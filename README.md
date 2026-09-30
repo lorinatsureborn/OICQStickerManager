@@ -26,6 +26,38 @@
 <img src="docs/images/main-window.png" width="720" alt="飞鸟主窗口" />
 </div>
 
+## 🚀 快速使用
+
+1. **下载运行**：到 [Releases](../../releases) 下载 `Asuka.zip`，解压后运行 `Asuka.exe`（需 [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) x64，详见下文安装）
+2. **导入表情**：把表情图片或整个文件夹拖进窗口，批量打好标签
+3. **发送**：在聊天输入框按 `Ctrl+Alt+D` 唤出快捷面板，点击表情即自动粘贴发送
+4. **进阶**：在 设置 → QQ 联动 中绑定 QQ 账号同步收藏表情；在任意应用里「复制图片」可一键入库
+
+到第 3 步就已经能用了，往下是完整的功能与设置说明。
+
+## 📦 安装
+
+### 下载成品（推荐）
+
+到 [Releases](../../releases) 下载最新版 `Asuka.zip`，解压后运行 `Asuka.exe`。
+
+> 单文件发布，需要安装 [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)（x64）。
+
+### 从源码构建
+
+```bash
+git clone https://github.com/<你的用户名>/OICQStickerManager.git
+cd OICQStickerManager
+dotnet build -c Release
+# 产物在 bin/Release/net10.0-windows/
+```
+
+需要 Windows 10/11 + .NET 10 SDK（含桌面工作负载）。发布单文件：
+
+```bash
+dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
+```
+
 ## ✨ 关键特性
 
 ### 图库管理
@@ -60,30 +92,7 @@
 - **托盘常驻**：关闭到托盘（首次询问并记住选择）、开机自启动、启动静默驻留、单实例
 - **失败可见**：数据保存采用原子写 + 备份 + 损坏自愈，异常必弹窗提示，绝不静默丢数据
 
-## 📦 安装
-
-### 下载成品（推荐）
-
-到 [Releases](../../releases) 下载最新版 `Asuka.zip`，解压后运行 `Asuka.exe`。
-
-> 单文件发布，需要安装 [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)（x64）。
-
-### 从源码构建
-
-```bash
-git clone https://github.com/<你的用户名>/OICQStickerManager.git
-cd OICQStickerManager
-dotnet build -c Release
-# 产物在 bin/Release/net10.0-windows/
-```
-
-需要 Windows 10/11 + .NET 10 SDK（含桌面工作负载）。发布单文件：
-
-```bash
-dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
-```
-
-## 🚀 使用方法
+## 📖 使用详解
 
 ### 1. 导入表情
 
@@ -165,6 +174,7 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 |---|---|
 | GIF 悬浮预览 | 悬浮表情时自动播放动图气泡 |
 | 复制图片后提示入库 | 在 QQ、浏览器等任意应用里「复制图片」后，右下角弹出一键入库提示 |
+| 提示停留时长 | 入库轻提示的停留秒数（3–15，默认 8），超时未处理视为忽略并自动消失 |
 | WebP 图片支持 | 显示系统 WebP 解码支持状态；未安装时可跳转微软商店安装「WebP 图像扩展」，支持重新检测 |
 | 打开表情存放文件夹 | 直接打开本地图库目录 |
 

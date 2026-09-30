@@ -29,6 +29,38 @@ together when you're done, just like a native feature. Any app that accepts past
 <img src="docs/images/main-window.png" width="720" alt="Asuka main window" />
 </div>
 
+## 🚀 Quick Start
+
+1. **Download & run**: grab `Asuka.zip` from [Releases](../../releases), unzip and run `Asuka.exe` (needs the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0), x64 — see Installation below)
+2. **Import stickers**: drag image files or whole folders onto the window, then batch-tag them
+3. **Send**: press `Ctrl+Alt+D` in any chat input to summon the quick panel, then click a sticker to paste it
+4. **Go further**: bind your QQ account under Settings → QQ integration to mirror your favorites; "copy image" in any app to import it with one click
+
+Step 3 is already the whole loop — everything below is detail.
+
+## 📦 Installation
+
+### Download (recommended)
+
+Grab the latest `Asuka.zip` from [Releases](../../releases), unzip and run `Asuka.exe`.
+
+> Single-file build; requires the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (x64).
+
+### Build from source
+
+```bash
+git clone https://github.com/<your-name>/OICQStickerManager.git
+cd OICQStickerManager
+dotnet build -c Release
+# output in bin/Release/net10.0-windows/
+```
+
+Requires Windows 10/11 and the .NET 10 SDK (desktop workload included). To publish a single file:
+
+```bash
+dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
+```
+
 ## ✨ Key Features
 
 ### Library
@@ -58,30 +90,7 @@ together when you're done, just like a native feature. Any app that accepts past
 - **Tray resident**: close-to-tray (asks once and remembers), launch on startup, silent tray start, single instance
 - **No silent data loss**: atomic writes + backup + self-healing recovery for all persisted data, with a visible alert if anything ever fails
 
-## 📦 Installation
-
-### Download (recommended)
-
-Grab the latest `Asuka.zip` from [Releases](../../releases), unzip and run `Asuka.exe`.
-
-> Single-file build; requires the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (x64).
-
-### Build from source
-
-```bash
-git clone https://github.com/<your-name>/OICQStickerManager.git
-cd OICQStickerManager
-dotnet build -c Release
-# output in bin/Release/net10.0-windows/
-```
-
-Requires Windows 10/11 and the .NET 10 SDK (desktop workload included). To publish a single file:
-
-```bash
-dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
-```
-
-## 🚀 Usage
+## 📖 Usage
 
 ### 1. Import stickers
 
@@ -160,6 +169,7 @@ Open Settings from the bottom-left of the main window.
 |---|---|
 | GIF hover preview | Plays animated bubbles when hovering stickers |
 | Prompt to import copied images | "Copy image" in QQ, browsers or any app → one-click import toast at the bottom-right |
+| Toast duration | How long the import toast stays on screen (3–15 s, default 8); an unanswered toast counts as ignored and dismisses itself |
 | WebP image support | Shows system WebP decoding status; links to the Microsoft Store "WebP Image Extension" when missing, with a re-check button |
 | Open sticker folder | Opens the local library directory |
 
