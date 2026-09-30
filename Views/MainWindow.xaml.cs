@@ -224,7 +224,7 @@ namespace OICQStickerManager.Views
         private bool _trayBalloonShown; // 首次藏进托盘时的提示只弹一次
 
         /// <summary>
-        /// 托盘唤起（托盘图标点击 / 第二实例唤醒共用）：恢复显示并抢回前台。
+        /// 托盘唤起（托盘图标点击 / 第二实例唤醒 / 快捷面板搜索跳转共用）：恢复显示并抢回前台。
         /// </summary>
         internal void RestoreFromTray()
         {
@@ -778,15 +778,24 @@ namespace OICQStickerManager.Views
         }
 
         /// <summary>
-        /// 快捷面板搜索按钮的落点：恢复主窗口并把键盘焦点交给搜索框。
+        /// 快捷面板搜索按钮的落点：恢复主窗口并进入搜索输入态。
+        /// 主窗口可能正以三种状态潜伏：托盘隐藏（Hide）/ 最小化 / 正常，
+        /// Activate 对隐藏窗口无效，必须先走 RestoreFromTray 的 Show；
+        /// 搜索胶囊收起时 SearchBox 是 Collapsed，直接 Focus 会静默失败，须先展开。
         /// 之后用户在主界面双击表情，走既有发送路径（最小化自身→焦点回聊天窗口→粘贴）。
         /// </summary>
         internal void FocusSearchFromQuickPanel()
         {
-            if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-            Activate();
-            SearchBox.Focus();
-            SearchBox.SelectAll();
+            RestoreFromTray();
+            if (_searchOpen)
+            {
+                SearchBox.Focus();
+                SearchBox.SelectAll();
+            }
+            else
+            {
+                OpenSearch();
+            }
         }
 
         protected override void OnClosed(EventArgs e)
