@@ -1,0 +1,830 @@
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Automation;
+
+namespace OICQStickerManager.Services;
+
+public class QqPanelEventArgs : EventArgs
+{
+    public IntPtr HostHwnd { get; }
+    public Rect PanelRect { get; } // 物理像素
+
+    public QqPanelEventArgs(IntPtr hostHwnd, Rect panelRect)
+    {
+        HostHwnd = hostHwnd;
+        PanelRect = panelRect;
+    }
+}
+
+/// <summary>
+/// 监听 QQ 聊天窗口内原生表情面板（UIA 标识：Window Class='sticker-panel'）的出现与消失，
+/// 驱动快捷面板的共存模式。纯事件驱动，零常驻成本：
+/// - 打开：全局焦点变化事件——用户点击表情按钮的瞬间焦点落在按钮上，立即检测联动；
+/// - 关闭：QQ 窗口的 UIA 结构变化事件（面板增删触发 ChildAdded/ChildRemoved，节流后验证），
+///   以及焦点移回输入框等焦点变化（节流验证）。
+/// 轮询保底（可选设置项，默认关）：事件在个别 QQ 版本上失灵时的兜底，常开会持续查询 QQ。
+/// 定位串随 QQ 版本更新可能失配：连续异常自动降级并提示，失败模式良性（热键不受影响）。
+/// 纯只读 UIA，不注入不挂钩。
+/// </summary>
+public class QqPanelWatcher : IDisposable
+{
+    private const int VerifyMinIntervalMs = 150; // 事件合并窗口：只限制风暴中的重复验证，不延迟首次验证
+    private const int CloseConfirmDelayMs = 150; // 关闭确认的延迟复核间隔（误关可自愈：QQ 面板还开着则下一事件重新弹出）
+    private const int TailVerifyIntervalMs = 200; // 按钮点击后的补验尾迹间隔
+    private const int TailWindowMs = 2500;        // 补验尾迹时长（每次按钮点击重新计时）
+    private const int FastPollMs = 125;          // 轮询保底开启且共存期间：快速感知关闭
+    private const int IdlePollMs = 1000;         // 轮询保底开启且常态：低频兜底
+    private const int DegradedPollIntervalMs = 5000;
+    private const int DegradeThreshold = 20;
+
+    private const string EmojiButtonName = "表情";
+    private const string EmojiButtonClass = "icon-item";
+    private const string PanelClassName = "sticker-panel";
+    private const string EditorClassKey = "ExEditor-qq-msg-editor";
+
+    private readonly Action<string> _status;
+    private readonly object _gate = new();
+    private readonly Dictionary<IntPtr, AutomationElement> _subscribed = new();
+
+    private CancellationTokenSource? _pollCts;
+    private Task? _pollLoop;
+    private long _tailUntilTicks;
+    private int _tailRunning;
+    private volatile bool _panelOpen;
+    private int _openMisses;
+    private HashSet<int> _qqPids = new();
+    private DateTime _lastPidRefresh = DateTime.MinValue;
+    private long _lastVerifyRanTicks;
+    private int _verifyScheduled;
+    private int _verifying;
+    private int _consecutiveErrors;
+    private bool _degraded;
+    private bool _disposed;
+
+    public bool PollingEnabled { get; private set; }
+    public bool Running { get; private set; }
+
+    public event EventHandler<QqPanelEventArgs>? PanelAppeared;
+    public event EventHandler? PanelDisappeared;
+
+    /// <summary>用户按下 QQ 表情按钮（mousedown 瞬间的焦点信号）。携带缓存的上次面板矩形（可能为 Empty），接收方应立即打开共存面板。</summary>
+    public event EventHandler<QqPanelEventArgs>? EmojiButtonClicked;
+
+    public QqPanelWatcher(Action<string> status)
+    {
+        _status = status;
+        _mouseHookProc = MouseHookProc; // 提前物化并终身持有，防止钩子委托被 GC 回收
+        _active = this;
+    }
+
+    // 当前活动实例：快捷面板共存发送后"同步关闭 QQ 原生面板"经此转发（2026-10-01 用户定案）
+    private static QqPanelWatcher? _active;
+
+    /// <summary>尽力同步关闭 QQ 原生表情面板：在缓存的表情按钮矩形中心取 UIA 元素，
+    /// 名称/类名对得上才 Invoke——面板开着时点表情按钮即关闭（NTQQ toggle 语义）。
+    /// 面板已被认为关闭、按钮找不到/对不上（窗口移动、树懒加载）都静默放弃，
+    /// 由既有的关闭跟随兜底。UIA 调用在后台线程执行，不占 UI。</summary>
+    public static void TryCloseQqPanel()
+    {
+        var w = _active;
+        if (w == null || !w._panelOpen) return; // 面板已关就别点按钮了——toggle 会把它重新打开
+        Task.Run(() =>
+        {
+            try
+            {
+                var rect = w._emojiBtnRect;
+                if (rect.Width <= 0 || rect.Height <= 0) { Log("close-q: no cached button rect"); return; }
+                var pt = new System.Windows.Point(rect.Left + rect.Width / 2.0, rect.Top + rect.Height / 2.0);
+                var el = System.Windows.Automation.AutomationElement.FromPoint(pt);
+                // 矩形中心常命中按钮内部的 svg 图标（/q-svg-icon q-icon），沿控制树向上回溯找
+                // 表情/icon-item 按钮本体（与面板检测的祖先回溯同款手法，≤12 级封顶）
+                var btn = el;
+                for (int hop = 0; hop < 12 && !(SafeName(btn) == EmojiButtonName && SafeClass(btn).Contains(EmojiButtonClass)); hop++)
+                {
+                    var parent = System.Windows.Automation.TreeWalker.ControlViewWalker.GetParent(btn);
+                    if (parent == null || parent == System.Windows.Automation.AutomationElement.RootElement)
+                    {
+                        btn = null;
+                        break;
+                    }
+                    btn = parent;
+                }
+                if (btn == null)
+                {
+                    Log("close-q: emoji button ancestor not found, skip");
+                    return;
+                }
+                if (btn.GetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern)
+                    is System.Windows.Automation.InvokePattern ip)
+                {
+                    ip.Invoke();
+                    Log("close-q: emoji button invoked (panel should close)");
+                }
+            }
+            catch (Exception ex) { Log("close-q failed: " + ex.Message); }
+        });
+    }
+
+    public void Start()
+    {
+        if (Running) return;
+        _qqPids = CollectQqPids();
+        Running = true;
+        Log("watcher started");
+
+        // 低级鼠标钩子装在专用消息泵线程上：LL 钩子对响应超时零容忍，
+        // 装在 UI 线程会因预热等卡顿被 Windows 静默摘除（实测发生过），专用线程永不超时。
+        _hookThread = new Thread(() =>
+        {
+            _hookThreadId = (uint)Environment.CurrentManagedThreadId;
+            _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookProc, GetModuleHandle(null), 0);
+            if (_mouseHook == IntPtr.Zero)
+            {
+                Log("mouse hook install FAILED: " + Marshal.GetLastWin32Error());
+                return;
+            }
+            Log("mouse hook installed on dedicated thread");
+            _hookAliveLogged = false;
+            while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+            Log("mouse hook thread exited");
+        })
+        {
+            IsBackground = true,
+            Name = "AsukaMouseHook"
+        };
+        _hookThread.Start();
+        Task.Run(() =>
+        {
+            try
+            {
+                Automation.AddAutomationFocusChangedEventHandler(OnFocusChanged);
+                Log("focus handler registered");
+            }
+            catch (Exception ex)
+            {
+                Log("focus handler register FAILED: " + ex.Message);
+            }
+        });
+
+        // 已存在的 QQ 窗口立即订阅结构变化事件（含主窗口）
+        foreach (var hwnd in GetVisibleWindowsOf(CollectQqPids()))
+        {
+            EnsureSubscribed(hwnd);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (!Running) return;
+        Running = false;
+        _disposed = true;
+        if (_active == this) _active = null;
+        StopPollLoop();
+        if (_mouseHook != IntPtr.Zero)
+        {
+            try { UnhookWindowsHookEx(_mouseHook); } catch { }
+            _mouseHook = IntPtr.Zero;
+        }
+        if (_hookThread != null)
+        {
+            try { PostThreadMessage(_hookThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero); } catch { }
+            try { _hookThread.Join(1000); } catch { }
+            _hookThread = null;
+        }
+        // RemoveAllEventHandlers 会同步等所有在途回调完成，实测耗时 0s/1s/3min/永不 不等——
+        // 在 UI 线程上调用它会把自己挂死（窗口关了进程不退，僵尸还握着单实例互斥锁，
+        // 之后所有新启动都拉不起来）。挪到后台 MTA 线程异步拆，不等待；_disposed 已置位，
+        // 拆卸完成前漏进来的残留事件会被各处理器入口的守卫丢弃，进程退出兜底清理。
+        // 已知竞态：Dispose 后极快重建新 watcher 时，旧拆卸可能误删新注册——现实中只有
+        // 设置开关"QQ 表情面板共存"会重建，人手速度远慢于拆卸，接受此权衡。
+        _ = Task.Run(() => { try { Automation.RemoveAllEventHandlers(); } catch { } });
+        lock (_gate) _subscribed.Clear();
+        Log("watcher disposed");
+    }
+
+    /// <summary>轮询保底开关（可选设置项）。事件失效时开启，常态保持关闭。</summary>
+    public void SetPollingFallback(bool enabled)
+    {
+        PollingEnabled = enabled;
+        if (!Running) return;
+        if (enabled) StartPollLoop(); else StopPollLoop();
+        Log("polling fallback = " + enabled);
+    }
+
+    private void StartPollLoop()
+    {
+        lock (_gate)
+        {
+            if (_pollLoop != null) return;
+            _pollCts = new CancellationTokenSource();
+            var ct = _pollCts.Token;
+            _pollLoop = Task.Run(async () =>
+            {
+                var consecutiveErrors = 0;
+                var degraded = false;
+                while (!ct.IsCancellationRequested)
+                {
+                    try
+                    {
+                        CheckNow();
+                        consecutiveErrors = 0;
+                        if (degraded) { degraded = false; _status("QQ 表情面板监听已恢复"); }
+                    }
+                    catch (Exception ex)
+                    {
+                        consecutiveErrors++;
+                        Log($"poll error #{consecutiveErrors}: {ex.Message}");
+                        if (consecutiveErrors >= DegradeThreshold && !degraded)
+                        {
+                            degraded = true;
+                            _status("QQ 表情面板监听已降级（QQ 界面结构可能变化），快捷键不受影响");
+                        }
+                    }
+
+                    var interval = _panelOpen ? FastPollMs : IdlePollMs;
+                    if (degraded) interval = DegradedPollIntervalMs;
+                    try { await Task.Delay(interval, ct); }
+                    catch (OperationCanceledException) { return; }
+                }
+            });
+            Log("poll loop started");
+        }
+    }
+
+    private void StopPollLoop()
+    {
+        lock (_gate)
+        {
+            _pollCts?.Cancel();
+            try { _pollLoop?.Wait(1500); } catch { }
+            _pollCts?.Dispose();
+            _pollCts = null;
+            _pollLoop = null;
+        }
+    }
+
+    // --- 焦点事件路径 ---
+
+    private void OnFocusChanged(object? sender, AutomationFocusChangedEventArgs e)
+    {
+        if (_disposed || !Running) return;
+        try
+        {
+            var el = AutomationElement.FocusedElement;
+            if (el == null) return;
+            int pid = el.Current.ProcessId;
+            RefreshPidsIfNeeded(pid);
+
+            if (!_qqPids.Contains(pid))
+            {
+                // 面板开着时焦点离开 QQ（点了桌面/其他应用）：QQ 面板大概率已被关掉，验证一次
+                if (_panelOpen) ScheduleThrottledVerify();
+                return;
+            }
+
+            // 懒订阅：正在使用的 QQ 窗口补订结构变化事件（新开聊天窗口也由此覆盖）
+            try
+            {
+                var hwnd = (IntPtr)el.Current.NativeWindowHandle;
+                if (hwnd != IntPtr.Zero) EnsureSubscribed(hwnd);
+            }
+            catch { }
+
+            string name = SafeName(el);
+            string cls = SafeClass(el);
+            if (name == EmojiButtonName && cls == EmojiButtonClass)
+            {
+                Log("focus hit emoji button");
+
+                // 缓存按钮矩形与宿主窗口：低级鼠标钩子的命中目标 + 乐观打开的粘贴目标
+                try
+                {
+                    var br = el.Current.BoundingRectangle;
+                    var topHwnd = GetTopWindowHwnd(el);
+                    if (topHwnd == IntPtr.Zero) topHwnd = _lastPanelRectHwnd; // 走查失败时用面板检测已确认的 QQ 顶层窗口兜底
+                    if (br.Width > 0 && topHwnd != IntPtr.Zero)
+                    {
+                        _emojiBtnRect = br;
+                        _emojiBtnHwnd = topHwnd;
+                        Log($"button rect cached {br} hwnd={topHwnd}");
+                    }
+                }
+                catch { }
+
+                // 焦点事件是异步投递的，到达时鼠标多半已松开——乐观打开主要靠鼠标钩子，
+                // 这里仅作左键仍按住时的兜底（例如事件恰好即时送达的场景）。
+                if (IsLeftButtonDown() && Running)
+                {
+                    var hostHwnd = GetTopWindowHwnd(el);
+                    if (hostHwnd != IntPtr.Zero)
+                    {
+                        var cachedRect = hostHwnd == _lastPanelRectHwnd ? _lastPanelRect : Rect.Empty;
+                        _optimisticPending = true;
+                        ArmTailVerify();
+                        Log($"emoji button clicked via focus event (optimistic, cachedRect={cachedRect})");
+                        EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hostHwnd, cachedRect));
+                    }
+                }
+
+                _ = VerifyWithOpenRetriesAsync();
+            }
+            else
+            {
+                // 焦点在 QQ 窗口内移动：面板可能被收起（如点击输入框），节流验证
+                ScheduleThrottledVerify();
+            }
+        }
+        catch { }
+    }
+
+    // --- 结构变化事件路径（不按类型过滤：面板关闭可能是 ChildrenBulkRemoved 整棵子树批量移除，
+    //     只认 ChildAdded/ChildRemoved 会漏掉关闭信号；处理函数零跨进程成本，靠节流防刷） ---
+
+    private readonly HashSet<int> _seenStructureTypes = new();
+
+    private void OnStructureChanged(object sender, StructureChangedEventArgs e)
+    {
+        if (_disposed || !Running) return;
+
+        // 诊断：记录每种结构变化类型的首现，确认 QQ 实际派发哪些类型
+        lock (_gate)
+        {
+            if (_seenStructureTypes.Add((int)e.StructureChangeType))
+            {
+                Log($"structure event type first seen: {e.StructureChangeType}");
+            }
+        }
+
+        ScheduleThrottledVerify();
+    }
+
+    private void ScheduleThrottledVerify()
+    {
+        var now = Environment.TickCount64;
+        var last = Interlocked.Read(ref _lastVerifyRanTicks);
+        if (now - last >= VerifyMinIntervalMs)
+        {
+            // 窗口外：立即验证（首次响应零延迟）
+            RunVerify();
+            return;
+        }
+        // 窗口内（事件风暴）：合并为窗口末尾的一次验证
+        if (Interlocked.Exchange(ref _verifyScheduled, 1) == 0)
+        {
+            var delay = (int)Math.Max(VerifyMinIntervalMs - (now - last), 20);
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(delay);
+                Interlocked.Exchange(ref _verifyScheduled, 0);
+                if (!_disposed) CheckNow();
+            });
+        }
+    }
+
+    private void RunVerify()
+    {
+        Interlocked.Exchange(ref _lastVerifyRanTicks, Environment.TickCount64);
+        CheckNow();
+    }
+
+    private async Task VerifyWithOpenRetriesAsync()
+    {
+        // QQ 在鼠标按下时把焦点给按钮，mouse-up 后才弹出面板；80ms 步进尽快逮到面板出现。
+        // 序列覆盖到 700ms 以容忍长按；乐观打开后面板一直没出现（如拖出按钮 aborted click）则收起共存面板。
+        foreach (var delay in new[] { 0, 80, 160, 240, 320, 480, 700 })
+        {
+            if (delay > 0) await Task.Delay(delay);
+            if (_disposed) return;
+            if (CheckNow())
+            {
+                _optimisticPending = false;
+                return;
+            }
+        }
+
+        if (_optimisticPending && !_panelOpen)
+        {
+            _optimisticPending = false;
+            Log("optimistic open aborted (QQ panel never appeared)");
+            PanelDisappeared?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    // --- 点击后补验尾迹 ---
+
+    /// <summary>
+    /// 表情按钮点击后的短尾迹补验。快速连点按钮关闭时 QQ 面板会"闪现"（关→开→关），
+    /// 焦点全程停在按钮上不再变化，而 QQ 侧对闪现的最终关闭可能不派发任何结构/焦点事件
+    /// （透明隐藏 + 滞留元素复用）——纯事件驱动会停在"面板开着"的陈旧状态，快捷面板不跟随关闭。
+    /// 尾迹保证点击后的短时间内持续验证，把最终关闭补检出来；每次点击重新计时，零常态成本。
+    /// </summary>
+    private void ArmTailVerify()
+    {
+        Interlocked.Exchange(ref _tailUntilTicks, Environment.TickCount64 + TailWindowMs);
+        if (Interlocked.Exchange(ref _tailRunning, 1) == 1) return;
+        Log("tail verify loop started");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!_disposed)
+                {
+                    var until = Interlocked.Read(ref _tailUntilTicks);
+                    var now = Environment.TickCount64;
+                    if (now >= until)
+                    {
+                        // 宽限一拍再退出：ArmTail 可能刚续期而本循环尚未看见
+                        await Task.Delay(60);
+                        if (Interlocked.Read(ref _tailUntilTicks) <= Environment.TickCount64) break;
+                        continue;
+                    }
+                    await Task.Delay((int)Math.Min(TailVerifyIntervalMs, until - now));
+                    if (_disposed) break;
+                    CheckNow();
+                }
+            }
+            catch { }
+            finally
+            {
+                Interlocked.Exchange(ref _tailRunning, 0);
+                // 退出瞬间恰好被续期的兜底：还有效就再起一轮
+                if (!_disposed && Interlocked.Read(ref _tailUntilTicks) > Environment.TickCount64) ArmTailVerify();
+            }
+        });
+    }
+
+    // --- 面板检测（所有信号共用，互斥防重入；错误计入降级统计） ---
+
+    private bool CheckNow()
+    {
+        if (Interlocked.Exchange(ref _verifying, 1) == 1) return _panelOpen;
+        Interlocked.Exchange(ref _lastVerifyRanTicks, Environment.TickCount64);
+        try
+        {
+            RefreshPidsIfNeeded();
+            var (open, hwnd, rect) = ScanQqWindows(_qqPids);
+            if (open)
+            {
+                _openMisses = 0;
+                if (!_panelOpen)
+                {
+                    _panelOpen = true;
+                    _optimisticPending = false;
+                    _lastPanelRect = rect;
+                    _lastPanelRectHwnd = hwnd;
+                    Log($"panel APPEARED hwnd={hwnd} rect={rect}");
+                    PanelAppeared?.Invoke(this, new QqPanelEventArgs(hwnd, rect));
+                }
+            }
+            else if (_panelOpen)
+            {
+                // 关闭确认采用时间窗而非事件次数：事件路径可能只触发一次验证（节流合并），
+                // 首次 miss 后安排一次延迟复核，届时仍 miss 即收起
+                if (_openMisses == 0)
+                {
+                    _openMisses = 1;
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(CloseConfirmDelayMs);
+                        if (!_disposed && _panelOpen) CheckNow();
+                    });
+                }
+                else
+                {
+                    _openMisses = 0;
+                    _panelOpen = false;
+                    Log("panel DISAPPEARED (time-confirmed)");
+                    PanelDisappeared?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            return _panelOpen;
+        }
+        catch (Exception ex)
+        {
+            _consecutiveErrors++;
+            Log($"verify error #{_consecutiveErrors}: {ex.Message}");
+            if (_consecutiveErrors >= DegradeThreshold && !_degraded)
+            {
+                _degraded = true;
+                _status("QQ 表情面板监听已降级（QQ 界面结构可能变化），快捷键不受影响");
+            }
+            return _panelOpen;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _verifying, 0);
+        }
+    }
+
+    private void RefreshPidsIfNeeded(int focusedPid)
+    {
+        if (_qqPids.Contains(focusedPid)) return;
+        if ((DateTime.Now - _lastPidRefresh).TotalMilliseconds < 2000) return;
+        _lastPidRefresh = DateTime.Now;
+        _qqPids = CollectQqPids();
+    }
+
+    private void RefreshPidsIfNeeded()
+    {
+        if ((DateTime.Now - _lastPidRefresh).TotalMilliseconds < 2000) return;
+        _lastPidRefresh = DateTime.Now;
+        _qqPids = CollectQqPids();
+        PruneSubscriptions();
+    }
+
+    // --- 结构变化事件订阅管理（懒订阅 + 清理） ---
+
+    private void EnsureSubscribed(IntPtr hwnd)
+    {
+        lock (_gate)
+        {
+            if (_subscribed.ContainsKey(hwnd)) return;
+            try
+            {
+                var el = AutomationElement.FromHandle(hwnd);
+                Automation.AddStructureChangedEventHandler(el, TreeScope.Descendants, OnStructureChanged);
+                _subscribed[hwnd] = el;
+                Log($"structure events subscribed hwnd={hwnd}");
+            }
+            catch (Exception ex)
+            {
+                Log($"subscribe failed hwnd={hwnd}: {ex.Message}");
+            }
+        }
+    }
+
+    private void PruneSubscriptions()
+    {
+        lock (_gate)
+        {
+            // 窗口销毁后订阅会随元素失效自然停止派发，这里仅清理字典引用防止增长
+            var dead = new List<IntPtr>();
+            foreach (var kv in _subscribed)
+            {
+                if (!IsWindowVisible(kv.Key)) dead.Add(kv.Key);
+            }
+            foreach (var h in dead)
+            {
+                _subscribed.Remove(h);
+            }
+            if (dead.Count > 0) Log($"pruned {dead.Count} stale subscriptions");
+        }
+    }
+
+    // --- 扫描 ---
+
+    private AutomationElement? _cachedPanel;     // 上次找到的面板元素：验证时先廉价探测，避免每次全树扫描
+    private IntPtr _cachedPanelHwnd;
+    private Rect _lastPanelRect = Rect.Empty;    // 上次面板矩形（物理像素）：乐观打开时的定位来源
+    private IntPtr _lastPanelRectHwnd;
+    private volatile bool _optimisticPending;    // 已按按下时点乐观打开，等待 QQ 面板真正出现
+    private Rect _emojiBtnRect = Rect.Empty;     // 表情按钮矩形（鼠标钩子的命中目标）
+    private IntPtr _emojiBtnHwnd;
+    private IntPtr _mouseHook;
+    private readonly LowLevelMouseProc _mouseHookProc; // 必须持有委托强引用，否则 GC 回收后钩子回调访问已释放 thunk → 闪退
+    private Thread? _hookThread;
+    private uint _hookThreadId;
+    private bool _hookAliveLogged;
+
+    private (bool open, IntPtr hwnd, Rect rect) ScanQqWindows(HashSet<int> pids)
+    {
+        var myPid = Environment.ProcessId;
+
+        // 快路径：上次的面板元素仍有效时只读单个元素 + 命中测试（毫秒级），不做全树遍历
+        var cached = _cachedPanel;
+        var cachedHwnd = _cachedPanelHwnd;
+        if (cached != null && cachedHwnd != IntPtr.Zero && IsWindowVisible(cachedHwnd))
+        {
+            try
+            {
+                if (SafeClass(cached) == PanelClassName)
+                {
+                    var crect = cached.Current.BoundingRectangle;
+                    if (IsPanelVisuallyRendered(cached, crect, myPid))
+                        return (true, cachedHwnd, crect);
+                }
+            }
+            catch
+            {
+                _cachedPanel = null; // 元素已失效（QQ 重建/关闭），走全树扫描
+            }
+        }
+
+        foreach (var hwnd in GetVisibleWindowsOf(pids))
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(hwnd);
+                var cond = new PropertyCondition(AutomationElement.ClassNameProperty, PanelClassName);
+                var panel = root.FindFirst(TreeScope.Descendants, cond);
+                if (panel == null) continue;
+
+                // 关键：QQ 关闭面板时可能仅用透明度隐藏（元素滞留在树里，矩形/IsOffscreen 均不变），
+                // 元素存在 ≠ 面板可见。必须用命中测试确认：面板矩形中心 FromPoint 后回溯祖先链，
+                // 能命中 sticker-panel 才算可见；命中的是下层元素（消息区等）说明面板已被透明隐藏。
+                var rect = panel.Current.BoundingRectangle;
+                if (!IsPanelVisuallyRendered(panel, rect, myPid)) continue;
+
+                _cachedPanel = panel;
+                _cachedPanelHwnd = hwnd;
+                return (true, hwnd, rect);
+            }
+            catch { /* 单个窗口失败（树未激活/元素失效）不影响整体 */ }
+        }
+        return (false, IntPtr.Zero, Rect.Empty);
+    }
+
+    private bool IsPanelVisuallyRendered(AutomationElement panel, Rect rect, int myPid)
+    {
+        try
+        {
+            if (rect.Width < 10 || rect.Height < 10) return false;
+            var center = new Point(rect.Left + rect.Width / 2, rect.Top + rect.Height / 2);
+            var hit = AutomationElement.FromPoint(center);
+            var cur = hit;
+            for (int i = 0; i < 12 && cur != null; i++)
+            {
+                if (SafeClass(cur) == PanelClassName) return true;
+                try
+                {
+                    if (cur.Current.ProcessId == myPid) return true; // 打到我们自己的窗口：无法判定，保守视为打开
+                }
+                catch { }
+                try { cur = TreeWalker.RawViewWalker.GetParent(cur); } catch { return true; }
+            }
+            return false; // 命中的是面板之下的元素 → 面板已被透明隐藏
+        }
+        catch
+        {
+            return true; // 命中测试失败时保守视为打开，避免闪烁
+        }
+    }
+
+    private static HashSet<int> CollectQqPids() =>
+        Process.GetProcessesByName("QQ").Select(p => p.Id).ToHashSet();
+
+    private static IEnumerable<IntPtr> GetVisibleWindowsOf(HashSet<int> pids)
+    {
+        var result = new List<IntPtr>();
+        EnumWindows((h, l) =>
+        {
+            GetWindowThreadProcessId(h, out var pid);
+            if (pids.Contains((int)pid) && IsWindowVisible(h))
+            {
+                result.Add(h);
+            }
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
+
+    internal static void Log(string message)
+    {
+        try
+        {
+            File.AppendAllText(
+                Path.Combine(Path.GetTempPath(), "asuka-watcher.log"),
+                $"[{DateTime.Now:HH:mm:ss.fff}] {message}\r\n");
+        }
+        catch { }
+    }
+
+    // --- 名称/类名/矩形安全读取（Chromium 树里部分元素属性不可读） ---
+
+    private static string SafeName(AutomationElement e) { try { var n = e.Current.Name; return n ?? ""; } catch { return ""; } }
+    private static string SafeClass(AutomationElement e) { try { var c = e.Current.ClassName; return c ?? ""; } catch { return ""; } }
+
+    private static bool IsLeftButtonDown()
+    {
+        try { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
+        catch { return false; }
+    }
+
+    // 从焦点元素向上找顶层 Window 元素，取其 hwnd（Chromium 的子元素 NativeWindowHandle 不可信）
+    private static IntPtr GetTopWindowHwnd(AutomationElement start)
+    {
+        // 实测 NTQQ 从按钮到根 Window 约 20+ 级（中间经过 Chrome_RenderWidgetHostHWND/多层 View），深度须给足
+        try
+        {
+            var cur = start;
+            for (int i = 0; i < 30; i++)
+            {
+                if (cur.Current.ControlType == System.Windows.Automation.ControlType.Window)
+                {
+                    var h = cur.Current.NativeWindowHandle;
+                    return h != 0 ? new IntPtr(h) : IntPtr.Zero;
+                }
+                var parent = TreeWalker.RawViewWalker.GetParent(cur);
+                if (parent == null) return IntPtr.Zero;
+                cur = parent;
+            }
+        }
+        catch { }
+        return IntPtr.Zero;
+    }
+
+    private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && !_hookAliveLogged)
+        {
+            _hookAliveLogged = true;
+            Log("mouse hook alive (first event received)");
+        }
+
+        if (nCode >= 0 && wParam.ToInt32() == WM_LBUTTONDOWN && !_panelOpen && Running)
+        {
+            try
+            {
+                var s = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                var r = _emojiBtnRect;
+                if (r.Width > 0 &&
+                    s.pt.X >= r.Left && s.pt.X <= r.Right &&
+                    s.pt.Y >= r.Top && s.pt.Y <= r.Bottom)
+                {
+                    // 按下表情按钮的物理瞬间：立即乐观打开（QQ 面板要等 mouse-up 才出现，我们更快）
+                    var hwnd = _emojiBtnHwnd;
+                    var crect = _lastPanelRectHwnd == hwnd ? _lastPanelRect : Rect.Empty;
+                    _optimisticPending = true;
+                    ArmTailVerify();
+                    Log($"mouse hook: emoji button clicked (optimistic, cachedRect={crect})");
+                    Task.Run(() =>
+                    {
+                        try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hwnd, crect)); }
+                        catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
+                    });
+                    _ = VerifyWithOpenRetriesAsync();
+                }
+            }
+            catch { }
+        }
+        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
+    [DllImport("user32.dll")]
+    private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+    [DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref MSG lpMsg);
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessage(ref MSG lpMsg);
+    [DllImport("user32.dll")]
+    private static extern bool PostThreadMessage(uint threadId, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public POINT pt;
+    }
+
+    private const uint WM_QUIT = 0x0012;
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private const int WH_MOUSE_LL = 14;
+    private const int WM_LBUTTONDOWN = 0x0201;
+    private const int VK_LBUTTON = 0x01;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+}

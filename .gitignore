@@ -1,0 +1,11 @@
+# 构建产物（发布用 dotnet publish -c Release -p:PublishProfile=FolderProfile → D:\Asuka）
+bin/
+obj/
+
+# Visual Studio 本地缓存与用户状态
+.vs/
+*.user
+*.suo
+
+# 运行期落盘日志/崩溃转储
+*.log

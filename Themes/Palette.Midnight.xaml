@@ -1,0 +1,40 @@
+﻿<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- 子夜：深色玻璃 · iOS 暗夜蓝。#1C1C1E 雾面之上是亮白文字与 systemBlue（dark）强调 -->
+
+    <Color x:Key="AccentColor">#0A84FF</Color>
+    <Color x:Key="TextPrimaryColor">#F5F5F7</Color>
+
+    <SolidColorBrush x:Key="AccentBrush" Color="#0A84FF"/>
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="#3D9DFF"/>
+    <SolidColorBrush x:Key="AccentPressedBrush" Color="#0060DF"/>
+    <SolidColorBrush x:Key="OnAccentBrush" Color="#FFFFFF"/>
+
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#F5F5F7"/>
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#A6A6AD"/>
+    <SolidColorBrush x:Key="TextTertiaryBrush" Color="#6E6E76"/>
+    <SolidColorBrush x:Key="DangerBrush" Color="#FF453A"/>
+
+    <!-- 材质 -->
+    <SolidColorBrush x:Key="GlassOverlayBrush" Color="#B31C1C1E"/>
+    <SolidColorBrush x:Key="SheetBrush" Color="#F21C1C1E"/>
+    <SolidColorBrush x:Key="MaterialBrush" Color="#E8262628"/>
+    <SolidColorBrush x:Key="MaterialBorderBrush" Color="#24FFFFFF"/>
+
+    <!-- 填充层级（iOS systemFill 家族，深色变体） -->
+    <SolidColorBrush x:Key="FieldBrush" Color="#24767680"/>
+    <SolidColorBrush x:Key="FieldHoverBrush" Color="#33767680"/>
+    <SolidColorBrush x:Key="FillHoverBrush" Color="#14FFFFFF"/>
+    <SolidColorBrush x:Key="FillPressedBrush" Color="#24FFFFFF"/>
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="#290A84FF"/>
+    <SolidColorBrush x:Key="SeparatorBrush" Color="#1FFFFFFF"/>
+    <SolidColorBrush x:Key="ScrimBrush" Color="#73000000"/>
+
+    <!-- 控件专用 -->
+    <SolidColorBrush x:Key="ThumbBrush" Color="#FF636366"/>
+    <SolidColorBrush x:Key="ScrollThumbBrush" Color="#42FFFFFF"/>
+    <SolidColorBrush x:Key="SwitchOnBrush" Color="#30D158"/>
+    <SolidColorBrush x:Key="SwitchOffBrush" Color="#39393D"/>
+
+</ResourceDictionary>

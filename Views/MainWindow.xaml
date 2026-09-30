@@ -1,0 +1,1068 @@
+<services:GlassWindow x:Class="OICQStickerManager.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:services="clr-namespace:OICQStickerManager.Services"
+        xmlns:vwp="clr-namespace:WpfToolkit.Controls;assembly=VirtualizingWrapPanel"
+        Title="飞鸟" Height="640" Width="900" MinHeight="480" MinWidth="760"
+        WindowStartupLocation="CenterScreen" Icon="pack://application:,,,/Assets/Asuka.ico"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="CanResize" UseLayoutRounding="True"
+        FontFamily="{StaticResource AppFontFamily}"
+        PreviewKeyDown="Window_PreviewKeyDown">
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+        <services:InverseBoolToVisibilityConverter x:Key="InverseBoolToVis"/>
+
+        <!-- 图库格子模板（"最近"/标签页） -->
+        <DataTemplate x:Key="GalleryTileTemplate">
+            <Border x:Name="Tile" Width="120" Height="120" Margin="5" Cursor="Hand"
+                    Background="Transparent" CornerRadius="16" RenderTransformOrigin="0.5,0.5"
+                    AutomationProperties.Name="{Binding DisplayName}"
+                    MouseEnter="StickerBorder_MouseEnter" MouseLeave="StickerBorder_MouseLeave"
+                    Loaded="StickerTile_Loaded"
+                    DataContextChanged="StickerTile_DataContextChanged">
+                <Border.RenderTransform>
+                    <TransformGroup>
+                        <ScaleTransform x:Name="TileScale"/>
+                        <!-- 入场上浮用；与悬停缩放同组互不干扰 -->
+                        <TranslateTransform x:Name="TileTranslate"/>
+                    </TransformGroup>
+                </Border.RenderTransform>
+                <Border.InputBindings>
+                    <MouseBinding MouseAction="LeftClick"
+                                  Command="{Binding DataContext.HandleStickerClickCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                  CommandParameter="{Binding}"/>
+                    <MouseBinding MouseAction="LeftDoubleClick"
+                                  Command="{Binding DataContext.HandleStickerDoubleClickCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                  CommandParameter="{Binding}"/>
+                </Border.InputBindings>
+                <Border.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="编辑标签" Click="EditTag_Click"/>
+                        <Separator/>
+                        <MenuItem Header="删除表情" Foreground="{DynamicResource DangerBrush}"
+                                  Click="DeleteSticker_Click"/>
+                    </ContextMenu>
+                </Border.ContextMenu>
+                <Grid>
+                    <Border x:Name="FillLayer" Background="{DynamicResource FillHoverBrush}"
+                            CornerRadius="16" Opacity="0"/>
+                    <Image Source="{Binding ImageSource}" Width="104" Height="104"
+                           Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <!-- GIF 角标：提示该表情悬浮可预览动画 -->
+                    <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0"
+                            Background="#99000000" CornerRadius="7" Padding="5,2"
+                            Visibility="{Binding IsGif, Converter={StaticResource BoolToVis}}">
+                        <TextBlock Text="GIF" FontSize="8.5" FontWeight="Bold" Foreground="#F2FFFFFF"/>
+                    </Border>
+                </Grid>
+            </Border>
+            <DataTemplate.Triggers>
+                <Trigger SourceName="Tile" Property="IsMouseOver" Value="True">
+                    <Setter TargetName="FillLayer" Property="Opacity" Value="1"/>
+                    <Trigger.EnterActions>
+                        <BeginStoryboard>
+                            <Storyboard>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleX"
+                                                 To="1.05" Duration="0:0:0.14">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleY"
+                                                 To="1.05" Duration="0:0:0.14">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                            </Storyboard>
+                        </BeginStoryboard>
+                    </Trigger.EnterActions>
+                    <Trigger.ExitActions>
+                        <BeginStoryboard>
+                            <Storyboard>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleX"
+                                                 To="1" Duration="0:0:0.16">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleY"
+                                                 To="1" Duration="0:0:0.16">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                            </Storyboard>
+                        </BeginStoryboard>
+                    </Trigger.ExitActions>
+                </Trigger>
+            </DataTemplate.Triggers>
+        </DataTemplate>
+
+        <!-- QQ 收藏表情格子模板：同一视觉语言，右键 = 导入/全部导入/定位文件，左下角"已入库"角标 -->
+        <DataTemplate x:Key="QqTileTemplate">
+            <Border x:Name="Tile" Width="120" Height="120" Margin="5" Cursor="Hand"
+                    Background="Transparent" CornerRadius="16" RenderTransformOrigin="0.5,0.5"
+                    AutomationProperties.Name="{Binding DisplayName}"
+                    MouseEnter="StickerBorder_MouseEnter" MouseLeave="StickerBorder_MouseLeave"
+                    Loaded="StickerTile_Loaded"
+                    DataContextChanged="StickerTile_DataContextChanged">
+                <Border.RenderTransform>
+                    <TransformGroup>
+                        <ScaleTransform x:Name="TileScale"/>
+                        <TranslateTransform x:Name="TileTranslate"/>
+                    </TransformGroup>
+                </Border.RenderTransform>
+                <Border.InputBindings>
+                    <MouseBinding MouseAction="LeftClick"
+                                  Command="{Binding DataContext.HandleStickerClickCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                  CommandParameter="{Binding}"/>
+                    <MouseBinding MouseAction="LeftDoubleClick"
+                                  Command="{Binding DataContext.HandleStickerDoubleClickCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                  CommandParameter="{Binding}"/>
+                </Border.InputBindings>
+                <Border.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="导入图库" Click="ImportQq_Click"/>
+                        <MenuItem Header="复制到自带图库中管理" Click="CopyQqToLibrary_Click"
+                                  ToolTip="复制一份进图库（不带 QQ 标签），已在图库则自动跳过"/>
+                        <MenuItem Header="导入本页全部到图库" Click="ImportAllQq_Click"/>
+                        <Separator/>
+                        <MenuItem Header="在文件夹中显示" Click="RevealQq_Click"/>
+                        <!-- 仅缓存残留（QQ 已取消收藏）提供删除：删本地缓存文件并出镜像 -->
+                        <MenuItem Header="删除缓存残留" Click="DeleteQqOrphan_Click"
+                                  ToolTip="这条表情在 QQ 里已取消收藏，本地文件只是缓存残留；删除后不可恢复"
+                                  Visibility="{Binding IsOrphaned, Converter={StaticResource BoolToVis}}"/>
+                    </ContextMenu>
+                </Border.ContextMenu>
+                <Grid>
+                    <Border x:Name="FillLayer" Background="{DynamicResource FillHoverBrush}"
+                            CornerRadius="16" Opacity="0"/>
+                    <Image Source="{Binding ImageSource}" Width="104" Height="104"
+                           Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0"
+                            Background="#99000000" CornerRadius="7" Padding="5,2"
+                            Visibility="{Binding IsGif, Converter={StaticResource BoolToVis}}"
+                            ToolTipService.ShowOnDisabled="True">
+                        <TextBlock Text="GIF" FontSize="8.5" FontWeight="Bold" Foreground="#F2FFFFFF"/>
+                    </Border>
+                    <Border HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="10,0,0,10"
+                            Background="#99000000" CornerRadius="7" Padding="5,2"
+                            Visibility="{Binding IsImported, Converter={StaticResource BoolToVis}}">
+                        <TextBlock Text="已入库" FontSize="8.5" Foreground="#F2FFFFFF"/>
+                    </Border>
+                    <!-- 孤儿角标：淡色小图标（低不透明度，不抢视觉），悬浮显示解释 -->
+                    <Border x:Name="OrphanBadge" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10,10,0,0"
+                            Background="#66FFFFFF" CornerRadius="7" Padding="4,2" Opacity="0.55"
+                            ToolTip="{Binding OrphanToolTip}"
+                            Visibility="{Binding IsOrphaned, Converter={StaticResource BoolToVis}}">
+                        <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE74D;" FontSize="9"
+                                   Foreground="#CC333333"/>
+                    </Border>
+                </Grid>
+            </Border>
+            <DataTemplate.Triggers>
+                <Trigger SourceName="Tile" Property="IsMouseOver" Value="True">
+                    <Setter TargetName="FillLayer" Property="Opacity" Value="1"/>
+                    <Trigger.EnterActions>
+                        <BeginStoryboard>
+                            <Storyboard>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleX"
+                                                 To="1.05" Duration="0:0:0.14">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleY"
+                                                 To="1.05" Duration="0:0:0.14">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                            </Storyboard>
+                        </BeginStoryboard>
+                    </Trigger.EnterActions>
+                    <Trigger.ExitActions>
+                        <BeginStoryboard>
+                            <Storyboard>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleX"
+                                                 To="1" Duration="0:0:0.16">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                                <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                 Storyboard.TargetProperty="ScaleY"
+                                                 To="1" Duration="0:0:0.16">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                            </Storyboard>
+                        </BeginStoryboard>
+                    </Trigger.ExitActions>
+                </Trigger>
+            </DataTemplate.Triggers>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Window.Loaded">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetName="RootGrid" Storyboard.TargetProperty="Opacity"
+                                     From="0" To="1" Duration="0:0:0.24"/>
+                    <DoubleAnimation Storyboard.TargetName="RootTranslate" Storyboard.TargetProperty="Y"
+                                     From="14" To="0" Duration="0:0:0.3">
+                        <DoubleAnimation.EasingFunction>
+                            <CubicEase EasingMode="EaseOut"/>
+                        </DoubleAnimation.EasingFunction>
+                    </DoubleAnimation>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+
+    <Border CornerRadius="16" Background="{DynamicResource GlassOverlayBrush}"
+            BorderBrush="{DynamicResource MaterialBorderBrush}" BorderThickness="1">
+    <Grid x:Name="RootGrid">
+        <Grid.RenderTransform>
+            <TranslateTransform x:Name="RootTranslate"/>
+        </Grid.RenderTransform>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="52"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="32"/>
+        </Grid.RowDefinitions>
+
+        <!-- ———— 标题栏 ———— -->
+        <Grid Grid.Row="0" Background="Transparent" MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" Orientation="Horizontal" Margin="18,0,0,0" VerticalAlignment="Center">
+                <!-- 用户原始素材的像素级蒙版 + 主题色填充：形状逐像素等于原稿，颜色跟随主题 -->
+                <Rectangle Width="24" Height="24" Fill="{DynamicResource AccentBrush}">
+                    <Rectangle.OpacityMask>
+                        <ImageBrush ImageSource="pack://application:,,,/Assets/bird-mask.png" Stretch="Uniform"/>
+                    </Rectangle.OpacityMask>
+                </Rectangle>
+                <TextBlock Text="飞鸟" Style="{StaticResource HeadlineTextStyle}"
+                           Margin="9,0,0,0" VerticalAlignment="Center"/>
+            </StackPanel>
+
+            <!-- 搜索胶囊（用户方案）：默认是居中的胶囊按钮（放大镜+搜索），点击左右展开成输入框；
+                 展开态无占位文字（光标插在占位字中间的怪相根源），文本清空且失焦后缩回胶囊 -->
+            <Grid Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center"
+                  WindowChrome.IsHitTestVisibleInChrome="True">
+                <Border x:Name="SearchHost" Width="112" Height="34" CornerRadius="17"
+                        Background="{DynamicResource FieldBrush}"
+                        Cursor="Hand" MouseLeftButtonDown="SearchCapsule_Click">
+                    <Grid>
+                        <StackPanel x:Name="SearchCapsuleContent" Orientation="Horizontal"
+                                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                                    IsHitTestVisible="False">
+                            <TextBlock FontFamily="{StaticResource IconFontFamily}" FontSize="13"
+                                       Foreground="{DynamicResource AccentBrush}" Text="&#xE721;"/>
+                            <TextBlock Text="搜索" FontSize="13" Margin="7,0,0,0"
+                                       Foreground="{DynamicResource TextSecondaryBrush}"/>
+                        </StackPanel>
+                        <TextBox x:Name="SearchBox" Style="{StaticResource SearchBoxStyle}"
+                                 Height="30" Margin="2" Visibility="Collapsed"
+                                 Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+                                 PreviewMouseLeftButtonDown="SearchBox_PreviewMouseLeftButtonDown"
+                                 PreviewKeyDown="SearchBox_PreviewKeyDown"
+                                 LostKeyboardFocus="SearchBox_LostKeyboardFocus"/>
+                    </Grid>
+                </Border>
+            </Grid>
+
+            <!-- 窗口控制：最小化 / 关闭 -->
+            <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center"
+                        Margin="0,0,12,0" WindowChrome.IsHitTestVisibleInChrome="True">
+                <Button Style="{StaticResource IconButtonStyle}" Click="MinimizeButton_Click"
+                        ToolTip="最小化" Content="&#xE921;"
+                        FontFamily="{StaticResource IconFontFamily}" FontSize="10"/>
+                <Button Style="{StaticResource IconButtonStyle}" Click="CloseButton_Click"
+                        ToolTip="关闭" Margin="2,0,0,0" Content="&#xE8BB;"
+                        FontFamily="{StaticResource IconFontFamily}" FontSize="10"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- ———— 主体 ———— -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="224"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- 侧栏 -->
+            <Grid Grid.Column="0">
+                <ListBox Style="{StaticResource SidebarListBoxStyle}"
+                         ItemsSource="{Binding TabTags}"
+                         SelectedValuePath="Value"
+                         SelectedValue="{Binding SelectedTab}"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"
+                                       ToolTip="{Binding Label}">
+                                <TextBlock.ContextMenu>
+                                    <ContextMenu>
+                                        <!-- QQ（账号）页：重命名 / 解绑；普通标签页：删除标签及其图片 -->
+                                        <MenuItem Header="重命名" Click="RenameQqTab_Click"
+                                                  Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
+                                        <MenuItem Header="解除绑定" Click="UnbindQqTab_Click"
+                                                  Foreground="{DynamicResource DangerBrush}"
+                                                  Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
+                                        <MenuItem Header="删除标签及其图片"
+                                                  Foreground="{DynamicResource DangerBrush}"
+                                                  Click="DeleteTagAndFiles_Click"
+                                                  Visibility="{Binding IsQq, Converter={StaticResource InverseBoolToVis}}"/>
+                                    </ContextMenu>
+                                </TextBlock.ContextMenu>
+                            </TextBlock>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+
+            <!-- 侧栏与内容之间的发丝线 -->
+            <Border Grid.Column="1" Width="1" Margin="0,10" Background="{DynamicResource SeparatorBrush}"/>
+
+            <!-- 表情网格 -->
+            <Grid Grid.Column="2">
+                <ListBox x:Name="StickersList"
+                         Style="{StaticResource GhostListBoxStyle}"
+                         ItemsSource="{Binding Stickers}"
+                         AllowDrop="True"
+                         Drop="ListBox_Drop"
+                         DragEnter="ListBox_DragEnter"
+                         DragLeave="ListBox_DragLeave"
+                         DragOver="ListBox_DragOver"
+                         Background="Transparent"
+                         Padding="12,6,12,12"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         VirtualizingPanel.IsVirtualizing="True"
+                         VirtualizingPanel.VirtualizationMode="Recycling"
+                         PreviewMouseWheel="Gallery_PreviewMouseWheel">
+                    <ListBox.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <vwp:VirtualizingWrapPanel/>
+                        </ItemsPanelTemplate>
+                    </ListBox.ItemsPanel>
+                    <!-- 模板在 Window.Resources：QQ 页由代码切换为 QqTileTemplate -->
+                    <ListBox.ItemTemplate>
+                        <StaticResource ResourceKey="GalleryTileTemplate"/>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <!-- 空状态 -->
+                <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center"
+                            IsHitTestVisible="False" Visibility="Collapsed">
+                    <StackPanel.Style>
+                        <Style TargetType="StackPanel">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding Stickers.Count}" Value="0">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                    <DataTrigger.EnterActions>
+                                        <BeginStoryboard>
+                                            <Storyboard>
+                                                <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                                                 From="0" To="1" Duration="0:0:0.18">
+                                                    <DoubleAnimation.EasingFunction>
+                                                        <CubicEase EasingMode="EaseOut"/>
+                                                    </DoubleAnimation.EasingFunction>
+                                                </DoubleAnimation>
+                                            </Storyboard>
+                                        </BeginStoryboard>
+                                    </DataTrigger.EnterActions>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </StackPanel.Style>
+                    <TextBlock x:Name="EmptyIcon" FontFamily="{StaticResource IconFontFamily}" FontSize="42"
+                               HorizontalAlignment="Center"
+                               Foreground="{DynamicResource TextTertiaryBrush}">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Text" Value="&#xE76E;"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasSearchText}" Value="True">
+                                        <Setter Property="Text" Value="&#xE721;"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <TextBlock x:Name="EmptyTitleText" HorizontalAlignment="Center" Margin="0,14,0,0">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock" BasedOn="{StaticResource HeadlineTextStyle}">
+                                <Setter Property="Text" Value="这里还没有表情"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasSearchText}" Value="True">
+                                        <Setter Property="Text" Value="没有找到相关表情"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <TextBlock x:Name="EmptyHintText" HorizontalAlignment="Center" Margin="0,5,0,0">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock" BasedOn="{StaticResource FootnoteTextStyle}">
+                                <Setter Property="Text" Value="把图片或文件夹拖进窗口即可添加"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasSearchText}" Value="True">
+                                        <Setter Property="Text" Value="换个关键词试试，或点击搜索框的 ✕ 清空"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </StackPanel>
+
+                <!-- 拖放反馈 -->
+                <Border x:Name="DropOverlay" Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+                        IsHitTestVisible="False">
+                    <Border HorizontalAlignment="Center" VerticalAlignment="Center"
+                            Background="{DynamicResource MaterialBrush}" CornerRadius="24" Padding="22,13"
+                            BorderBrush="{DynamicResource MaterialBorderBrush}" BorderThickness="1">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE710;" FontSize="15"
+                                       Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
+                            <TextBlock Text="松开以添加表情" Style="{StaticResource BodyTextStyle}"
+                                       FontWeight="Medium" Margin="9,0,0,0" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Border>
+                </Border>
+            </Grid>
+        </Grid>
+
+        <!-- ———— 页脚 ———— -->
+        <!-- 水平缩进 24：圆角 R=16 的弧线在底角挖掉一块，页脚文字必须落在圆角安全区内。
+             中部留给悬浮表情的标签（自适应宽度，放不下的整条舍弃），右侧为实时计数。 -->
+        <Border Grid.Row="2" BorderBrush="{DynamicResource SeparatorBrush}" BorderThickness="0,1,0,0">
+            <Grid Margin="24,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <!-- 设置入口（原侧栏底部迁来；状态文字已移除——无信息量） -->
+                <Button Grid.Column="0" Style="{StaticResource TextButtonStyle}" Click="OpenSettings_Click"
+                        Height="26" Padding="10,0" HorizontalAlignment="Left" VerticalAlignment="Center"
+                        AutomationProperties.Name="设置" ToolTip="设置">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE713;"
+                                   FontSize="12" VerticalAlignment="Center"/>
+                        <TextBlock Text="设置" FontSize="11.5" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Button>
+                <Border Grid.Column="1" x:Name="HoverTagsSlot" Margin="18,0">
+                    <TextBlock x:Name="HoverTagsText" TextAlignment="Center" FontSize="11.5"
+                               Foreground="{DynamicResource TextPrimaryBrush}"
+                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis">
+                        <TextBlock.RenderTransform>
+                            <!-- 标签进场的上浮动效 -->
+                            <TranslateTransform x:Name="HoverTagsTranslate"/>
+                        </TextBlock.RenderTransform>
+                    </TextBlock>
+                </Border>
+                <TextBlock Grid.Column="2" Text="{Binding StickerCountText}" FontSize="11"
+                           Foreground="{DynamicResource TextPrimaryBrush}"
+                           HorizontalAlignment="Right" VerticalAlignment="Center"/>
+            </Grid>
+        </Border>
+
+        <!-- ———— 标签编辑器 sheet（覆盖标题栏/主体/页脚） ———— -->
+        <Grid x:Name="TagEditorOverlay" Grid.Row="0" Grid.RowSpan="3"
+              Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+              Opacity="0" MouseLeftButtonDown="OverlayScrim_Click">
+            <Border x:Name="TagEditorSheet" Style="{StaticResource SheetCardStyle}"
+                    Width="580" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5" Opacity="0">
+                <Border.RenderTransform>
+                    <ScaleTransform x:Name="TagEditorSheetScale" ScaleX="0.94" ScaleY="0.94"/>
+                </Border.RenderTransform>
+                <Grid Margin="26">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0" Margin="0,0,0,20">
+                        <TextBlock Text="编辑标签" Style="{StaticResource TitleTextStyle}"/>
+                        <TextBlock x:Name="TagEditorSubtitle" Style="{StaticResource FootnoteTextStyle}"
+                                   Margin="0,4,0,0" Text="为表情添加标签，方便搜索与整理"/>
+                    </StackPanel>
+
+                    <Grid Grid.Row="1">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="176"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <Border Background="{DynamicResource FieldBrush}" CornerRadius="14" Padding="10">
+                            <Image x:Name="TagEditorImage" Stretch="Uniform" MaxHeight="168"/>
+                        </Border>
+
+                        <StackPanel Grid.Column="1" Margin="20,0,0,0">
+                            <TextBlock Text="已选标签" Style="{StaticResource CaptionTextStyle}"/>
+                            <WrapPanel x:Name="CurrentTagsPanel" Margin="-2,6,-2,2"/>
+                            <TextBlock x:Name="NoTagsHint" Text="暂无标签，输入新标签或从下方选择"
+                                       Style="{StaticResource CaptionTextStyle}" Margin="0,2,0,4"/>
+
+                            <TextBlock Text="新增标签（回车或点击添加）" Style="{StaticResource CaptionTextStyle}"
+                                       Margin="0,14,0,0"/>
+                            <Grid Margin="0,7,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="TagInputBox" KeyDown="TagInputBox_KeyDown" Tag="输入标签…"/>
+                                <Button Grid.Column="1" Style="{StaticResource AccentButtonStyle}"
+                                        Content="添加" MinWidth="60" Margin="8,0,0,0" Click="AddTagButton_Click"/>
+                            </Grid>
+
+                            <TextBlock Text="库中已有标签（点击添加）" Style="{StaticResource CaptionTextStyle}"
+                                       Margin="0,16,0,0"/>
+                            <ScrollViewer MaxHeight="128" Margin="0,7,0,0"
+                                          VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <WrapPanel x:Name="TagPoolPanel" Margin="-2,0,-2,0"/>
+                            </ScrollViewer>
+                        </StackPanel>
+                    </Grid>
+
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,22,0,0">
+                        <Button Style="{StaticResource TextButtonStyle}" Content="取消"
+                                Width="88" Click="CloseTagEditor_Click"/>
+                        <Button Style="{StaticResource AccentButtonStyle}" Content="保存"
+                                Width="88" Margin="10,0,0,0" Click="SaveTag_Click"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- ———— 设置 sheet ———— -->
+        <Grid x:Name="SettingsOverlay" Grid.Row="0" Grid.RowSpan="3"
+              Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+              Opacity="0" MouseLeftButtonDown="OverlayScrim_Click">
+            <Border x:Name="SettingsSheet" Style="{StaticResource SheetCardStyle}"
+                    Width="460" MaxHeight="620" Margin="0,16" VerticalAlignment="Center"
+                    RenderTransformOrigin="0.5,0.5" Opacity="0">
+                <Border.RenderTransform>
+                    <ScaleTransform x:Name="SettingsSheetScale" ScaleX="0.94" ScaleY="0.94"/>
+                </Border.RenderTransform>
+                <Grid Margin="24,18">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="0,0,0,14">
+                        <TextBlock Text="设置" Style="{StaticResource TitleTextStyle}" VerticalAlignment="Center"/>
+                        <Button Style="{StaticResource IconButtonStyle}" Click="CloseSettings_Click"
+                                HorizontalAlignment="Right" ToolTip="关闭"
+                                Content="&#xE711;" FontFamily="{StaticResource IconFontFamily}" FontSize="11"/>
+                    </Grid>
+
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel Margin="0,-4,0,0">
+
+                            <TextBlock Text="通用" Style="{StaticResource CaptionTextStyle}" Margin="2,6,0,10"/>
+                            <Border Style="{StaticResource SettingsGroupStyle}">
+                                <StackPanel>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="开机自启动" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="登录 Windows 后自动启动飞鸟"
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding LaunchOnStartup}"
+                                                  VerticalAlignment="Center"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="关闭时最小化到托盘" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="点 ✕ 隐藏到托盘驻留，从托盘图标退出程序"
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding CloseToTray}"
+                                                  VerticalAlignment="Center"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="启动时进入托盘" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="启动后不显示主窗口，直接驻留托盘（图标将常驻）"
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding SilentStart}"
+                                                  VerticalAlignment="Center"/>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+
+                            <TextBlock Text="外观" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <ItemsControl ItemsSource="{Binding ThemeOptions}" Margin="2,0,0,0">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <StackPanel Orientation="Horizontal"/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <RadioButton Style="{StaticResource ThemeSwatchStyle}" GroupName="Theme"
+                                                     IsChecked="{Binding IsSelected}"
+                                                     Checked="ThemeSwatch_Checked"/>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+
+                            <Border Style="{StaticResource SettingsGroupStyle}" Margin="0,12,0,0">
+                                <Grid Margin="16,11">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="磨砂浓度" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBlock Text="玻璃的白度与不透明程度，实时生效"
+                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding GlassOpacity, StringFormat={}{0}%}" Width="34"
+                                                   Style="{StaticResource FootnoteTextStyle}"
+                                                   VerticalAlignment="Center" HorizontalAlignment="Right"/>
+                                        <Slider Style="{StaticResource SliderStyle}" Width="110" Margin="8,0,0,0"
+                                                Minimum="50" Maximum="100" IsSnapToTickEnabled="True" TickFrequency="1"
+                                                Value="{Binding GlassOpacity}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+
+                            <TextBlock Text="发送" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <Border Background="{DynamicResource FieldBrush}" CornerRadius="11"
+                                    Padding="2" Height="32">
+                                <UniformGrid Columns="2">
+                                    <RadioButton Style="{StaticResource SegmentedItemStyle}" GroupName="SendMode"
+                                                 Content="单击发送" IsChecked="{Binding IsSingleClick}"/>
+                                    <RadioButton Style="{StaticResource SegmentedItemStyle}" GroupName="SendMode"
+                                                 Content="双击发送" IsChecked="{Binding IsDoubleClick}"/>
+                                </UniformGrid>
+                            </Border>
+                            <Border Style="{StaticResource SettingsGroupStyle}" Margin="0,12,0,0">
+                                <Grid Margin="16,11" Grid.IsSharedSizeScope="False">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="发送后恢复剪贴板" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBlock Text="关闭时，表情发送后会留在剪贴板"
+                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                              IsChecked="{Binding RestoreClipboardAfterSend}"
+                                              VerticalAlignment="Center"/>
+                                </Grid>
+                            </Border>
+
+                            <TextBlock Text="QQ 联动" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <Border Style="{StaticResource SettingsGroupStyle}">
+                                <StackPanel>
+                                    <Button Style="{StaticResource RowButtonStyle}" Click="OpenQqBindingDialog_Click"
+                                            AutomationProperties.Name="绑定 QQ 表情">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE710;"
+                                                       FontSize="14" Foreground="{DynamicResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="绑定 QQ 表情…" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="QQ 表情面板共存" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="点开 QQ 表情面板时，自动在旁边弹出快捷面板"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding EnableQqCoexistTrigger}"
+                                                  VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="轮询保底" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="推荐快捷表情面板弹出异常时开启；开启后会定期查询 QQ 的表情面板状态，保证面板联动不失效，对性能影响很小"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding EnableWatcherPolling}"
+                                                  VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="QQ 新收藏自动入库" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="在 QQ 里点「添加到表情」后，自动复制进图库并打「QQ」标签"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding QqFavoriteAutoImport}"
+                                                  VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="QQ 收藏深度同步" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap">
+                                                <TextBlock.Text>
+                                                    <MultiBinding StringFormat="{}{0}">
+                                                        <Binding Path="QqDeepSyncStatusText"/>
+                                                    </MultiBinding>
+                                                </TextBlock.Text>
+                                            </TextBlock>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding QqDeepSyncEnabled}"
+                                                  VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                    </Grid>
+                                    <!-- 同步策略三档（深度同步开启后出现） -->
+                                    <Grid Margin="16,4,16,11" Visibility="{Binding QqSyncStrategyVisible, Converter={StaticResource BoolToVis}}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="发现已取消收藏的表情时" Style="{StaticResource FootnoteTextStyle}"
+                                                   VerticalAlignment="Center"/>
+                                        <Border Grid.Column="1" Background="{DynamicResource FieldBrush}" CornerRadius="11"
+                                                Padding="2" Height="32" Margin="12,0,0,0">
+                                            <UniformGrid Columns="3">
+                                                <RadioButton Style="{StaticResource SegmentedItemStyle}" GroupName="QqSyncStrategy"
+                                                             Content="仅标记" IsChecked="{Binding StrategyIsMark, Mode=TwoWay}"
+                                                             ToolTip="表情保留在 QQ 页，左下角出现淡色「已移除」角标（悬浮看解释）"/>
+                                                <RadioButton Style="{StaticResource SegmentedItemStyle}" GroupName="QqSyncStrategy"
+                                                             Content="同步删除" IsChecked="{Binding StrategyIsRemove, Mode=TwoWay}"
+                                                             ToolTip="从 QQ 页移除该表情（QQ 的缓存文件不会被删除）"/>
+                                                <RadioButton Style="{StaticResource SegmentedItemStyle}" GroupName="QqSyncStrategy"
+                                                             Content="挪入图库" IsChecked="{Binding StrategyIsAdopt, Mode=TwoWay}"
+                                                             ToolTip="把表情复制进图库继续管理（不带 QQ 标签），并从 QQ 页移除"/>
+                                            </UniformGrid>
+                                        </Border>
+                                    </Grid>
+                                    <!-- 存量孤儿批量收编：仅在「挪入图库」档解锁，用户主动点击才执行 -->
+                                    <Button Style="{StaticResource TextButtonStyle}"
+                                            HorizontalAlignment="Right" Margin="16,0,16,11"
+                                            Visibility="{Binding AdoptBatchButtonVisible, Converter={StaticResource BoolToVis}}"
+                                            Click="AdoptOrphansBatch_Click"
+                                            AutomationProperties.Name="把现有已取消收藏的表情批量移入图库">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE8B7;"
+                                                       FontSize="12" VerticalAlignment="Center"/>
+                                            <TextBlock Text="把现有的「已移除」表情批量移入图库…" FontSize="12"
+                                                       Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                </StackPanel>
+                            </Border>
+
+                            <TextBlock Text="快捷键" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <Border Style="{StaticResource SettingsGroupStyle}">
+                                <StackPanel>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="呼出快捷面板" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="点击右侧输入框，按下新的组合键"
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                        </StackPanel>
+                                        <TextBox x:Name="HotkeyBox" Grid.Column="1" Width="136" Margin="12,0,0,0"
+                                                 IsReadOnly="True" Cursor="Hand" TextAlignment="Center"
+                                                 FontSize="12" Text="{Binding HotkeyDisplay, Mode=OneWay}"
+                                                 PreviewKeyDown="HotkeyBox_PreviewKeyDown"
+                                                 ToolTip="按下想要的组合键即可更换（Esc 取消）"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,9">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="需包含 Ctrl / Alt / Shift / Win，或直接使用 F1–F12"
+                                                   Style="{StaticResource FootnoteTextStyle}" VerticalAlignment="Center"/>
+                                        <Button Grid.Column="1" Style="{StaticResource TextButtonStyle}"
+                                                Content="恢复默认" FontSize="12" Height="26" Padding="10,0"
+                                                Click="ResetHotkey_Click"/>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+
+                            <TextBlock Text="图库" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <Border Style="{StaticResource SettingsGroupStyle}">
+                                <Grid Margin="16,11">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="GIF 悬浮预览" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBlock Text="悬浮表情时自动播放动图气泡"
+                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                              IsChecked="{Binding EnableGifHoverPreview}"
+                                              VerticalAlignment="Center"/>
+                                </Grid>
+                            </Border>
+
+                            <TextBlock Text="资源库" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <Border Style="{StaticResource SettingsGroupStyle}" Margin="0,0,0,8">
+                                <StackPanel>
+                                    <Button Style="{StaticResource RowButtonStyle}" Command="{Binding OpenLibraryCommand}">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE8B7;"
+                                                       FontSize="14" Foreground="{DynamicResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="打开表情存放文件夹" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
+                                    <Button Style="{StaticResource RowButtonStyle}" Click="OpenQuickPanel_Click">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE765;"
+                                                       FontSize="14" Foreground="{DynamicResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="打开快捷表情面板" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="复制图片后提示入库" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="在 QQ、浏览器等任意应用里「复制图片」后，右下角弹出一键入库提示"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding CaptureClipboardImages}"
+                                                  VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="WebP 图片支持" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="{Binding WebpStatusText}"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <Button Style="{StaticResource TextButtonStyle}" Content="重新检测"
+                                                    FontSize="12" Height="26" Padding="10,0"
+                                                    Click="RecheckWebp_Click"
+                                                    ToolTip="重新探测系统的 WebP 解码能力（装好扩展后点这个）"/>
+                                            <Button x:Name="WebpStoreButton" Style="{StaticResource TextButtonStyle}"
+                                                    Content="打开安装页" FontSize="12" Height="26" Padding="10,0"
+                                                    Margin="6,0,0,0" Click="OpenWebpStore_Click"
+                                                    Visibility="{Binding WebpSupported, Converter={StaticResource InverseBoolToVis}}"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+
+                        </StackPanel>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- ———— QQ 绑定 sheet（设置 → 绑定 QQ 表情） ———— -->
+        <Grid x:Name="QqBindOverlay" Grid.Row="0" Grid.RowSpan="3"
+              Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+              Opacity="0" MouseLeftButtonDown="OverlayScrim_Click">
+            <Border x:Name="QqBindSheet" Style="{StaticResource SheetCardStyle}"
+                    Width="640" MaxHeight="600" Margin="0,16" VerticalAlignment="Center"
+                    RenderTransformOrigin="0.5,0.5" Opacity="0">
+                <Border.RenderTransform>
+                    <ScaleTransform x:Name="QqBindSheetScale" ScaleX="0.94" ScaleY="0.94"/>
+                </Border.RenderTransform>
+                <Grid Margin="24,18">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="0,0,0,4">
+                        <StackPanel>
+                            <TextBlock Text="绑定 QQ 表情" Style="{StaticResource TitleTextStyle}"/>
+                            <TextBlock Text="扫描本机 QQ 的收藏表情（表情面板的爱心分页），勾选后绑定；解绑不影响已导入图库的表情"
+                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,4,0,0"
+                                       TextWrapping="Wrap" MaxWidth="520" HorizontalAlignment="Left"/>
+                        </StackPanel>
+                        <Button Style="{StaticResource IconButtonStyle}" Click="CloseQqBindDialog_Click"
+                                HorizontalAlignment="Right" VerticalAlignment="Top" ToolTip="关闭"
+                                Content="&#xE711;" FontFamily="{StaticResource IconFontFamily}" FontSize="11"/>
+                    </Grid>
+
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled" Margin="0,12,0,0">
+                        <StackPanel>
+                            <StackPanel x:Name="QqBindList"/>
+                            <TextBlock x:Name="QqBindEmptyHint" Text="没有找到 QQ 账号数据（Tencent Files 目录为空）"
+                                       Style="{StaticResource FootnoteTextStyle}" HorizontalAlignment="Center"
+                                       Margin="0,24,0,24" Visibility="Collapsed"/>
+                        </StackPanel>
+                    </ScrollViewer>
+
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+                        <Button x:Name="QqBindSelectedButton" Style="{StaticResource AccentButtonStyle}"
+                                Content="绑定所选" MinWidth="96" Click="QqBindSelected_Click"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- ———— QQ 页重命名 sheet（选项卡右键 → 重命名） ———— -->
+        <Grid x:Name="QqRenameOverlay" Grid.Row="0" Grid.RowSpan="3"
+              Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+              Opacity="0" MouseLeftButtonDown="OverlayScrim_Click">
+            <Border x:Name="QqRenameSheet" Style="{StaticResource SheetCardStyle}"
+                    Width="400" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5" Opacity="0">
+                <Border.RenderTransform>
+                    <ScaleTransform x:Name="QqRenameSheetScale" ScaleX="0.94" ScaleY="0.94"/>
+                </Border.RenderTransform>
+                <StackPanel Margin="26">
+                    <TextBlock Text="重命名 QQ 页" Style="{StaticResource TitleTextStyle}"/>
+                    <TextBlock x:Name="QqRenameSubtitle" Style="{StaticResource FootnoteTextStyle}"
+                               Margin="0,4,0,0" TextWrapping="Wrap"/>
+                    <TextBox x:Name="QqRenameBox" Margin="0,16,0,0" Tag="输入显示名，留空恢复默认"
+                             KeyDown="QqRenameBox_KeyDown"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+                        <Button Style="{StaticResource TextButtonStyle}" Content="取消"
+                                Width="88" Click="CloseQqRename_Click"/>
+                        <Button Style="{StaticResource AccentButtonStyle}" Content="保存"
+                                Width="88" Margin="10,0,0,0" Click="SaveQqRename_Click"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- ———— iOS 风格 Alert ———— -->
+        <Grid x:Name="AlertOverlay" Grid.Row="0" Grid.RowSpan="3"
+              Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+              Opacity="0" MouseLeftButtonDown="OverlayScrim_Click">
+            <Border x:Name="AlertCard" Style="{StaticResource SheetCardStyle}"
+                    Width="286" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5" Opacity="0">
+                <Border.RenderTransform>
+                    <ScaleTransform x:Name="AlertCardScale" ScaleX="0.9" ScaleY="0.9"/>
+                </Border.RenderTransform>
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel Grid.Row="0" Margin="22,22,22,18">
+                        <TextBlock x:Name="AlertTitle" TextAlignment="Center" Style="{StaticResource HeadlineTextStyle}"/>
+                        <TextBlock x:Name="AlertMessage" TextAlignment="Center" Margin="0,7,0,0"
+                                   FontSize="12.5" TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextSecondaryBrush}"/>
+                    </StackPanel>
+                    <Grid Grid.Row="1">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="44"/>
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0" Height="1" Background="{DynamicResource SeparatorBrush}"/>
+                        <Grid Grid.Row="1">
+                            <!-- 中性按钮（如"不再询问"）默认隐藏折叠为 [取消|确认] 双按钮 -->
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition x:Name="AlertNeutralColumn" Width="0"/>
+                                <ColumnDefinition x:Name="AlertNeutralSeparatorColumn" Width="0"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="AlertCancelButton" Grid.Column="0" Style="{StaticResource AlertButtonLeftStyle}"
+                                    Content="取消" Click="AlertCancel_Click"/>
+                            <Border Grid.Column="1" Width="1" Background="{DynamicResource SeparatorBrush}"/>
+                            <Button x:Name="AlertNeutralButton" Grid.Column="2" Style="{StaticResource AlertButtonLeftStyle}"
+                                    Visibility="Collapsed" Click="AlertNeutral_Click"/>
+                            <Border x:Name="AlertNeutralSeparator" Grid.Column="3" Width="1"
+                                    Background="{DynamicResource SeparatorBrush}" Visibility="Collapsed"/>
+                            <Button x:Name="AlertConfirmButton" Grid.Column="4" Style="{StaticResource AlertButtonRightStyle}"
+                                    FontWeight="SemiBold" Click="AlertConfirm_Click"/>
+                        </Grid>
+                    </Grid>
+                </Grid>
+            </Border>
+        </Grid>
+
+    </Grid>
+    </Border>
+
+</services:GlassWindow>

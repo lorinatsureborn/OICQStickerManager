@@ -1,0 +1,42 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- 托盘图标用 WinForms 的 NotifyIcon（随运行时自带，任务栏重启等 shell 边界它都处理了） -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>Asuka</AssemblyName>
+    <ApplicationIcon>Assets\Asuka.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\Asuka.ico" />
+    <Resource Include="Assets\bird-mask.png" />
+    <!-- 内嵌字体（Inter=拉丁/数字 OFL，MiSans=中文 小米免费商用）：pack URI 按家族名引用 -->
+    <None Remove="Fonts\*.otf" />
+    <None Remove="Fonts\*.ttf" />
+    <Resource Include="Fonts\*.otf" />
+    <Resource Include="Fonts\*.ttf" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="Fonts\LICENSE-Inter-OFL.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Fonts\README-MiSans.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- WinForms 全局 using 与 WPF 类型名冲突（Size/KeyEventArgs/Image…），
+         移除后托盘代码里的全限定 System.Windows.Forms.NotifyIcon 不受影响 -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <PackageReference Include="VirtualizingWrapPanel" Version="2.5.4" />
+    <PackageReference Include="WpfAnimatedGif" Version="2.0.2" />
+  </ItemGroup>
+
+</Project>

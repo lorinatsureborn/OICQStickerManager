@@ -1,0 +1,201 @@
+<services:GlassWindow x:Class="OICQStickerManager.Views.QuickPanelWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:services="clr-namespace:OICQStickerManager.Services"
+        xmlns:vwp="clr-namespace:WpfToolkit.Controls;assembly=VirtualizingWrapPanel"
+        Title="快捷表情面板" Width="680" Height="540"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ShowActivated="False" ShowInTaskbar="False" Topmost="True"
+        ResizeMode="NoResize" WindowStartupLocation="Manual"
+        FontFamily="{StaticResource AppFontFamily}" UseLayoutRounding="True">
+
+    <WindowChrome.WindowChrome>
+        <!-- GlassFrameThickness 保持默认 0：分层窗口（AllowsTransparency）挂玻璃帧自相矛盾，
+             且 DWM 玻璃层自带一份不受控的背景快照，是顶部横带显示旧画面伪影的嫌疑源；
+             主窗口无玻璃帧而磨砂正常，磨砂完全由拼片+材质层提供 -->
+        <WindowChrome CaptionHeight="0" ResizeBorderThickness="0"
+                      CornerRadius="0" UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+    </Window.Resources>
+
+    <Border CornerRadius="16" Background="{DynamicResource GlassOverlayBrush}"
+            BorderBrush="{DynamicResource MaterialBorderBrush}" BorderThickness="1">
+    <Grid x:Name="PanelRoot" MouseEnter="PanelRoot_MouseEnter" MouseLeave="PanelRoot_MouseLeave"
+          RenderTransformOrigin="0.5,0.5">
+        <Grid.RenderTransform>
+            <ScaleTransform x:Name="PanelScale"/>
+        </Grid.RenderTransform>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="48"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- 标题行：面板名 + 热键键帽 + 圆形图标按钮 -->
+        <Grid Grid.Row="0" Margin="18,0,12,0">
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock Text="快捷表情面板" FontSize="13" FontWeight="SemiBold"
+                           Foreground="{DynamicResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                <ItemsControl ItemsSource="{Binding HotkeyKeycaps}" Margin="12,0,0,0"
+                              VerticalAlignment="Center">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Horizontal"/>
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="{DynamicResource FieldBrush}" CornerRadius="5"
+                                    Padding="5,2" Margin="1.5,0">
+                                <TextBlock Text="{Binding}" FontSize="10"
+                                           Foreground="{DynamicResource TextSecondaryBrush}"/>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <TextBlock Text="呼出 / 收起" FontSize="11" Margin="4,0,0,0"
+                           Foreground="{DynamicResource TextTertiaryBrush}" VerticalAlignment="Center"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                <Button Style="{StaticResource IconButtonStyle}" Click="SearchButton_Click"
+                        ToolTip="跳转到主界面搜索表情"
+                        Content="&#xE721;" FontFamily="{StaticResource IconFontFamily}" FontSize="12"/>
+                <Button Style="{StaticResource IconButtonStyle}" Click="CloseButton_Click"
+                        ToolTip="收起" Margin="2,0,0,0"
+                        Content="&#xE711;" FontFamily="{StaticResource IconFontFamily}" FontSize="11"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- 标题行下的发丝线 -->
+        <Border Grid.Row="0" Height="1" VerticalAlignment="Bottom" Margin="14,0"
+                Background="{DynamicResource SeparatorBrush}"/>
+
+        <!-- 选项卡行：悬浮 150ms 切换视角（非激活窗口鼠标事件照常到达，悬浮不抢聊天输入框焦点） -->
+        <ScrollViewer x:Name="PanelTabScroll" Grid.Row="1" VerticalScrollBarVisibility="Disabled"
+                      HorizontalScrollBarVisibility="Hidden"
+                      MouseWheel="PanelTabScroll_MouseWheel"
+                      Visibility="{Binding HasPanelTabs, Converter={StaticResource BoolToVis}}">
+            <ItemsControl ItemsSource="{Binding PanelTabs}" Margin="14,5,14,3" HorizontalAlignment="Left">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal"/>
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Button Content="{Binding Label}" Focusable="False"
+                                MouseEnter="PanelTab_MouseEnter" MouseLeave="PanelTab_MouseLeave"
+                                PreviewMouseLeftButtonDown="PanelTab_MouseDown">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource ChipButtonStyle}">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                                            <Setter Property="Background" Value="{DynamicResource AccentBrush}"/>
+                                            <Setter Property="Foreground" Value="{DynamicResource OnAccentBrush}"/>
+                                            <Setter Property="FontWeight" Value="Medium"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Button.Style>
+                        </Button>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+
+        <!-- 表情网格：QuickPanelView = 全量 + 热度排序的独立视图（不受主界面标签页/搜索过滤影响） -->
+        <ListBox Grid.Row="2" Style="{StaticResource GhostListBoxStyle}"
+                 ItemsSource="{Binding QuickPanelView}"
+                 Background="Transparent" Margin="10,8,10,12"
+                 ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                 VirtualizingPanel.IsVirtualizing="True"
+                 VirtualizingPanel.VirtualizationMode="Recycling">
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <vwp:VirtualizingWrapPanel/>
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <Border x:Name="Tile" Width="100" Height="100" Margin="4" Cursor="Hand"
+                            Background="Transparent" CornerRadius="14" RenderTransformOrigin="0.5,0.5"
+                            AutomationProperties.Name="{Binding DisplayName}">
+                        <Border.RenderTransform>
+                            <ScaleTransform x:Name="TileScale"/>
+                        </Border.RenderTransform>
+                        <Border.InputBindings>
+                            <MouseBinding MouseAction="LeftClick"
+                                          Command="{Binding DataContext.PanelStickerClickCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                          CommandParameter="{Binding}"/>
+                            <MouseBinding MouseAction="LeftDoubleClick"
+                                          Command="{Binding DataContext.PanelStickerDoubleClickCommand, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                          CommandParameter="{Binding}"/>
+                        </Border.InputBindings>
+                        <Grid>
+                            <Border x:Name="FillLayer" Background="{DynamicResource FillHoverBrush}"
+                                    CornerRadius="14" Opacity="0"/>
+                            <Image Source="{Binding ImageSource}" Width="86" Height="86"
+                                   Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <!-- GIF 角标：提示该表情会以动图形式发出 -->
+                            <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,8,8,0"
+                                    Background="#99000000" CornerRadius="6" Padding="4,1.5"
+                                    Visibility="{Binding IsGif, Converter={StaticResource BoolToVis}}">
+                                <TextBlock Text="GIF" FontSize="8" FontWeight="Bold" Foreground="#F2FFFFFF"/>
+                            </Border>
+                        </Grid>
+                    </Border>
+                    <DataTemplate.Triggers>
+                        <Trigger SourceName="Tile" Property="IsMouseOver" Value="True">
+                            <Setter TargetName="FillLayer" Property="Opacity" Value="1"/>
+                            <Trigger.EnterActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                         Storyboard.TargetProperty="ScaleX"
+                                                         To="1.06" Duration="0:0:0.14">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                         Storyboard.TargetProperty="ScaleY"
+                                                         To="1.06" Duration="0:0:0.14">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.EnterActions>
+                            <Trigger.ExitActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                         Storyboard.TargetProperty="ScaleX"
+                                                         To="1" Duration="0:0:0.16">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <DoubleAnimation Storyboard.TargetName="TileScale"
+                                                         Storyboard.TargetProperty="ScaleY"
+                                                         To="1" Duration="0:0:0.16">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.ExitActions>
+                        </Trigger>
+                    </DataTemplate.Triggers>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+    </Grid>
+    </Border>
+</services:GlassWindow>

@@ -1,0 +1,14 @@
+﻿<Application x:Class="OICQStickerManager.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:OICQStickerManager"
+             ShutdownMode="OnMainWindowClose">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!-- 设计系统（控件模板/动效/字体）；调色板由 ThemeManager 在启动时插入 -->
+                <ResourceDictionary Source="Themes/Tokens.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
