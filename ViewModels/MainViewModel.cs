@@ -982,6 +982,7 @@ public class MainViewModel : ViewModelBase
                 CurrentSendMode = this.CurrentSendMode,
                 RestoreClipboardAfterSend = this.RestoreClipboardAfterSend,
                 CaptureClipboardImages = this.CaptureClipboardImages,
+                ToastDurationSeconds = this.ToastDurationSeconds,
                 QqFavoriteAutoImport = this.QqFavoriteAutoImport,
                 QqDeepSyncEnabled = this.QqDeepSyncEnabled,
                 QqSyncStrategy = this.QqSyncStrategy,
@@ -1237,10 +1238,31 @@ public class MainViewModel : ViewModelBase
             {
                 _captureClipboardImages = value;
                 OnPropertyChanged();
+                OnPropertyChanged(nameof(ToastDurationVisible));
                 _ = SaveConfigAsync();
             }
         }
     }
+
+    // 入库轻提示停留时长（秒，3-15）：下一次弹窗即用新值（弹窗在 Show 时向 VM 取数）
+    private int _toastDurationSeconds = 8;
+    public int ToastDurationSeconds
+    {
+        get => _toastDurationSeconds;
+        set
+        {
+            value = Math.Clamp(value, 3, 15);
+            if (_toastDurationSeconds != value)
+            {
+                _toastDurationSeconds = value;
+                OnPropertyChanged();
+                _ = SaveConfigAsync();
+            }
+        }
+    }
+
+    // 时长行只在捕获开关打开时有意义（跟随开关显隐）
+    public bool ToastDurationVisible => _captureClipboardImages;
 
     // M4 联动：QQ 里点「添加到表情」后自动复制进图库（默认关，避免未经确认写入图库）
     private bool _qqFavoriteAutoImport;
@@ -1617,6 +1639,7 @@ public class MainViewModel : ViewModelBase
                     this.CurrentSendMode = config.CurrentSendMode;
                     this.RestoreClipboardAfterSend = config.RestoreClipboardAfterSend;
                     this._captureClipboardImages = config.CaptureClipboardImages;
+                    this._toastDurationSeconds = Math.Clamp(config.ToastDurationSeconds, 3, 15);
                     this._qqFavoriteAutoImport = config.QqFavoriteAutoImport;
                     this._qqDeepSyncEnabled = config.QqDeepSyncEnabled;
                     this._qqSyncStrategy = config.QqSyncStrategy;
@@ -1660,6 +1683,8 @@ public class MainViewModel : ViewModelBase
                     OnPropertyChanged(nameof(QqDeepSyncEnabled));
                     OnPropertyChanged(nameof(QqFavoriteAutoImport));
                     OnPropertyChanged(nameof(CaptureClipboardImages));
+                    OnPropertyChanged(nameof(ToastDurationSeconds));
+                    OnPropertyChanged(nameof(ToastDurationVisible));
                     OnPropertyChanged(nameof(StrategyIsMark));
                     OnPropertyChanged(nameof(StrategyIsRemove));
                     OnPropertyChanged(nameof(StrategyIsAdopt));

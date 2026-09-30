@@ -667,7 +667,8 @@ namespace OICQStickerManager.Views
             try { thumb = LoadBitmapScaled(imagePath, 96); } catch { }
             if (thumb == null) return;
 
-            var toast = new ClipboardToastWindow(thumb, "复制了图片");
+            var durationSec = DataContext is MainViewModel vm ? vm.ToastDurationSeconds : 8;
+            var toast = new ClipboardToastWindow(thumb, "复制了图片", durationSec * 1000);
             _captureToast = toast;
             toast.ImportClicked += () =>
             {

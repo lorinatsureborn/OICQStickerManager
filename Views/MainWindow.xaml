@@ -908,6 +908,26 @@
                                                   IsChecked="{Binding CaptureClipboardImages}"
                                                   VerticalAlignment="Center" Margin="12,0,0,0"/>
                                     </Grid>
+                                    <Grid Margin="16,11" Visibility="{Binding ToastDurationVisible, Converter={StaticResource BoolToVis}}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="提示停留时长" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="超时未处理视为忽略，自动消失"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding ToastDurationSeconds, StringFormat={}{0} 秒}" Width="46"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       VerticalAlignment="Center" HorizontalAlignment="Right"/>
+                                            <Slider Style="{StaticResource SliderStyle}" Width="110" Margin="8,0,0,0"
+                                                    Minimum="3" Maximum="15" IsSnapToTickEnabled="True" TickFrequency="1"
+                                                    Value="{Binding ToastDurationSeconds}"/>
+                                        </StackPanel>
+                                    </Grid>
                                     <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
                                     <Grid Margin="16,11">
                                         <Grid.ColumnDefinitions>

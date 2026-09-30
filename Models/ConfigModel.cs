@@ -49,6 +49,9 @@ public class AppConfig
     // 复制图片后弹轻提示一键入库（M2 剪贴板捕获，默认开）
     public bool CaptureClipboardImages { get; set; } = true;
 
+    // 入库轻提示的停留时长（秒，3-15）：超时未处理视为忽略；默认 8 秒
+    public int ToastDurationSeconds { get; set; } = 8;
+
     // QQ 里点「添加到表情」后自动复制进图库（M4 联动，默认关）
     public bool QqFavoriteAutoImport { get; set; } = false;
 

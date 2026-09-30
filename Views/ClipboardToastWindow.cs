@@ -9,7 +9,7 @@ namespace OICQStickerManager.Views;
 
 /// <summary>
 /// 剪贴板捕获轻提示（M2）/通用迷你 toast：非激活窗口（不抢聊天焦点）、右下角贴托盘、
-/// 8 秒自动淡出。纯代码构建无 XAML；素材经 SetResourceReference 跟随主题。
+/// 停留时长由设置决定（自动淡出）。纯代码构建无 XAML；素材经 SetResourceReference 跟随主题。
 /// </summary>
 public class ClipboardToastWindow : Window
 {
@@ -31,10 +31,12 @@ public class ClipboardToastWindow : Window
     /// <summary>超时/✕ 关闭（未入库）。</summary>
     public event Action? Dismissed;
 
-    private const int AutoDismissMs = 8000;
+    private readonly int _autoDismissMs;
 
-    public ClipboardToastWindow(ImageSource thumbnail, string title)
+    /// <param name="autoDismissMs">停留时长（毫秒），超时未处理视为忽略。</param>
+    public ClipboardToastWindow(ImageSource thumbnail, string title, int autoDismissMs = 8000)
     {
+        _autoDismissMs = autoDismissMs;
         WindowStyle = WindowStyle.None;
         AllowsTransparency = true;
         Background = Brushes.Transparent;
@@ -126,8 +128,8 @@ public class ClipboardToastWindow : Window
     public new void Show()
     {
         base.Show();
-        // 8 秒不处理即自动关闭（视为忽略）
-        _autoDismiss = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(AutoDismissMs) };
+        // 到时不处理即自动关闭（视为忽略）；时长来自设置页
+        _autoDismiss = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_autoDismissMs) };
         _autoDismiss.Tick += (_, _) => Finish(Dismissed);
         _autoDismiss.Start();
     }
