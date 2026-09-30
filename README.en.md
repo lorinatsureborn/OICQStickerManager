@@ -191,6 +191,10 @@ Open Settings from the bottom-left of the main window.
 - Apps without UI-automation integration (e.g. WeChat): use the global hotkey for the quick panel;
 - Major QQ updates may break the co-existence linkage — a benign degradation; enabling "Polling fallback" restores it.
 
+## 📄 License
+
+This project is licensed under the [MIT](LICENSE) license. Embedded fonts ship under their own licenses: [Inter](https://rsms.me/inter/) (SIL OFL 1.1), [MiSans](https://hyperos.mi.com/font) (free commercial license by Xiaomi); license files in [Fonts/](Fonts/).
+
 ## 🙏 Acknowledgements
 
 - [QQBackup/qq-win-db-key](https://github.com/QQBackup/qq-win-db-key) — QQ favorites index key extraction (deep sync, optional)

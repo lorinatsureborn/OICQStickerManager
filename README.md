@@ -197,6 +197,10 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 - 微信等无 UI 自动化联动的应用，请使用全局热键唤出快捷面板；
 - QQ 大版本更新可能导致共存联动失灵，属良性降级——开启「轮询保底」即可恢复。
 
+## 📄 许可
+
+本项目以 [MIT](LICENSE) 协议开源。内嵌字体遵循其自身许可：[Inter](https://rsms.me/inter/)（SIL OFL 1.1）、[MiSans](https://hyperos.mi.com/font)（小米免费商用授权），许可文件见 [Fonts/](Fonts/)。
+
 ## 🙏 致谢
 
 - [QQBackup/qq-win-db-key](https://github.com/QQBackup/qq-win-db-key) —— QQ 收藏索引密钥提取（深度同步，可选功能）
