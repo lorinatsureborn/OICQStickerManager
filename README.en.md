@@ -49,7 +49,7 @@ Grab the latest `Asuka.zip` from [Releases](../../releases), unzip and run `Asuk
 ### Build from source
 
 ```bash
-git clone https://github.com/<your-name>/OICQStickerManager.git
+git clone https://github.com/lorinatsureborn/OICQStickerManager.git
 cd OICQStickerManager
 dotnet build -c Release
 # output in bin/Release/net10.0-windows/

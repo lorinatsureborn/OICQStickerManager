@@ -46,7 +46,7 @@
 ### 从源码构建
 
 ```bash
-git clone https://github.com/<你的用户名>/OICQStickerManager.git
+git clone https://github.com/lorinatsureborn/OICQStickerManager.git
 cd OICQStickerManager
 dotnet build -c Release
 # 产物在 bin/Release/net10.0-windows/
