@@ -735,7 +735,18 @@ public class MainViewModel : ViewModelBase
     private void UpdateImportedFlags(QqEmojiService service)
     {
         foreach (var item in service.Mirror)
-            item.IsImported = Stickers.Any(s => s.Md5 == item.Md5);
+        {
+            var twin = Stickers.FirstOrDefault(s => s.Md5 == item.Md5);
+            item.IsImported = twin != null;
+            // 借入标签：图库同款副本的标签供 QQ 页悬浮页脚显示（自身标签优先，见 EffectiveTags）
+            item.BorrowedTags = twin?.Tags;
+        }
+    }
+
+    /// <summary>图库标签编辑/表情删除后调用：刷新 QQ 页镜像的已入库角标与借入标签。</summary>
+    public void RefreshQqMirrorFlags()
+    {
+        foreach (var service in _qqServices.Values) UpdateImportedFlags(service);
     }
 
     // ———— QQ 页搜索分桶（2026-10-01 用户定案：QQ 页搜索不过滤、按命中优先排序）————

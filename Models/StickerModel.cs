@@ -35,6 +35,11 @@ public class StickerModel : ViewModelBase // 💡 继承基类
         set { _tags = value; OnPropertyChanged(); }
     }
 
+    /// <summary>页脚悬浮等展示场景用的有效标签：图库条目=自身 Tags；
+    /// QQ 镜像覆写为"自身标签优先，否则借图库同款副本的标签"（见 QqStickerModel）。</summary>
+    [JsonIgnore]
+    public virtual List<string> EffectiveTags => Tags;
+
     // 最近活跃时间 = 最近一次使用；从未使用时以入库时间兜底（语义见 StickerRanking）
     private DateTime _lastUsedTime = DateTime.MinValue;
     public DateTime LastUsedTime

@@ -16,6 +16,22 @@ public class QqStickerModel : StickerModel
     [JsonIgnore]
     public override bool IsQqItem => true;
 
+    private List<string>? _borrowedTags;
+
+    /// <summary>图库同款副本的标签（Md5 对账借入，见 MainViewModel.UpdateImportedFlags）；
+    /// null=图库没有同款。用户在图库给表情打的标签通过它显现在 QQ 页。</summary>
+    [JsonIgnore]
+    public List<string>? BorrowedTags
+    {
+        get => _borrowedTags;
+        set { _borrowedTags = value; OnPropertyChanged(); }
+    }
+
+    /// <summary>有效标签：自身标签优先（未来镜像原生标签），否则借图库同款的——QQ 页悬浮页脚
+    /// 与其他页一致地显示标签就靠它。</summary>
+    [JsonIgnore]
+    public override List<string> EffectiveTags => Tags.Count > 0 ? Tags : _borrowedTags ?? Tags;
+
     /// <summary>
     /// 搜索命中标记（QQ 页分桶排序用，见 MainViewModel.ApplyQqSearchBuckets）：
     /// 命中的排前、未命中的排后，桶内各按时序+频率。UI 辅助态，不落盘。

@@ -947,6 +947,7 @@ namespace OICQStickerManager.Views
                     await viewModel.SaveDatabaseAsync(); // 存入 JSON
                     viewModel.UpdateTabTags();           // 刷新左侧选项卡列表
                     viewModel.RefreshTagPool();          // 刷新编辑器里的标签池
+                    viewModel.RefreshQqMirrorFlags();    // QQ 页借入标签与已入库角标同步
                 }
             }
 
@@ -1084,6 +1085,8 @@ namespace OICQStickerManager.Views
                     else
                         Diag("delete: file deleted");
                 }
+                // twin 被删：QQ 页借入标签与已入库角标立即失效
+                viewModel.RefreshQqMirrorFlags();
                 Diag("delete: flow complete");
             }
             catch (Exception ex)
@@ -1263,6 +1266,7 @@ namespace OICQStickerManager.Views
                     await viewModel.SaveDatabaseAsync();
                     viewModel.UpdateTabTags();
                     viewModel.SelectedTab = "最近";
+                    viewModel.RefreshQqMirrorFlags(); // 被删标签从 QQ 页借入显示中移除
 
                     viewModel.StatusText = $"标签「{tagName}」及其图片已成功清除";
                 }
@@ -1381,7 +1385,8 @@ namespace OICQStickerManager.Views
         // 页脚中部宽度有限：整条标签逐个放入，放不下的整条舍弃、以 … 结尾（不硬挤）。
         private void ShowHoverTags()
         {
-            var tags = _hoveredSticker?.Tags;
+            // QQ 镜像条目的有效标签=自身或图库同款借入（EffectiveTags），与其他页一致显示
+            var tags = _hoveredSticker?.EffectiveTags;
             if (tags == null || tags.Count == 0) { HoverTagsText.Text = string.Empty; return; }
 
             double maxWidth = HoverTagsSlot.ActualWidth - 36; // 两侧留白 + 测量余量
