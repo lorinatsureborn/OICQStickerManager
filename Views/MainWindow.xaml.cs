@@ -1009,8 +1009,13 @@ namespace OICQStickerManager.Views
             }
             NoTagsHint.Visibility = _editingTags.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
+            // 输入中的文字实时筛选推荐标签：同系命名的标签（如 小卡/卡提希娅/卡卡）输一个字
+            // 就能全部点到；筛选词为空时显示全部（按标签最近使用排序）
+            string filter = TagInputBox.Text?.Trim() ?? "";
+
             // 建议标签放标签池首位（文件夹名/文件名，入库场景才有）：点一下即加，不点可忽略
-            if (!string.IsNullOrEmpty(_suggestedTag) && !_editingTags.Contains(_suggestedTag))
+            if (!string.IsNullOrEmpty(_suggestedTag) && !_editingTags.Contains(_suggestedTag)
+                && (filter.Length == 0 || _suggestedTag.Contains(filter, StringComparison.OrdinalIgnoreCase)))
             {
                 var suggestion = new Button { Content = _suggestedTag, Style = (Style)chipStyle };
                 suggestion.ToolTip = "建议标签：点击添加到本批表情";
@@ -1025,12 +1030,16 @@ namespace OICQStickerManager.Views
                 TagPoolPanel.Children.Add(suggestion);
             }
 
-            // 渲染“库中已有但未添加”标签（中性胶囊，按标签最近使用排序）
+            // 渲染“推荐标签”（中性胶囊，按标签最近使用排序，随输入筛选）
             foreach (var tag in viewModel.AllExistingTags.Except(_editingTags))
             {
+                if (filter.Length > 0 && !tag.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
                 TagPoolPanel.Children.Add(CreateTagButton(tag, chipStyle));
             }
         }
+
+        // 新增标签输入框文字变化 → 推荐标签实时筛选
+        private void TagInputBox_TextChanged(object sender, TextChangedEventArgs e) => RefreshEditorUI();
 
         private Button CreateTagButton(string tag, object style)
         {

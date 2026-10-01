@@ -544,12 +544,13 @@
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
-                                <TextBox x:Name="TagInputBox" KeyDown="TagInputBox_KeyDown" Tag="输入标签…"/>
+                                <TextBox x:Name="TagInputBox" KeyDown="TagInputBox_KeyDown"
+                                         TextChanged="TagInputBox_TextChanged" Tag="输入标签…"/>
                                 <Button Grid.Column="1" Style="{StaticResource AccentButtonStyle}"
                                         Content="添加" MinWidth="60" Margin="8,0,0,0" Click="AddTagButton_Click"/>
                             </Grid>
 
-                            <TextBlock Text="库中已有标签（点击添加）" Style="{StaticResource CaptionTextStyle}"
+                            <TextBlock Text="推荐标签（点击添加）" Style="{StaticResource CaptionTextStyle}"
                                        Margin="0,16,0,0"/>
                             <ScrollViewer MaxHeight="128" Margin="0,7,0,0"
                                           VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
