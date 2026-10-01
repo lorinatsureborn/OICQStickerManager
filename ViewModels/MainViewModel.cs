@@ -135,9 +135,12 @@ public class MainViewModel : ViewModelBase
         {
             if (_selectedTab == value) return; // 值未变时不触发全列表刷新
 
-            // 搜索期间点标签胶囊 = 把该标签设为搜索词（胶囊此时是搜索快捷入口而非页签切换，
-            // 否则点击后过滤仍走全库搜索、高亮却是假选中）；「最近」是搜索宿主视图，正常选中
-            if (!string.IsNullOrEmpty(_searchText) && value != "最近" && !value.StartsWith("qq:", StringComparison.Ordinal))
+            // 搜索期间左键点击标签胶囊 = 把该标签设为搜索词（胶囊此时是搜索快捷入口而非页签切换，
+            // 否则点击后过滤仍走全库搜索、高亮却是假选中）；「最近」是搜索宿主视图，正常选中。
+            // 转译只认左键（NoteSidebarLeftDown 的时间窗）：右键选中若也转译，TabTags 重建会
+            // 销毁正在打开的右键菜单——"搜索→右键删除标签"路线因此断掉（2026-10-01 用户实测）
+            if (!string.IsNullOrEmpty(_searchText) && SidebarLeftClickRecent &&
+                value != "最近" && !value.StartsWith("qq:", StringComparison.Ordinal))
             {
                 SearchText = value;
                 return;
@@ -1236,6 +1239,8 @@ public class MainViewModel : ViewModelBase
         set
         {
             var newText = value ?? "";
+            if (newText == _searchText) return; // 同值短路：转译等路径可能同值回灌，触发重建纯属浪费
+
             bool wasSearching = !string.IsNullOrEmpty(_searchText);
             bool searching = !string.IsNullOrEmpty(newText);
 
@@ -1264,6 +1269,15 @@ public class MainViewModel : ViewModelBase
 
     // 进入搜索前的选项卡（清空搜索后回跳）；null=搜索前就在「最近」
     private string? _tabBeforeSearch;
+
+    // 侧栏左键按下时间戳（SelectedTab 转译的时间窗判据，见 SelectedTab setter 注释）
+    private long _sidebarLeftDownAtTicks = long.MinValue / 2;
+
+    /// <summary>窗口在侧栏 PreviewMouseLeftButtonDown 时调用：标记"这是真实的左键点击"。</summary>
+    public void NoteSidebarLeftDown() => _sidebarLeftDownAtTicks = Environment.TickCount64;
+
+    /// <summary>600ms 内有过侧栏左键按下（左键选中引发的 SelectedTab 变化才算"点击标签"）。</summary>
+    private bool SidebarLeftClickRecent => Environment.TickCount64 - _sidebarLeftDownAtTicks < 600;
 
     // 搜索框是否有内容：驱动清空按钮与空状态文案
     public bool HasSearchText => !string.IsNullOrEmpty(_searchText);
