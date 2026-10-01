@@ -656,19 +656,13 @@
                             <TextBlock Text="排序" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
                             <Border Style="{StaticResource SettingsGroupStyle}">
                                 <StackPanel>
-                                    <Grid Margin="16,11">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="Auto"/>
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel>
-                                            <TextBlock Text="图库排序" Style="{StaticResource BodyTextStyle}"/>
-                                            <TextBlock Text="最近置顶：最新使用的几张排在最前，其余按热度"
-                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
-                                                       TextWrapping="Wrap"/>
-                                        </StackPanel>
-                                        <Border Grid.Column="1" Background="{DynamicResource FieldBrush}" CornerRadius="11"
-                                                Padding="2" Height="32" Margin="12,0,0,0">
+                                    <StackPanel Margin="16,11,16,2">
+                                        <TextBlock Text="图库排序" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBlock Text="最近置顶：最新使用的几张排在最前，其余按热度"
+                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
+                                                   TextWrapping="Wrap"/>
+                                        <Border Background="{DynamicResource FieldBrush}" CornerRadius="11"
+                                                Padding="2" Height="32" Margin="0,9,0,0">
                                             <UniformGrid Columns="3">
                                                 <RadioButton Style="{StaticResource SegmentedItemStyle}" GroupName="GallerySort"
                                                              Content="最近" IsChecked="{Binding IsGallerySortRecent, Mode=TwoWay}"/>
@@ -680,21 +674,15 @@
                                                              ToolTip="按标签命名排序，顺序稳定不变动"/>
                                             </UniformGrid>
                                         </Border>
-                                    </Grid>
-                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
-                                    <Grid Margin="16,11">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="Auto"/>
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel>
-                                            <TextBlock Text="快捷面板排序" Style="{StaticResource BodyTextStyle}"/>
-                                            <TextBlock Text="与图库分开设置，规则相同"
-                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
-                                                       TextWrapping="Wrap"/>
-                                        </StackPanel>
-                                        <Border Grid.Column="1" Background="{DynamicResource FieldBrush}" CornerRadius="11"
-                                                Padding="2" Height="32" Margin="12,0,0,0">
+                                    </StackPanel>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,9"/>
+                                    <StackPanel Margin="16,9,16,2">
+                                        <TextBlock Text="快捷面板排序" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBlock Text="与图库分开设置，规则相同"
+                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
+                                                   TextWrapping="Wrap"/>
+                                        <Border Background="{DynamicResource FieldBrush}" CornerRadius="11"
+                                                Padding="2" Height="32" Margin="0,9,0,0">
                                             <UniformGrid Columns="3">
                                                 <RadioButton Style="{StaticResource SegmentedItemStyle}" GroupName="PanelSort"
                                                              Content="最近" IsChecked="{Binding IsPanelSortRecent, Mode=TwoWay}"/>
@@ -704,26 +692,26 @@
                                                              Content="名称" IsChecked="{Binding IsPanelSortName, Mode=TwoWay}"/>
                                             </UniformGrid>
                                         </Border>
-                                    </Grid>
-                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
-                                    <Grid Margin="16,11" Visibility="{Binding RecentPinnedVisible, Converter={StaticResource BoolToVis}}">
+                                    </StackPanel>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,9"/>
+                                    <Grid Margin="16,9,16,11" Visibility="{Binding RecentPinnedVisible, Converter={StaticResource BoolToVis}}">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="Auto"/>
                                         </Grid.ColumnDefinitions>
-                                        <StackPanel>
+                                        <StackPanel VerticalAlignment="Center">
                                             <TextBlock Text="最近置顶张数" Style="{StaticResource BodyTextStyle}"/>
                                             <TextBlock Text="最新使用的这几张在任何筛选下都排最前"
                                                        Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
                                                        TextWrapping="Wrap"/>
                                         </StackPanel>
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                                            <TextBlock Text="{Binding RecentPinnedCountText}" Width="40"
-                                                       Style="{StaticResource FootnoteTextStyle}"
-                                                       VerticalAlignment="Center" HorizontalAlignment="Right"/>
-                                            <Slider Style="{StaticResource SliderStyle}" Width="110" Margin="8,0,0,0"
-                                                    Minimum="1" Maximum="20" IsSnapToTickEnabled="True" TickFrequency="1"
-                                                    Value="{Binding RecentPinnedCount}"/>
+                                            <TextBox Width="56" Height="30" TextAlignment="Center"
+                                                     AutomationProperties.Name="最近置顶张数"
+                                                     ToolTip="可填 1 到 20"
+                                                     Text="{Binding RecentPinnedCount, UpdateSourceTrigger=LostFocus}"/>
+                                            <TextBlock Text="张" Style="{StaticResource FootnoteTextStyle}"
+                                                       VerticalAlignment="Center" Margin="8,0,0,0"/>
                                         </StackPanel>
                                     </Grid>
                                 </StackPanel>
