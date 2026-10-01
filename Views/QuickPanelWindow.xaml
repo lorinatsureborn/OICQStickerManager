@@ -107,7 +107,7 @@
         </ScrollViewer>
 
         <!-- 表情网格：QuickPanelView = 全量 + 热度排序的独立视图（不受主界面标签页/搜索过滤影响） -->
-        <ListBox Grid.Row="2" Style="{StaticResource GhostListBoxStyle}"
+        <ListBox x:Name="PanelList" Grid.Row="2" Style="{StaticResource GhostListBoxStyle}"
                  ItemsSource="{Binding QuickPanelView}"
                  Background="Transparent" Margin="10,8,10,12"
                  ScrollViewer.HorizontalScrollBarVisibility="Disabled"

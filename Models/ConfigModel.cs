@@ -63,4 +63,11 @@ public class AppConfig
     // emoji.db 密钥（16 字符，官方脚本提取；QQ 大版本更新后可能失效需重新引导）
     public string QqDbKey { get; set; } = "";
 
+    // 排序模式（图库 / 快捷面板各自独立）：0=前 N 张最近置顶+其余热度，1=全部热度，2=全部按名称
+    public int GallerySortMode { get; set; } = 0;
+    public int QuickPanelSortMode { get; set; } = 0;
+
+    // "最近置顶"的张数（1-20，默认 5）：最近发送的图会高频连发，置顶便于快速再找
+    public int RecentPinnedCount { get; set; } = 5;
+
 }

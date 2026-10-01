@@ -185,6 +185,29 @@ namespace OICQStickerManager.Views
             _viewModel.ResetPanelTab();
             _viewModel.RebuildPanelItems();
             _viewModel.QuickPanelView.Refresh();
+            ScrollToTop();
+        }
+
+        // 每次唤出都回到顶部（2026-10-02 用户定案：不要滚动记忆——置顶区就是最近用过的，
+        // 唤出即见）。Show 后布局未完成时 ScrollToTop 会被忽略，故排到 Loaded 优先级之后执行
+        private void ScrollToTop()
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+            {
+                var scroll = FindDescendant<System.Windows.Controls.ScrollViewer>(PanelList);
+                scroll?.ScrollToTop();
+            });
+        }
+
+        private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
+        {
+            if (root is T match) return match;
+            for (int i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(root); i++)
+            {
+                var found = FindDescendant<T>(System.Windows.Media.VisualTreeHelper.GetChild(root, i));
+                if (found != null) return found;
+            }
+            return null;
         }
 
         // --- 选项卡悬浮切换 ---

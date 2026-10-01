@@ -1,6 +1,7 @@
 ﻿using OICQStickerManager.Models;
 using OICQStickerManager.Services;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -170,7 +171,7 @@ public class MainViewModel : ViewModelBase
         ImportAllQqCommand = new RelayCommand(ImportAllQqAsync);
 
         // 初始化视图
-        _stickersView = CollectionViewSource.GetDefaultView(Stickers);
+        _stickersView = (ListCollectionView)CollectionViewSource.GetDefaultView(Stickers);
         _stickersView.Filter = (obj) =>
         {
             var sticker = (StickerModel)obj;
@@ -188,18 +189,18 @@ public class MainViewModel : ViewModelBase
             return sticker.Tags.Contains(SelectedTab);
         };
 
-        // 💡 核心排序逻辑：热度分降序（频次 × 新近度，公式见 StickerRanking），同分再比最近活跃时间。
-        // 筛选（搜索/标签页）只过滤不参与排序，因此筛选前后顺序一致
+        // 💡 核心排序：CustomSort 统一走 CompareWithMode（排序模式用户可调，见排序属性区），
+        // 默认"前 N 张最近使用置顶 + 其余热度"（最近发送的图常被高频连发，置顶便于快速再找）。
+        // CustomSort 在筛选后的集合上排序，SortDescriptions 与之互斥故不再使用
         _stickersView.SortDescriptions.Clear();
-        _stickersView.SortDescriptions.Add(new SortDescription(nameof(StickerModel.RankScore), ListSortDirection.Descending));
-        _stickersView.SortDescriptions.Add(new SortDescription(nameof(StickerModel.LastUsedTime), ListSortDirection.Descending));
+        _stickersView.CustomSort = Comparer<StickerModel>.Create(CompareGallery);
 
         // 快捷面板专用视图：与图库默认视图（带标签页/搜索过滤）解耦，永远全量、同一把热度尺子；
         // 不开实时排序——面板打开期间顺序冻结，发送不会让格子从光标下跳走，每次呼出时再重排。
         // 数据源是 PanelItems（图库 ∪ QQ 未入库镜像，呼出时重建），不是 Stickers 本身
         QuickPanelView = new ListCollectionView(PanelItems);
-        QuickPanelView.SortDescriptions.Add(new SortDescription(nameof(StickerModel.RankScore), ListSortDirection.Descending));
-        QuickPanelView.SortDescriptions.Add(new SortDescription(nameof(StickerModel.LastUsedTime), ListSortDirection.Descending));
+        QuickPanelView.SortDescriptions.Clear();
+        QuickPanelView.CustomSort = Comparer<StickerModel>.Create(ComparePanel);
         // 面板过滤器：视角空 = 全部；"qq" = 只看 QQ 收藏；其他 = 该标签下的图库表情
         // （QQ 镜像条目没有标签，标签视角天然只出图库表情）
         QuickPanelView.Filter = o =>
@@ -210,7 +211,7 @@ public class MainViewModel : ViewModelBase
         };
 
         // 页脚计数：过滤结果变化（搜索/切标签/增删表情）都走这里实时刷新
-        _stickersView.CollectionChanged += (_, _) => UpdateCounts();
+        ((INotifyCollectionChanged)_stickersView).CollectionChanged += (_, _) => UpdateCounts();
         Stickers.CollectionChanged += (_, _) => UpdateCounts();
 
         // 💡 启动时自动加载
@@ -306,6 +307,12 @@ public class MainViewModel : ViewModelBase
             var byScore = b.RankScore.CompareTo(a.RankScore);
             return byScore != 0 ? byScore : b.LastUsedTime.CompareTo(a.LastUsedTime);
         });
+        // 面板"最近置顶"集 = 混排范围内 LastUsedTime 最新的 N 张（含 QQ 镜像，发送统计已借入）
+        _panelPinned = items
+            .OrderByDescending(i => i.LastUsedTime)
+            .Take(_recentPinnedCount)
+            .Select(i => i.Id)
+            .ToHashSet();
         PanelItems.Clear();
         foreach (var item in items) PanelItems.Add(item);
     }
@@ -929,6 +936,8 @@ public class MainViewModel : ViewModelBase
         {
             await SaveDatabaseAsync();
             UpdateTabTags();
+            RecalcRecentPinned();      // 新入库 = 最新使用，应进入"最近置顶"集
+            _stickersView.Refresh();
         }
         // M4 静默导入（自动入库）不触发完成事件，避免弹出标签编辑器打扰
         if (raiseCompleted) QqImportCompleted?.Invoke(report.Added, report.Duplicates, report.Unsupported);
@@ -998,6 +1007,11 @@ public class MainViewModel : ViewModelBase
         // 6. 旧数据（Guid 命名时代）后台补算 MD5，让查重与 QQ 页"已导入"角标全局生效
         _ = BackfillMd5Async();
         UpdateImportedFlagsAll();
+
+        // 7. 数据就绪：算"最近置顶"集并让自定义排序生效
+        RecalcRecentPinned();
+        _stickersView.Refresh();
+        UpdateTabTags();
     }
 
     private async Task BackfillMd5Async()
@@ -1089,6 +1103,8 @@ public class MainViewModel : ViewModelBase
         if (report.Added.Count > 0)
         {
             await SaveDatabaseAsync();
+            RecalcRecentPinned();      // 新入库 = 最新使用，应进入"最近置顶"集
+            _stickersView.Refresh();   // 置顶集变了，重新定位已插入的条目
         }
 
         return report;
@@ -1163,6 +1179,9 @@ public class MainViewModel : ViewModelBase
                 QqDeepSyncEnabled = this.QqDeepSyncEnabled,
                 QqSyncStrategy = this.QqSyncStrategy,
                 QqDbKey = this._qqDbKey,
+                GallerySortMode = this.GallerySortMode,
+                QuickPanelSortMode = this.QuickPanelSortMode,
+                RecentPinnedCount = this.RecentPinnedCount,
                 EnableQqCoexistTrigger = this.EnableQqCoexistTrigger,
                 EnableWatcherPolling = this.EnableWatcherPolling,
                 HotkeyModifiers = (int)this.HotkeyModifiers,
@@ -1251,7 +1270,7 @@ public class MainViewModel : ViewModelBase
         return null;
     }
 
-    private ICollectionView _stickersView;
+    private ListCollectionView _stickersView;
     private string _searchText = string.Empty;
 
     /// <summary>快捷面板的独立数据视图（全量 + 热度排序，见构造函数）。</summary>
@@ -1337,6 +1356,130 @@ public class MainViewModel : ViewModelBase
 
     // 搜索框是否有内容：驱动清空按钮与空状态文案
     public bool HasSearchText => !string.IsNullOrEmpty(_searchText);
+
+    // ———— 排序规则（图库 / 快捷面板独立设置，2026-10-02 用户定案）————
+    // 0=前 N 张最近使用置顶 + 其余热度（默认：最近发送的图常被高频连发，置顶便于快速再找）；
+    // 1=全部热度（时序+频率复合，RankScore）；2=全部按名称（标签联合名序，稳定不变动）。
+    // "最近置顶"的置顶集 = 各自范围内 LastUsedTime 最新的 N 张（图库=图库全体，面板=PanelItems）。
+
+    public const int RecentPinnedMax = 20;
+
+    private int _gallerySortMode;
+    public int GallerySortMode
+    {
+        get => _gallerySortMode;
+        set
+        {
+            value = Math.Clamp(value, 0, 2);
+            if (_gallerySortMode == value) return;
+            _gallerySortMode = value;
+            OnPropertyChanged();
+            NotifySortBooleans(isGallery: true);
+            _ = SaveConfigAsync();
+            RecalcRecentPinned();
+            _stickersView?.Refresh();
+        }
+    }
+
+    private int _quickPanelSortMode;
+    public int QuickPanelSortMode
+    {
+        get => _quickPanelSortMode;
+        set
+        {
+            value = Math.Clamp(value, 0, 2);
+            if (_quickPanelSortMode == value) return;
+            _quickPanelSortMode = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(RecentPinnedVisible));
+            NotifySortBooleans(isGallery: false);
+            _ = SaveConfigAsync();
+            QuickPanelView?.Refresh();
+        }
+    }
+
+    private int _recentPinnedCount = 5;
+    public int RecentPinnedCount
+    {
+        get => _recentPinnedCount;
+        set
+        {
+            value = Math.Clamp(value, 1, RecentPinnedMax);
+            if (_recentPinnedCount == value) return;
+            _recentPinnedCount = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(RecentPinnedCountText));
+            _ = SaveConfigAsync();
+            RecalcRecentPinned();
+            _stickersView?.Refresh();
+            QuickPanelView?.Refresh();
+        }
+    }
+
+    public string RecentPinnedCountText => $"{_recentPinnedCount} 张";
+
+    private void NotifySortBooleans(bool isGallery)
+    {
+        if (isGallery)
+        {
+            OnPropertyChanged(nameof(IsGallerySortRecent));
+            OnPropertyChanged(nameof(IsGallerySortScore));
+            OnPropertyChanged(nameof(IsGallerySortName));
+        }
+        else
+        {
+            OnPropertyChanged(nameof(IsPanelSortRecent));
+            OnPropertyChanged(nameof(IsPanelSortScore));
+            OnPropertyChanged(nameof(IsPanelSortName));
+        }
+    }
+
+    // 分段控件的双向包装
+    public bool IsGallerySortRecent { get => _gallerySortMode == 0; set { if (value) GallerySortMode = 0; } }
+    public bool IsGallerySortScore { get => _gallerySortMode == 1; set { if (value) GallerySortMode = 1; } }
+    public bool IsGallerySortName { get => _gallerySortMode == 2; set { if (value) GallerySortMode = 2; } }
+    public bool IsPanelSortRecent { get => _quickPanelSortMode == 0; set { if (value) QuickPanelSortMode = 0; } }
+    public bool IsPanelSortScore { get => _quickPanelSortMode == 1; set { if (value) QuickPanelSortMode = 1; } }
+    public bool IsPanelSortName { get => _quickPanelSortMode == 2; set { if (value) QuickPanelSortMode = 2; } }
+
+    /// <summary>任一视图处于"最近置顶"模式时，设置页才显示置顶张数行。</summary>
+    public bool RecentPinnedVisible => _gallerySortMode == 0 || _quickPanelSortMode == 0;
+
+    private HashSet<Guid> _galleryPinned = new();
+    private HashSet<Guid> _panelPinned = new();
+
+    /// <summary>重算图库的"最近置顶"集合（LastUsedTime 最新的 N 张）；发送/加载/设置变化时调用。</summary>
+    private void RecalcRecentPinned()
+    {
+        _galleryPinned = Stickers
+            .OrderByDescending(s => s.LastUsedTime)
+            .Take(_recentPinnedCount)
+            .Select(s => s.Id)
+            .ToHashSet();
+        OnPropertyChanged(nameof(RecentPinnedVisible));
+    }
+
+    /// <summary>统一比较器：按模式分派，未特判的路径回落热度（RankScore 降序 → 最近活跃降序 → Id 稳定序）。</summary>
+    private int CompareWithMode(StickerModel a, StickerModel b, int mode, HashSet<Guid> pinned)
+    {
+        switch (mode)
+        {
+            case 2: // 按名称（标签联合名，稳定不变动）；无标签的"未命名表情"自然沉后
+                var byName = string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase);
+                if (byName != 0) return byName;
+                break;
+            case 0: // 前 N 张最近使用置顶（桶内按最近使用序），其余走热度
+                bool pa = pinned.Contains(a.Id), pb = pinned.Contains(b.Id);
+                if (pa != pb) return pa ? -1 : 1;
+                if (pa) return b.LastUsedTime.CompareTo(a.LastUsedTime);
+                break;
+        }
+        var byScore = b.RankScore.CompareTo(a.RankScore);
+        return byScore != 0 ? byScore : b.LastUsedTime.CompareTo(a.LastUsedTime);
+    }
+
+    private int CompareGallery(StickerModel a, StickerModel b) => CompareWithMode(a, b, _gallerySortMode, _galleryPinned);
+    private int ComparePanel(StickerModel a, StickerModel b) => CompareWithMode(a, b, _quickPanelSortMode, _panelPinned);
 
     // 界面配色主题
     public IReadOnlyList<ThemeOption> ThemeOptions { get; } = ThemeManager.Themes.Select(t => new ThemeOption(t)).ToList();
@@ -1879,6 +2022,7 @@ public class MainViewModel : ViewModelBase
         }
         await send(s.FullPath);
         await SaveDatabaseAsync();
+        RecalcRecentPinned();  // 刚发送的图进入"最近置顶"集
         _stickersView.Refresh();
     }
 
@@ -1932,6 +2076,9 @@ public class MainViewModel : ViewModelBase
                     this._qqSyncStrategy = config.QqSyncStrategy;
                     this._qqDbKey = config.QqDbKey ?? "";
                     NotifyQqDeepSyncStatus();
+                    this._gallerySortMode = Math.Clamp(config.GallerySortMode, 0, 2);
+                    this._quickPanelSortMode = Math.Clamp(config.QuickPanelSortMode, 0, 2);
+                    this._recentPinnedCount = Math.Clamp(config.RecentPinnedCount, 1, RecentPinnedMax);
                     this.EnableQqCoexistTrigger = config.EnableQqCoexistTrigger;
                     this.EnableWatcherPolling = config.EnableWatcherPolling;
                     // 热键按配置原样加载（无迁移）
@@ -1964,6 +2111,17 @@ public class MainViewModel : ViewModelBase
                     OnPropertyChanged(nameof(StrategyIsAdopt));
                     OnPropertyChanged(nameof(QqSyncStrategyVisible));
                     OnPropertyChanged(nameof(AdoptBatchButtonVisible));
+                    OnPropertyChanged(nameof(GallerySortMode));
+                    OnPropertyChanged(nameof(QuickPanelSortMode));
+                    OnPropertyChanged(nameof(RecentPinnedCount));
+                    OnPropertyChanged(nameof(RecentPinnedCountText));
+                    OnPropertyChanged(nameof(RecentPinnedVisible));
+                    OnPropertyChanged(nameof(IsGallerySortRecent));
+                    OnPropertyChanged(nameof(IsGallerySortScore));
+                    OnPropertyChanged(nameof(IsGallerySortName));
+                    OnPropertyChanged(nameof(IsPanelSortRecent));
+                    OnPropertyChanged(nameof(IsPanelSortScore));
+                    OnPropertyChanged(nameof(IsPanelSortName));
                 }
             }
             catch { /* 如果配置损坏则使用默认值 */ }
