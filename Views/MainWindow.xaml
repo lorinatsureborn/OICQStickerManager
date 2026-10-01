@@ -664,7 +664,8 @@
                                         <StackPanel>
                                             <TextBlock Text="图库排序" Style="{StaticResource BodyTextStyle}"/>
                                             <TextBlock Text="最近置顶：最新使用的几张排在最前，其余按热度"
-                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
+                                                       TextWrapping="Wrap"/>
                                         </StackPanel>
                                         <Border Grid.Column="1" Background="{DynamicResource FieldBrush}" CornerRadius="11"
                                                 Padding="2" Height="32" Margin="12,0,0,0">
@@ -689,7 +690,8 @@
                                         <StackPanel>
                                             <TextBlock Text="快捷面板排序" Style="{StaticResource BodyTextStyle}"/>
                                             <TextBlock Text="与图库分开设置，规则相同"
-                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
+                                                       TextWrapping="Wrap"/>
                                         </StackPanel>
                                         <Border Grid.Column="1" Background="{DynamicResource FieldBrush}" CornerRadius="11"
                                                 Padding="2" Height="32" Margin="12,0,0,0">
@@ -712,7 +714,8 @@
                                         <StackPanel>
                                             <TextBlock Text="最近置顶张数" Style="{StaticResource BodyTextStyle}"/>
                                             <TextBlock Text="最新使用的这几张在任何筛选下都排最前"
-                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
+                                                       TextWrapping="Wrap"/>
                                         </StackPanel>
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                                             <TextBlock Text="{Binding RecentPinnedCountText}" Width="40"
