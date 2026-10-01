@@ -14,8 +14,7 @@ public class AppConfig
     public bool EnableWatcherPolling { get; set; } = false;
 
     // 快捷面板热键：Win32 MOD_* 标志（1=Alt 2=Ctrl 4=Shift 8=Win）与虚拟键码，默认 Ctrl+Alt+D
-    // （旧默认 E 被 QQ 新版功能占用、K 离左手太远；2026-09-30 用户要求左手单手可按，
-    // 实机扫描后选定 D=左手食指本位、Ctrl+Alt 系列在本机唯一空闲的舒适键，见 LoadConfigAsync 迁移）
+    // （历史默认变迁 E→K→D；按配置原样加载，用户设置的任何键位一律尊重，无迁移）
     public int HotkeyModifiers { get; set; } = 3;
     public int HotkeyKey { get; set; } = 0x44;
 

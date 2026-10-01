@@ -2124,6 +2124,48 @@ namespace OICQStickerManager.Views
         private void OpenWebpStore_Click(object sender, RoutedEventArgs e)
             => WebpSupportProbe.OpenStorePage();
 
+        // ———— 反馈到 GitHub ————
+
+        // 打开预填 issue 提交页（正文自动带脱敏诊断日志），用户补描述后点提交即可；
+        // 打不开时兜底：空白 issue 页 + 日志所在文件夹 + 弹窗说明手动路径
+        private async void FeedbackToGithub_Click(object sender, RoutedEventArgs e)
+        {
+            var hotkey = DataContext is MainViewModel vm ? vm.HotkeyDisplay : "默认";
+            try
+            {
+                var (url, truncated) = await Task.Run(() => FeedbackService.BuildIssueUrl(hotkey));
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url)
+                {
+                    UseShellExecute = true,
+                });
+                if (_trayIcon != null)
+                {
+                    _trayIcon.BalloonTipTitle = "反馈页面已在浏览器打开";
+                    _trayIcon.BalloonTipText = truncated
+                        ? "诊断日志过长已截断，完整日志在 %TEMP%\\asuka-watcher.log，可手动附上。"
+                        : "诊断日志已自动附在正文里，描述问题后点「Submit new issue」即可提交。";
+                    _trayIcon.ShowBalloonTip(6000);
+                }
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                        Services.FeedbackService.IssueNewUrl) { UseShellExecute = true });
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe")
+                    {
+                        Arguments = $"\"{System.IO.Path.GetTempPath()}\"",
+                        UseShellExecute = true,
+                    });
+                }
+                catch { /* 连 explorer 都起不来时只弹说明 */ }
+                _ = ShowAlertAsync("未能打开预填的反馈页面",
+                    $"可以手动提交 issue，并附上 %TEMP%\\asuka-watcher.log（日志已含自动诊断）。\n\n{ex.Message}",
+                    "知道了", showCancel: false);
+            }
+        }
+
         // ———— 启动询问（检测 → 猜测 → 询问，绝不擅自绑定） ————
 
         private async Task TryPromptQqBindingAsync()

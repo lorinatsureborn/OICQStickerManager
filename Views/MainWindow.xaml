@@ -983,6 +983,27 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- ———— 反馈 ———— -->
+                            <TextBlock Text="反馈" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <Border Style="{StaticResource SettingsGroupStyle}" Margin="0,0,0,8">
+                                <StackPanel>
+                                    <Button Style="{StaticResource RowButtonStyle}" Click="FeedbackToGithub_Click"
+                                            AutomationProperties.Name="反馈问题到 GitHub">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE939;"
+                                                       FontSize="14" Foreground="{DynamicResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="反馈问题到 GitHub…" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
+                                    <Grid Margin="16,11">
+                                        <TextBlock Text="会打开 GitHub 的 issue 提交页，自动附上诊断日志（已脱敏）；提交前可以先描述你遇到的问题"
+                                                   Style="{StaticResource FootnoteTextStyle}" TextWrapping="Wrap"/>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+
                         </StackPanel>
                     </ScrollViewer>
                 </Grid>

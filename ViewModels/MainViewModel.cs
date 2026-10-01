@@ -1552,7 +1552,7 @@ public class MainViewModel : ViewModelBase
     }
 
     // 快捷面板热键：Win32 MOD_* 标志（1=Alt 2=Ctrl 4=Shift 8=Win，与 WPF ModifierKeys 数值一致）+ 虚拟键码，默认 Ctrl+Alt+D
-    // （旧默认 Ctrl+Alt+E 被 QQ 新版功能占用，2026-09 迁移，见 LoadConfigAsync）
+    // （按配置原样加载，无迁移——任何用户设置的键位一律尊重）
     private uint _hotkeyModifiers = 0x3;
     public uint HotkeyModifiers
     {
@@ -1570,7 +1570,7 @@ public class MainViewModel : ViewModelBase
         }
     }
 
-    private uint _hotkeyKey = 0x44; // VK_D（旧默认 VK_E→VK_K→D，迁移见 LoadConfigAsync）
+    private uint _hotkeyKey = 0x44; // VK_D（历史默认变迁 E→K→D；配置值原样加载，无迁移）
     public uint HotkeyKey
     {
         get => _hotkeyKey;
@@ -1742,20 +1742,13 @@ public class MainViewModel : ViewModelBase
         // 程序性赋值不算用户决策（否则 CloseToTray 一加载就把"已选择"置位，首次关闭询问永远不弹）
         // 同时也是 SaveConfigAsync 的加载期禁写窗口（防半加载快照覆盖好档）
         _loadingConfig = true;
-        bool migrateHotkey;
         try
         {
-            migrateHotkey = await LoadConfigCoreAsync();
+            await LoadConfigCoreAsync();
         }
         finally
         {
             _loadingConfig = false;
-        }
-        if (migrateHotkey)
-        {
-            // 旧默认热键迁移的落盘放在加载完成后（加载期禁写），属性 setter 会触发保存
-            this.HotkeyModifiers = 0x3;
-            this.HotkeyKey = 0x44;
         }
         // 放出"配置已就绪"信号：主窗口的热键注册等它（启动时默认键抢先注册会误报被占用）
         _configLoaded.TrySetResult();
@@ -1769,17 +1762,18 @@ public class MainViewModel : ViewModelBase
     private readonly TaskCompletionSource _configLoaded =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>returns: 是否需要旧默认热键迁移（迁移落盘在加载完成后统一执行）。</summary>
-    private async Task<bool> LoadConfigCoreAsync()
+    /// <summary>加载 config.json 到各属性。热键迁移链已删（2026-10-01 用户实测误伤：
+    /// 用户主动设置的 Ctrl+Alt+E 每次启动都被当成"旧默认"强迁回 D）——迁移使命早已完成，
+    /// 任何用户设置的键位从此一律尊重；旧默认 E 若真被 QQ 占用，注册失败有提示可自行改键。</summary>
+    private async Task LoadConfigCoreAsync()
     {
-        bool migrateHotkey = false;
         if (File.Exists(_configPath))
         {
             try
             {
                 var json = await ReadJsonRecoveringAsync(_configPath,
                     s => { try { return JsonSerializer.Deserialize<AppConfig>(s) != null; } catch { return false; } });
-                if (json == null) return false; // 损坏且无备份：保持默认值（坏文件已留证，状态栏有提示）
+                if (json == null) return; // 损坏且无备份：保持默认值（坏文件已留证，状态栏有提示）
                 var config = JsonSerializer.Deserialize<AppConfig>(json);
                 if (config != null)
                 {
@@ -1795,22 +1789,9 @@ public class MainViewModel : ViewModelBase
                     NotifyQqDeepSyncStatus();
                     this.EnableQqCoexistTrigger = config.EnableQqCoexistTrigger;
                     this.EnableWatcherPolling = config.EnableWatcherPolling;
-                    // 热键迁移：旧默认 Ctrl+Alt+E 被 QQ 新版功能占用（2026-09 实测冲突）；
-                    // Ctrl+Alt+K 对左手单手太远（2026-09-30 用户要求左手可单手按出）→ 实机扫描后选定 D。
-                    // 从未自定义过热键（仍是任一旧默认值）的老配置自动迁到新默认 Ctrl+Alt+D；
-                    // 落盘在 LoadConfigAsync 完成后统一执行（加载期禁写）。用户自定义过的键尊重不动。
-                    migrateHotkey = config.HotkeyModifiers == 3 &&
-                        (config.HotkeyKey == 0x45 || config.HotkeyKey == 0x4B || config.HotkeyKey == 0x51);
-                    if (migrateHotkey)
-                    {
-                        this.HotkeyModifiers = 0x3;
-                        this.HotkeyKey = 0x44;
-                    }
-                    else
-                    {
-                        this.HotkeyModifiers = (uint)config.HotkeyModifiers;
-                        this.HotkeyKey = (uint)config.HotkeyKey;
-                    }
+                    // 热键按配置原样加载（无迁移）
+                    this.HotkeyModifiers = (uint)config.HotkeyModifiers;
+                    this.HotkeyKey = (uint)config.HotkeyKey;
                     GlassMaterial.OpacityPercent = config.GlassOpacity;
                     this.CloseToTray = config.CloseToTray;
                     this._closeBehaviorDecided = config.CloseBehaviorDecided;
@@ -1844,6 +1825,5 @@ public class MainViewModel : ViewModelBase
             }
             catch { /* 如果配置损坏则使用默认值 */ }
         }
-        return migrateHotkey; // 迁移落盘由 LoadConfigAsync 在解除禁写后统一执行
     }
 }
