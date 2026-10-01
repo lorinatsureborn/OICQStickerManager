@@ -217,6 +217,7 @@ public class MainViewModel : ViewModelBase
         _ = LoadConfigAsync();
         _ = LoadStickersAsync();
         _ = LoadQqStatsAsync();
+        _ = LoadTagStatsAsync();
     }
 
     public void UpdateTabTags()
@@ -1030,10 +1031,9 @@ public class MainViewModel : ViewModelBase
         });
     }
 
-    // 💡 拖放入库：魔数定真实格式 + MD5 内容去重 + 以 <md5>.<ext> 命名（设计 §5.1）
-    // autoTag：自动打标签（反馈 2026-10-01）。null = 按来源推导（目录拖入 → 文件夹名）；
-    // 空串 = 明确不打；非空 = 调用方指定的标签（剪贴板链路传来源应用名）。
-    public async Task<ImportReport> AddStickersFromPathAsync(string sourcePath, string? autoTag = null)
+    // 💡 拖放入库：魔数定真实格式 + MD5 内容去重 + 以 <md5>.<ext> 命名（设计 §5.1）。
+    // 不自动打标签：文件夹名/文件名由窗口作为"第一备选建议"给到标签编辑器，用户点选才加
+    public async Task<ImportReport> AddStickersFromPathAsync(string sourcePath)
     {
         var report = new ImportReport();
         string appDataFolder = EnsureLibraryFolder();
@@ -1047,12 +1047,6 @@ public class MainViewModel : ViewModelBase
             filesToProcess = Directory.EnumerateFiles(sourcePath, "*.*", SearchOption.AllDirectories)
                                       .Where(f => exts.Contains(Path.GetExtension(f).ToLower()))
                                       .ToList();
-            // 自动打标签：拖入文件夹 = 以文件夹名给整批打标签（最高频的整理场景，免手动逐张标）
-            if (autoTag == null && _autoTaggingEnabled)
-            {
-                var folder = Path.GetFileName(sourcePath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-                if (!string.IsNullOrWhiteSpace(folder) && folder.Trim().Length <= 24) autoTag = folder.Trim();
-            }
         }
         else if (File.Exists(sourcePath))
         {
@@ -1082,7 +1076,7 @@ public class MainViewModel : ViewModelBase
                 {
                     FullPath = destinationPath,
                     Md5 = md5,
-                    Tags = !string.IsNullOrEmpty(autoTag) ? new List<string> { autoTag } : new List<string>(),
+                    Tags = new List<string>(),
                     // 入库即活跃基线：新表情按"最近添加"高位起步，之后随时间自然下沉
                     LastUsedTime = DateTime.Now
                 };
@@ -1179,7 +1173,6 @@ public class MainViewModel : ViewModelBase
                 CloseBehaviorDecided = this._closeBehaviorDecided,
                 SilentStart = this.SilentStart,
                 EnableGifHoverPreview = this.EnableGifHoverPreview,
-                AutoTaggingEnabled = this.AutoTaggingEnabled,
                 QqBindings = new List<QqBindingInfo>(this._qqBindings),
                 QqPromptDismissedUins = new List<string>(this._qqPromptDismissedUins),
                 WebpNoticeDismissed = this._webpNoticeDismissed
@@ -1365,11 +1358,60 @@ public class MainViewModel : ViewModelBase
     }
 
     // 获取当前库中所有不重复的标签（标签池）
+    // 排序 = 标签自身最近使用时间降序（最近被打上的在前，见 NoteTagUsage），无记录的按名称兜底
     public List<string> AllExistingTags => Stickers
         .SelectMany(s => s.Tags)
         .Distinct()
-        .OrderBy(t => t)
+        .OrderByDescending(t => _tagStats.GetValueOrDefault(t, DateTime.MinValue))
+        .ThenBy(t => t)
         .ToList();
+
+    // ———— 标签使用统计（编辑器标签池的排序依据，tag-stats.json 持久化）————
+    // "使用" = 标签最近一次被添加到某个表情上（标签编辑器保存时记录新增部分）
+
+    private Dictionary<string, DateTime> _tagStats = new(StringComparer.Ordinal);
+    private static readonly SemaphoreSlim _tagStatsWriteLock = new(1, 1);
+
+    private static string TagStatsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+        "OICQStickerManager", "tag-stats.json");
+
+    private async Task LoadTagStatsAsync()
+    {
+        try
+        {
+            if (!File.Exists(TagStatsPath)) return;
+            var json = await File.ReadAllTextAsync(TagStatsPath);
+            var loaded = JsonSerializer.Deserialize<Dictionary<string, DateTime>>(json);
+            if (loaded != null) _tagStats = new Dictionary<string, DateTime>(loaded, StringComparer.Ordinal);
+        }
+        catch { /* 统计损坏按无记录处理，保存时会重建 */ }
+    }
+
+    private async Task SaveTagStatsAsync()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(TagStatsPath)!;
+            if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
+            var json = JsonSerializer.Serialize(_tagStats);
+            await WriteJsonWithBackupAsync(TagStatsPath, json, _tagStatsWriteLock);
+        }
+        catch { /* 统计落盘失败不拖累保存链路 */ }
+    }
+
+    /// <summary>记录标签被使用（添加到表情）：标签池随之按"最近用过"排序。</summary>
+    public void NoteTagUsage(IEnumerable<string> tags)
+    {
+        bool changed = false;
+        foreach (var t in tags)
+        {
+            if (string.IsNullOrWhiteSpace(t)) continue;
+            _tagStats[t] = DateTime.Now;
+            changed = true;
+        }
+        if (changed) _ = SaveTagStatsAsync();
+    }
 
     // 💡 这是一个小技巧：当标签更新后，通知 UI 刷新标签池
     public void RefreshTagPool() => OnPropertyChanged(nameof(AllExistingTags));
@@ -1605,23 +1647,6 @@ public class MainViewModel : ViewModelBase
             if (_enableGifHoverPreview != value)
             {
                 _enableGifHoverPreview = value;
-                OnPropertyChanged();
-                _ = SaveConfigAsync();
-            }
-        }
-    }
-
-    // 自动打标签（默认开）：拖入文件夹以文件夹名打整批标签；剪贴板入库以来源应用名打标签。
-    // 只做零猜测的规则式标注（来源信息本来就在手边），不做任何内容识别
-    private bool _autoTaggingEnabled = true;
-    public bool AutoTaggingEnabled
-    {
-        get => _autoTaggingEnabled;
-        set
-        {
-            if (_autoTaggingEnabled != value)
-            {
-                _autoTaggingEnabled = value;
                 OnPropertyChanged();
                 _ = SaveConfigAsync();
             }
@@ -1874,7 +1899,6 @@ public class MainViewModel : ViewModelBase
                     this._closeBehaviorDecided = config.CloseBehaviorDecided;
                     this.SilentStart = config.SilentStart;
                     this.EnableGifHoverPreview = config.EnableGifHoverPreview;
-                    this._autoTaggingEnabled = config.AutoTaggingEnabled;
                     // 主题已在启动时由 ThemeManager.ApplyInitial 同步应用；这里仅对齐 VM 状态
                     this.SelectedTheme = ThemeManager.Current.Id;
                     // QQ 绑定：按配置恢复（每绑定一个镜像服务），随后选项卡插入 QQ（账号）页
@@ -1897,7 +1921,6 @@ public class MainViewModel : ViewModelBase
                     OnPropertyChanged(nameof(StrategyIsAdopt));
                     OnPropertyChanged(nameof(QqSyncStrategyVisible));
                     OnPropertyChanged(nameof(AdoptBatchButtonVisible));
-                    OnPropertyChanged(nameof(AutoTaggingEnabled));
                 }
             }
             catch { /* 如果配置损坏则使用默认值 */ }

@@ -659,39 +659,16 @@ namespace OICQStickerManager.Views
                 if (sig == _lastClipboardSig) return;
                 _lastClipboardSig = sig;
 
-                // 自动打标签：捕获瞬间（复制后约 300ms，用户多半没切窗）记下来源应用，
-                // 点入库时以应用名打标签；前台是自己（本应用内复制）则不打
-                ShowCaptureToast(path, isTemp, vm.AutoTaggingEnabled ? GetForegroundProcessName() : null);
+                ShowCaptureToast(path, isTemp);
             }
             catch { /* 剪贴板被占用/无图等，忽略本次 */ }
-        }
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-        /// <summary>当前前台窗口的进程名（自动打标签用，如 QQ / WeChat / msedge）；取不到或是自己则 null。</summary>
-        private static string? GetForegroundProcessName()
-        {
-            try
-            {
-                var hwnd = GetForegroundWindow();
-                if (hwnd == IntPtr.Zero) return null;
-                GetWindowThreadProcessId(hwnd, out var pid);
-                if (pid == 0 || pid == (uint)Environment.ProcessId) return null;
-                using var p = System.Diagnostics.Process.GetProcessById((int)pid);
-                var name = p.ProcessName.Trim();
-                return name.Length > 0 && name.Length <= 24 ? name : null;
-            }
-            catch { return null; }
         }
 
         private string? _lastClipboardSig;
 
         private ClipboardToastWindow? _captureToast;
 
-        private void ShowCaptureToast(string imagePath, bool isTemp, string? autoTag = null)
+        private void ShowCaptureToast(string imagePath, bool isTemp)
         {
             // 新捕获顶掉旧的（旧临时文件顺带清理）
             if (_captureToast != null)
@@ -711,7 +688,7 @@ namespace OICQStickerManager.Views
             toast.ImportClicked += () =>
             {
                 if (_captureToast == toast) _captureToast = null;
-                _ = HandleCaptureImportAsync(imagePath, isTemp, autoTag);
+                _ = HandleCaptureImportAsync(imagePath, isTemp);
             };
             toast.Dismissed += () =>
             {
@@ -721,13 +698,13 @@ namespace OICQStickerManager.Views
             toast.Show();
         }
 
-        private async Task HandleCaptureImportAsync(string imagePath, bool isTemp, string? autoTag = null)
+        private async Task HandleCaptureImportAsync(string imagePath, bool isTemp)
         {
             try
             {
                 if (DataContext is MainViewModel vm)
                 {
-                    var report = await vm.AddStickersFromPathAsync(imagePath, autoTag);
+                    var report = await vm.AddStickersFromPathAsync(imagePath);
                     OnQqImportCompleted(report.Added, report.Duplicates, report.Unsupported);
                 }
             }
@@ -905,6 +882,10 @@ namespace OICQStickerManager.Views
                     _editingTags = new List<string>(); // 初始标签为空
                     TagInputBox.Text = "";
 
+                    // 建议标签（第一备选）：单个来源时以文件夹名/文件名作候选，用户点一下才加上，
+                    // 不自动打（2026-10-02 用户定案：来源命名只做建议）
+                    _suggestedTag = paths.Length == 1 ? DeriveSuggestedTag(paths[0]) : null;
+
                     // UI 显示第一张图片作为预览，并提示“批量编辑”（附跳过摘要）
                     SetTagEditorPreview(_pendingStickers[0]);
                     var summary = $"正在为 {_pendingStickers.Count} 个新表情设置标签";
@@ -935,7 +916,9 @@ namespace OICQStickerManager.Views
                 // 1. 防呆添加
                 if (!string.IsNullOrWhiteSpace(TagInputBox.Text)) PerformAddTag();
 
-                // 2. 同步标签给所有待处理对象
+                // 2. 本次新增的标签 = 编辑后集合 - 编辑前所有表情已有标签的并集
+                //    （新增即"标签被使用"，驱动标签池的最近使用排序）
+                var before = new HashSet<string>(_pendingStickers.SelectMany(s => s.Tags));
                 foreach (var sticker in _pendingStickers)
                 {
                     sticker.Tags = new List<string>(_editingTags);
@@ -948,25 +931,47 @@ namespace OICQStickerManager.Views
                     viewModel.UpdateTabTags();           // 刷新左侧选项卡列表
                     viewModel.RefreshTagPool();          // 刷新编辑器里的标签池
                     viewModel.RefreshQqMirrorFlags();    // QQ 页借入标签与已入库角标同步
+                    viewModel.NoteTagUsage(_editingTags.Where(t => !before.Contains(t)));
                 }
             }
 
+            _suggestedTag = null;
             ClearTagEditorPreview();
             HideOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
         }
 
         private void CloseTagEditor_Click(object sender, RoutedEventArgs e)
         {
+            _suggestedTag = null;
             ClearTagEditorPreview();
             HideOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
         }
 
         private List<string> _editingTags = new(); // 临时存放正在编辑的标签
 
+        // 标签编辑器的第一备选（文件夹批量导入=文件夹名，单个文件导入=文件名，其余场景为空）：
+        // 只做建议不自动打，用户点一下才加上（2026-10-02 用户定案）
+        private string? _suggestedTag;
+
+        /// <summary>从入库来源推导建议标签：文件夹取文件夹名、文件取文件名（去扩展名）；取不到为 null。</summary>
+        private static string? DeriveSuggestedTag(string path)
+        {
+            try
+            {
+                string name = Directory.Exists(path)
+                    ? Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                    : Path.GetFileNameWithoutExtension(path);
+                name = name?.Trim() ?? "";
+                return name.Length > 0 && name.Length <= 32 ? name : null;
+            }
+            catch { return null; }
+        }
+
         private void ShowTagEditor(StickerModel sticker)
         {
             // 💡 统一入口：即使是编辑单个，也放入列表中
             _pendingStickers = new List<StickerModel> { sticker };
+            _suggestedTag = null; // 编辑已有表情不提供来源建议
 
             // 拷贝标签用于编辑（如果是批量编辑，这里通常取第一张的标签或清空，按需决定）
             _editingTags = new List<string>(sticker.Tags);
@@ -1004,7 +1009,23 @@ namespace OICQStickerManager.Views
             }
             NoTagsHint.Visibility = _editingTags.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
-            // 渲染“库中已有但未添加”标签（中性胶囊）
+            // 建议标签放标签池首位（文件夹名/文件名，入库场景才有）：点一下即加，不点可忽略
+            if (!string.IsNullOrEmpty(_suggestedTag) && !_editingTags.Contains(_suggestedTag))
+            {
+                var suggestion = new Button { Content = _suggestedTag, Style = (Style)chipStyle };
+                suggestion.ToolTip = "建议标签：点击添加到本批表情";
+                suggestion.Click += (s, e) =>
+                {
+                    if (!string.IsNullOrEmpty(_suggestedTag) && !_editingTags.Contains(_suggestedTag))
+                    {
+                        _editingTags.Add(_suggestedTag);
+                        RefreshEditorUI();
+                    }
+                };
+                TagPoolPanel.Children.Add(suggestion);
+            }
+
+            // 渲染“库中已有但未添加”标签（中性胶囊，按标签最近使用排序）
             foreach (var tag in viewModel.AllExistingTags.Except(_editingTags))
             {
                 TagPoolPanel.Children.Add(CreateTagButton(tag, chipStyle));
@@ -1826,6 +1847,7 @@ namespace OICQStickerManager.Views
             {
                 _pendingStickers = imported;
                 _editingTags = new List<string>();
+                _suggestedTag = null; // QQ/剪贴板来源没有有意义的名字，不提供建议
                 TagInputBox.Text = "";
 
                 SetTagEditorPreview(imported[0]);

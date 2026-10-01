@@ -866,38 +866,20 @@
 
                             <TextBlock Text="图库" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
                             <Border Style="{StaticResource SettingsGroupStyle}">
-                                <StackPanel>
-                                    <Grid Margin="16,11">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="Auto"/>
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel>
-                                            <TextBlock Text="GIF 悬浮预览" Style="{StaticResource BodyTextStyle}"/>
-                                            <TextBlock Text="悬浮表情时自动播放动图气泡"
-                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
-                                        </StackPanel>
-                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
-                                                  IsChecked="{Binding EnableGifHoverPreview}"
-                                                  VerticalAlignment="Center"/>
-                                    </Grid>
-                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
-                                    <Grid Margin="16,11">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="Auto"/>
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel>
-                                            <TextBlock Text="自动打标签" Style="{StaticResource BodyTextStyle}"/>
-                                            <TextBlock Text="拖入文件夹时以文件夹名打标签；从剪贴板入库时以来源应用名打标签"
-                                                       Style="{StaticResource FootnoteTextStyle}"
-                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
-                                        </StackPanel>
-                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
-                                                  IsChecked="{Binding AutoTaggingEnabled}"
-                                                  VerticalAlignment="Center" Margin="12,0,0,0"/>
-                                    </Grid>
-                                </StackPanel>
+                                <Grid Margin="16,11">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="GIF 悬浮预览" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBlock Text="悬浮表情时自动播放动图气泡"
+                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                              IsChecked="{Binding EnableGifHoverPreview}"
+                                              VerticalAlignment="Center"/>
+                                </Grid>
                             </Border>
 
                             <TextBlock Text="资源库" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
