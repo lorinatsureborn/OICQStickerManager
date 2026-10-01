@@ -315,8 +315,7 @@
                          ItemsSource="{Binding TabTags}"
                          SelectedValuePath="Value"
                          SelectedValue="{Binding SelectedTab}"
-                         ScrollViewer.VerticalScrollBarVisibility="Auto"
-                         PreviewMouseLeftButtonDown="Sidebar_PreviewLeftDown">
+                         ScrollViewer.VerticalScrollBarVisibility="Auto">
                     <!-- 右键菜单挂在 ListBoxItem 上：胶囊整行可右键。挂在模板内 TextBlock 上时
                          可命中区域只有文字字形，点到胶囊空白处右键无反应（"触发不稳定"的根源）。
                          菜单定义在 Resources（x:Shared=False 每次右键新建实例）——Style.Setter 内的

@@ -135,17 +135,9 @@ public class MainViewModel : ViewModelBase
         {
             if (_selectedTab == value) return; // 值未变时不触发全列表刷新
 
-            // 搜索期间左键点击标签胶囊 = 把该标签设为搜索词（胶囊此时是搜索快捷入口而非页签切换，
-            // 否则点击后过滤仍走全库搜索、高亮却是假选中）；「最近」是搜索宿主视图，正常选中。
-            // 转译只认左键（NoteSidebarLeftDown 的时间窗）：右键选中若也转译，TabTags 重建会
-            // 销毁正在打开的右键菜单——"搜索→右键删除标签"路线因此断掉（2026-10-01 用户实测）
-            if (!string.IsNullOrEmpty(_searchText) && SidebarLeftClickRecent &&
-                value != "最近" && !value.StartsWith("qq:", StringComparison.Ordinal))
-            {
-                SearchText = value;
-                return;
-            }
-
+            // 选项卡就是纯页签：搜索中切换也不改搜索栏（2026-10-01 用户定案删除"点标签=搜索该词"
+            // 转译——搜索词被莫名替换很蠢）。过滤语义见构造函数：搜索只在「最近」视图生效，
+            // 切到标签页=看该标签全量（高亮与结果永远诚实），切回「最近」=搜索结果还在。
             _selectedTab = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(CurrentQqUin));
@@ -183,12 +175,16 @@ public class MainViewModel : ViewModelBase
         {
             var sticker = (StickerModel)obj;
 
-            // 搜索框过滤（最高优先级）
-            if (!string.IsNullOrWhiteSpace(SearchText))
-                return sticker.Tags.Any(t => t.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
+            // 搜索只在「最近」视图生效（「最近」=搜索宿主）：搜索中切到标签页就看该标签全量，
+            // 高亮与结果永远诚实；搜索词保留在搜索框，切回「最近」结果还在
+            if (SelectedTab == "最近")
+            {
+                if (!string.IsNullOrWhiteSpace(SearchText))
+                    return sticker.Tags.Any(t => t.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
+                return true;
+            }
 
             // 选项卡过滤
-            if (SelectedTab == "最近") return true; // “最近”显示所有
             return sticker.Tags.Contains(SelectedTab);
         };
 
@@ -226,12 +222,8 @@ public class MainViewModel : ViewModelBase
     public void UpdateTabTags()
     {
         var current = SelectedTab;
+        // 侧栏永远全量标签：搜索中切页签是正常操作（2026-10-01 用户定案），不再按搜索词过滤侧栏
         var allTags = Stickers.SelectMany(s => s.Tags).Distinct();
-
-        if (!string.IsNullOrEmpty(SearchText))
-        {
-            allTags = allTags.Where(t => t.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
-        }
 
         // 标签按内容热度排：标签热度 = 该标签下最热表情的 RankScore（用大而冷的标签堆分数会失真，故取峰值不取总和），
         // 最近活跃/高频使用的标签随之浮到顶部；同分按名称定序保持稳定
@@ -1244,9 +1236,9 @@ public class MainViewModel : ViewModelBase
             bool wasSearching = !string.IsNullOrEmpty(_searchText);
             bool searching = !string.IsNullOrEmpty(newText);
 
-            // 搜索=显式进入「最近」全库视图：进入时记忆原选项卡、清空时回跳。
-            // 旧逻辑只在原页签没被搜索词筛掉时才隐式回落到最近，高亮与实际过滤语义脱节
-            // （2026-10-01 用户提出纠正；从 QQ 界面搜索跳转也走同一条路径）
+            // 搜索=显式进入「最近」全库视图：进入时记忆原选项卡、清空时回跳——
+            // 但搜索期间用户手动切过页签的，尊重当前所在页签不回跳
+            // （从 QQ 界面搜索跳转也走同一条路径）
             if (searching && !wasSearching)
             {
                 _tabBeforeSearch = SelectedTab == "最近" ? null : SelectedTab;
@@ -1256,7 +1248,7 @@ public class MainViewModel : ViewModelBase
             {
                 var back = _tabBeforeSearch;
                 _tabBeforeSearch = null;
-                if (back != null && TabTags.Any(t => t.Value == back)) SelectedTab = back;
+                if (back != null && SelectedTab == "最近" && TabTags.Any(t => t.Value == back)) SelectedTab = back;
             }
 
             _searchText = newText;
@@ -1267,17 +1259,9 @@ public class MainViewModel : ViewModelBase
         }
     }
 
-    // 进入搜索前的选项卡（清空搜索后回跳）；null=搜索前就在「最近」
+    // 进入搜索前的选项卡（清空搜索后回跳）；null=搜索前就在「最近」。
+    // 搜索期间用户手动切过页签则弃用（尊重用户最后所在位置）
     private string? _tabBeforeSearch;
-
-    // 侧栏左键按下时间戳（SelectedTab 转译的时间窗判据，见 SelectedTab setter 注释）
-    private long _sidebarLeftDownAtTicks = long.MinValue / 2;
-
-    /// <summary>窗口在侧栏 PreviewMouseLeftButtonDown 时调用：标记"这是真实的左键点击"。</summary>
-    public void NoteSidebarLeftDown() => _sidebarLeftDownAtTicks = Environment.TickCount64;
-
-    /// <summary>600ms 内有过侧栏左键按下（左键选中引发的 SelectedTab 变化才算"点击标签"）。</summary>
-    private bool SidebarLeftClickRecent => Environment.TickCount64 - _sidebarLeftDownAtTicks < 600;
 
     // 搜索框是否有内容：驱动清空按钮与空状态文案
     public bool HasSearchText => !string.IsNullOrEmpty(_searchText);

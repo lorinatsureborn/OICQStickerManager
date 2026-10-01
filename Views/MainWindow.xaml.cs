@@ -342,15 +342,6 @@ namespace OICQStickerManager.Views
         private void OpenSettings_Click(object sender, RoutedEventArgs e)
             => ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
 
-        // 记录侧栏左键按下：SelectedTab 的"搜索中点标签=设为搜索词"转译只认左键点击。
-        // 右键引发的选中变化不得触发转译——转译会重建 TabTags、把正在打开的右键菜单
-        // 连根销毁（"搜索→右键删除标签"路线断掉的根源，2026-10-01 用户实测）。
-        // 时间窗（600ms）而非布尔标志：Up 丢失（拖出窗口释放）时不会永久卡在"左键中"。
-        private void Sidebar_PreviewLeftDown(object sender, MouseButtonEventArgs e)
-        {
-            if (DataContext is MainViewModel vm) vm.NoteSidebarLeftDown();
-        }
-
         private void CloseSettings_Click(object sender, RoutedEventArgs e)
             => HideOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
 
