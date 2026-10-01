@@ -916,25 +916,36 @@ namespace OICQStickerManager.Views
                 // 1. 防呆添加
                 if (!string.IsNullOrWhiteSpace(TagInputBox.Text)) PerformAddTag();
 
-                // 2. 本次新增的标签 = 编辑后集合 - 编辑前所有表情已有标签的并集
-                //    （新增即"标签被使用"，驱动标签池的最近使用排序）
-                var before = new HashSet<string>(_pendingStickers.SelectMany(s => s.Tags));
-                foreach (var sticker in _pendingStickers)
-                {
-                    sticker.Tags = new List<string>(_editingTags);
-                }
+                if (DataContext is not ViewModels.MainViewModel viewModel) return;
 
-                // 3. 核心持久化与视图刷新
-                if (this.DataContext is ViewModels.MainViewModel viewModel)
+                if (_batchAdjustMode)
                 {
-                    await viewModel.SaveDatabaseAsync(); // 存入 JSON
-                    viewModel.UpdateTabTags();           // 刷新左侧选项卡列表
-                    viewModel.RefreshTagPool();          // 刷新编辑器里的标签池
-                    viewModel.RefreshQqMirrorFlags();    // QQ 页借入标签与已入库角标同步
+                    // 批量调整模式：差量应用——added 加到每张、removed 从每张移除，
+                    // 各图片独有标签保留（覆盖式赋值会抹掉它们）
+                    var added = _editingTags.Except(_batchOriginalTags).ToList();
+                    var removed = _batchOriginalTags.Except(_editingTags).ToList();
+                    viewModel.ApplyTagAdjust(_pendingStickers, added, removed);
+                    viewModel.NoteTagUsage(added);
+                }
+                else
+                {
+                    // 导入/单张模式：覆盖式（导入初始为空、单张以自身标签起步，覆盖即增删）
+                    var before = new HashSet<string>(_pendingStickers.SelectMany(s => s.Tags));
+                    foreach (var sticker in _pendingStickers)
+                    {
+                        sticker.Tags = new List<string>(_editingTags);
+                    }
                     viewModel.NoteTagUsage(_editingTags.Where(t => !before.Contains(t)));
                 }
+
+                // 2. 核心持久化与视图刷新
+                await viewModel.SaveDatabaseAsync(); // 存入 JSON
+                viewModel.UpdateTabTags();           // 刷新左侧选项卡列表
+                viewModel.RefreshTagPool();          // 刷新编辑器里的标签池
+                viewModel.RefreshQqMirrorFlags();    // QQ 页借入标签与已入库角标同步
             }
 
+            _batchAdjustMode = false;
             _suggestedTag = null;
             ClearTagEditorPreview();
             HideOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
@@ -942,6 +953,7 @@ namespace OICQStickerManager.Views
 
         private void CloseTagEditor_Click(object sender, RoutedEventArgs e)
         {
+            _batchAdjustMode = false;
             _suggestedTag = null;
             ClearTagEditorPreview();
             HideOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
@@ -952,6 +964,14 @@ namespace OICQStickerManager.Views
         // 标签编辑器的第一备选（文件夹批量导入=文件夹名，单个文件导入=文件名，其余场景为空）：
         // 只做建议不自动打，用户点一下才加上（2026-10-02 用户定案）
         private string? _suggestedTag;
+
+        // "编辑标签下所有图片"模式：保存时差量应用（只加/删改动的标签），预填的共有标签集合
+        private bool _batchAdjustMode;
+        private List<string> _batchOriginalTags = new();
+
+        // 标签改名模式（复用 QQ 重命名 sheet）：true=正在改普通标签名，false=QQ 账号别名
+        private bool _renameTagMode;
+        private string? _renamingTag;
 
         /// <summary>从入库来源推导建议标签：文件夹取文件夹名、文件取文件名（去扩展名）；取不到为 null。</summary>
         private static string? DeriveSuggestedTag(string path)
@@ -1238,6 +1258,80 @@ namespace OICQStickerManager.Views
             {
                 EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
             });
+        }
+
+        // ———— 标签右键四项：改名 / 批量编辑 / 移除标签 / 删除表情 ————
+
+        // 解析菜单目标的标签名（MenuItem.DataContext = TabItemModel）
+        private static string? TagNameOf(object? dataContext) => dataContext switch
+        {
+            TabItemModel tab => tab.Value,
+            string s => s,
+            _ => null,
+        };
+
+        // 编辑该标签：把所有表情上的该标签改名（复用 QQ 重命名 sheet，标签模式）
+        private void RenameTag_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not MenuItem mi || DataContext is not MainViewModel vm) return;
+            var tagName = TagNameOf(mi.DataContext);
+            if (string.IsNullOrEmpty(tagName)) return;
+
+            _renameTagMode = true;
+            _renamingTag = tagName;
+            QqRenameTitle.Text = "编辑标签";
+            QqRenameSubtitle.Text = $"把所有表情上的「{tagName}」改名（当前 {vm.Stickers.Count(s => s.Tags.Contains(tagName))} 张图片带有此标签）";
+            QqRenameBox.Text = tagName;
+            ShowOverlay(QqRenameOverlay, QqRenameSheet, QqRenameSheetScale, 0.94);
+            QqRenameBox.Focus();
+            QqRenameBox.SelectAll();
+        }
+
+        // 编辑该标签下所有图片：批量标签编辑器，预填全部图片共有的标签，
+        // 保存时差量应用（只加/删改动的标签，各图片独有标签保留）
+        private void EditTagStickers_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not MenuItem mi || DataContext is not MainViewModel vm) return;
+            var tagName = TagNameOf(mi.DataContext);
+            if (string.IsNullOrEmpty(tagName)) return;
+
+            var stickers = vm.Stickers.Where(s => s.Tags.Contains(tagName)).ToList();
+            if (stickers.Count == 0) return;
+
+            IEnumerable<string> common = stickers[0].Tags;
+            foreach (var s in stickers.Skip(1)) common = common.Intersect(s.Tags);
+            _batchOriginalTags = common.Distinct().ToList();
+            _editingTags = new List<string>(_batchOriginalTags);
+            _pendingStickers = stickers;
+            _batchAdjustMode = true;
+            _suggestedTag = null;
+            TagInputBox.Text = "";
+
+            TagEditorTitle.Text = "编辑标签下所有图片";
+            TagEditorSubtitle.Text = $"「{tagName}」下共 {stickers.Count} 张图片；已预填全部图片共有的标签，" +
+                                     "保存时只应用你的增删改动，各图片独有的标签会保留";
+            SetTagEditorPreview(stickers[0]);
+            RefreshEditorUI();
+            ShowOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
+            TagInputBox.Focus();
+        }
+
+        // 删除该标签：从所有表情上移除标签本身，图片保留
+        private async void RemoveTag_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not MenuItem mi || DataContext is not MainViewModel vm) return;
+            var tagName = TagNameOf(mi.DataContext);
+            if (string.IsNullOrEmpty(tagName)) return;
+
+            int count = vm.Stickers.Count(s => s.Tags.Contains(tagName));
+            if (count == 0) return;
+            bool ok = await ShowAlertAsync("删除该标签？",
+                $"将把标签「{tagName}」从 {count} 张表情上移除，图片本身保留、不会删除。",
+                "移除标签", destructive: true);
+            if (!ok) return;
+
+            await vm.RemoveTagAsync(tagName);
+            vm.StatusText = $"已从 {count} 张表情上移除标签「{tagName}」";
         }
 
         private async void DeleteTagAndFiles_Click(object sender, RoutedEventArgs e)
@@ -1710,7 +1804,10 @@ namespace OICQStickerManager.Views
             var binding = vm.QqBindings.FirstOrDefault(b => "qq:" + b.Uin == tab.Value);
             if (binding == null) return;
 
+            _renameTagMode = false;
+            _renamingTag = null;
             _renameUin = binding.Uin;
+            QqRenameTitle.Text = "重命名 QQ 页";
             QqRenameSubtitle.Text = $"账号 {binding.Uin} · 当前显示：{vm.QqTabLabel(binding)}";
             QqRenameBox.Text = binding.Alias;
             ShowOverlay(QqRenameOverlay, QqRenameSheet, QqRenameSheetScale, 0.94);
@@ -1720,9 +1817,15 @@ namespace OICQStickerManager.Views
 
         private async void SaveQqRename_Click(object sender, RoutedEventArgs e)
         {
-            if (_renameUin != null && DataContext is MainViewModel vm)
+            if (DataContext is not MainViewModel vm) { CloseQqRename_Click(sender, e); return; }
+            if (_renameTagMode)
             {
-                // 留空 = 恢复默认（uin 尾号）
+                // 标签改名：所有表情上的旧名换新名
+                if (_renamingTag != null) await vm.RenameTagAsync(_renamingTag, QqRenameBox.Text);
+            }
+            else if (_renameUin != null)
+            {
+                // QQ 账号别名：留空 = 恢复默认（uin 尾号）
                 await vm.RenameQqAccountAsync(_renameUin, QqRenameBox.Text);
             }
             CloseQqRename_Click(sender, e);
@@ -1740,6 +1843,8 @@ namespace OICQStickerManager.Views
         private void CloseQqRename_Click(object sender, RoutedEventArgs e)
         {
             _renameUin = null;
+            _renameTagMode = false;
+            _renamingTag = null;
             HideOverlay(QqRenameOverlay, QqRenameSheet, QqRenameSheetScale, 0.94);
         }
 

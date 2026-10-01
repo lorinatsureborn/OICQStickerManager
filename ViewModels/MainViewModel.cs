@@ -1413,6 +1413,49 @@ public class MainViewModel : ViewModelBase
         if (changed) _ = SaveTagStatsAsync();
     }
 
+    // ———— 标签级操作（侧栏标签右键菜单，2026-10-02 用户定案细分）————
+
+    /// <summary>编辑标签：把所有表情上的「旧名」改为新名称（重合标签自动去重），并记一次新名使用。</summary>
+    public async Task RenameTagAsync(string oldName, string newName)
+    {
+        newName = (newName ?? "").Trim();
+        if (string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName) || oldName == newName) return;
+        foreach (var s in Stickers)
+        {
+            if (!s.Tags.Contains(oldName)) continue;
+            s.Tags = s.Tags.Select(t => t == oldName ? newName : t).Distinct().ToList();
+        }
+        await SaveDatabaseAsync();
+        UpdateTabTags();
+        RefreshQqMirrorFlags();
+        NoteTagUsage(new[] { newName });
+    }
+
+    /// <summary>批量增删标签（差量应用）：added 加到每张、removed 从每张移除，各张其余标签保留——
+    /// 批量编辑不能覆盖式赋值，否则会抹掉各图片独有的标签。</summary>
+    public void ApplyTagAdjust(IEnumerable<StickerModel> stickers, IEnumerable<string> added, IEnumerable<string> removed)
+    {
+        var add = new HashSet<string>(added);
+        var rem = new HashSet<string>(removed);
+        if (add.Count == 0 && rem.Count == 0) return;
+        foreach (var s in stickers)
+        {
+            s.Tags = s.Tags.Union(add).Except(rem).ToList();
+        }
+    }
+
+    /// <summary>删除标签（从所有表情上移除该标签，图片保留）；无载体的标签随页签重建自然消失。</summary>
+    public async Task RemoveTagAsync(string tagName)
+    {
+        foreach (var s in Stickers.Where(x => x.Tags.Contains(tagName)).ToList())
+        {
+            s.Tags = s.Tags.Where(t => t != tagName).ToList();
+        }
+        await SaveDatabaseAsync();
+        UpdateTabTags();
+        RefreshQqMirrorFlags();
+    }
+
     // 💡 这是一个小技巧：当标签更新后，通知 UI 刷新标签池
     public void RefreshTagPool() => OnPropertyChanged(nameof(AllExistingTags));
 

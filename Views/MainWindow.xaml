@@ -324,15 +324,22 @@
                          MenuItem 的 DataContext 继承自 placement target = TabItemModel。 -->
                     <ListBox.Resources>
                         <ContextMenu x:Key="TabContextMenu" x:Shared="False">
-                            <!-- QQ（账号）页：重命名 / 解绑；普通标签页：删除标签及其图片 -->
+                            <!-- QQ（账号）页：重命名 / 解绑；普通标签页：编辑/改名/移除/删除四项细分 -->
                             <MenuItem Header="重命名" Click="RenameQqTab_Click"
                                       Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
                             <MenuItem Header="解除绑定" Click="UnbindQqTab_Click"
                                       Foreground="{DynamicResource DangerBrush}"
                                       Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
-                            <MenuItem Header="删除标签及其图片"
+                            <MenuItem Header="编辑标签（全部改名）" Click="RenameTag_Click"
+                                      Visibility="{Binding CanDeleteTags, Converter={StaticResource BoolToVis}}"/>
+                            <MenuItem Header="编辑标签下所有图片" Click="EditTagStickers_Click"
+                                      Visibility="{Binding CanDeleteTags, Converter={StaticResource BoolToVis}}"/>
+                            <Separator/>
+                            <MenuItem Header="删除该标签（从表情中移除）" Click="RemoveTag_Click"
                                       Foreground="{DynamicResource DangerBrush}"
-                                      Click="DeleteTagAndFiles_Click"
+                                      Visibility="{Binding CanDeleteTags, Converter={StaticResource BoolToVis}}"/>
+                            <MenuItem Header="删除标签下所有表情" Click="DeleteTagAndFiles_Click"
+                                      Foreground="{DynamicResource DangerBrush}"
                                       Visibility="{Binding CanDeleteTags, Converter={StaticResource BoolToVis}}"/>
                         </ContextMenu>
                     </ListBox.Resources>
@@ -516,7 +523,7 @@
                     </Grid.RowDefinitions>
 
                     <StackPanel Grid.Row="0" Margin="0,0,0,20">
-                        <TextBlock Text="编辑标签" Style="{StaticResource TitleTextStyle}"/>
+                        <TextBlock x:Name="TagEditorTitle" Text="编辑标签" Style="{StaticResource TitleTextStyle}"/>
                         <TextBlock x:Name="TagEditorSubtitle" Style="{StaticResource FootnoteTextStyle}"
                                    Margin="0,4,0,0" Text="为表情添加标签，方便搜索与整理"/>
                     </StackPanel>
@@ -1060,7 +1067,7 @@
                     <ScaleTransform x:Name="QqRenameSheetScale" ScaleX="0.94" ScaleY="0.94"/>
                 </Border.RenderTransform>
                 <StackPanel Margin="26">
-                    <TextBlock Text="重命名 QQ 页" Style="{StaticResource TitleTextStyle}"/>
+                    <TextBlock x:Name="QqRenameTitle" Text="重命名 QQ 页" Style="{StaticResource TitleTextStyle}"/>
                     <TextBlock x:Name="QqRenameSubtitle" Style="{StaticResource FootnoteTextStyle}"
                                Margin="0,4,0,0" TextWrapping="Wrap"/>
                     <TextBox x:Name="QqRenameBox" Margin="0,16,0,0" Tag="输入显示名，留空恢复默认"
