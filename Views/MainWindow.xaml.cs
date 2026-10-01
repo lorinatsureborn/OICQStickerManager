@@ -1131,7 +1131,11 @@ namespace OICQStickerManager.Views
                     }
 
                     if (!deleted)
-                        viewModel.StatusText = "文件被占用，已从列表移除但物理文件未删除";
+                    {
+                        // 半删除兜底：记录待删任务，30 秒后与下次启动各重试一轮；期间不会被重新收编
+                        viewModel.QueuePendingDelete(sticker.FullPath, sticker.Md5);
+                        viewModel.StatusText = "文件被占用，已从图库移除，稍后自动重试删除";
+                    }
                     else
                         Diag("delete: file deleted");
                 }

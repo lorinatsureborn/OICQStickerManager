@@ -577,7 +577,7 @@ public class MainViewModel : ViewModelBase
         string library = EnsureLibraryFolder();
         if (!ImageSniffer.TryGetImportExtension(sticker.FullPath, out var ext, out var kind)) return false;
         var destination = Path.Combine(library, sticker.Md5 + ext);
-        if (File.Exists(destination)) return false;
+        if (File.Exists(destination)) { CancelPendingDelete(destination); return false; } // 命中待删旧文件=用户重新入库，销单放行
 
         destination = await ImageSniffer.MaterializeAsync(sticker.FullPath, library, sticker.Md5, kind);
         var copy = new StickerModel
@@ -912,7 +912,7 @@ public class MainViewModel : ViewModelBase
                 if (!ImageSniffer.TryGetImportExtension(item.FullPath, out var ext, out var kind)) { report.Unsupported++; continue; }
 
                 var destination = Path.Combine(library, item.Md5 + ext);
-                if (File.Exists(destination)) { item.IsImported = true; report.Duplicates++; continue; }
+                if (File.Exists(destination)) { CancelPendingDelete(destination); item.IsImported = true; report.Duplicates++; continue; } // 命中待删旧文件=用户重新入库，销单放行
 
                 destination = await ImageSniffer.MaterializeAsync(item.FullPath, library, item.Md5, kind);
 
@@ -944,14 +944,120 @@ public class MainViewModel : ViewModelBase
         return report;
     }
 
+    // ———— 待删除队列（半删除兜底；2026-10-03 用户定案）————
+    // 删除时物理文件被占用（GIF 预览/杀毒扫描等）：记录已从图库移除、UI 即时消失，
+    // 文件记入待删队列，30 秒后与下次启动各重试一轮；期间物理收编跳过这些文件，
+    // 防止“半删除”文件被重新收编成无标签表情。删除成功即销单——不是永久删除意图，
+    // 文件被重新入库占用时也销单放行，用户加回同一张图不受任何干扰。
+
+    private sealed record PendingDelete(string Path, string? Md5, DateTime RequestedAt);
+
+    private List<PendingDelete> _pendingDeletes = new();
+    private static readonly SemaphoreSlim _pendingDeleteWriteLock = new(1, 1);
+    private DispatcherTimer? _pendingRetryTimer;
+
+    private static string PendingDeletesPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+        "OICQStickerManager", "pending-deletes.json");
+
+    private void LoadPendingDeletes()
+    {
+        try
+        {
+            if (!File.Exists(PendingDeletesPath)) return;
+            var json = File.ReadAllText(PendingDeletesPath);
+            _pendingDeletes = JsonSerializer.Deserialize<List<PendingDelete>>(json) ?? new();
+        }
+        catch { _pendingDeletes = new(); /* 损坏按空处理，最坏=残留文件被收编（历史行为） */ }
+    }
+
+    private async Task SavePendingDeletesAsync()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(PendingDeletesPath)!;
+            if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
+            var json = JsonSerializer.Serialize(_pendingDeletes);
+            await WriteJsonWithBackupAsync(PendingDeletesPath, json, _pendingDeleteWriteLock);
+        }
+        catch { /* 落盘失败不拖累删除链路，下次入队再写 */ }
+    }
+
+    /// <summary>删除时文件被占用：记入待删队列并安排一轮延迟重试（启动时还有一轮）。</summary>
+    public void QueuePendingDelete(string path, string? md5)
+    {
+        if (string.IsNullOrEmpty(path)) return;
+        if (_pendingDeletes.Any(p => string.Equals(p.Path, path, StringComparison.OrdinalIgnoreCase))) return;
+        _pendingDeletes.Add(new PendingDelete(path, md5, DateTime.Now));
+        _ = SavePendingDeletesAsync();
+
+        if (_pendingRetryTimer == null)
+        {
+            _pendingRetryTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
+            _pendingRetryTimer.Tick += async (_, _) =>
+            {
+                _pendingRetryTimer.Stop();
+                await RetryPendingDeletesAsync();
+            };
+        }
+        _pendingRetryTimer.Stop();
+        _pendingRetryTimer.Start(); // 无论入队几张，只安排一轮延迟重试
+    }
+
+    /// <summary>用户重新入库占用了待删路径（导入落盘命中旧文件）：销单放行。</summary>
+    public void CancelPendingDelete(string path)
+    {
+        var before = _pendingDeletes.Count;
+        _pendingDeletes.RemoveAll(p => string.Equals(p.Path, path, StringComparison.OrdinalIgnoreCase));
+        if (_pendingDeletes.Count != before) _ = SavePendingDeletesAsync();
+    }
+
+    /// <summary>
+    /// 重试待删队列：删除成功销单；路径已被新记录占用（用户重新入库）销单放行；
+    /// 仍被占用则保留，留给下次启动。返回是否仍有残留。
+    /// </summary>
+    private async Task<bool> RetryPendingDeletesAsync()
+    {
+        if (_pendingDeletes.Count == 0) return false;
+
+        // 在库路径：待删文件只可能是“已不在图库”的孤儿，被重新入库占用的路径直接销单
+        var alivePaths = new HashSet<string>(
+            Stickers.Select(s => s.FullPath), StringComparer.OrdinalIgnoreCase);
+
+        var remaining = new List<PendingDelete>();
+        foreach (var item in _pendingDeletes.ToList())
+        {
+            if (alivePaths.Contains(item.Path)) continue; // 销单：文件已归新记录
+            var deleted = await Task.Run(() =>
+            {
+                try { if (File.Exists(item.Path)) File.Delete(item.Path); return true; }
+                catch { return false; } // 仍被占用：保留，下次启动再试
+            });
+            if (!deleted) remaining.Add(item);
+        }
+
+        _pendingDeletes = remaining;
+        await SavePendingDeletesAsync();
+        return _pendingDeletes.Count > 0;
+    }
+
     private async Task LoadStickersAsync()
     {
         StatusText = "正在自动同步图库文件...";
 
         string libraryPath = EnsureLibraryFolder();
 
-        // 1. 获取物理文件列表
-        var physicalFiles = await _imageService.GetStickersAsync(libraryPath);
+        // 0. 待删队列：启动先重试一轮（此时 Stickers 尚未载入，在库保护集为空=全删）；
+        //    仍删不掉的文件在下面收编时跳过，防止“半删除复活成无标签表情”
+        LoadPendingDeletes();
+        await RetryPendingDeletesAsync();
+
+        // 1. 获取物理文件列表（待删队列中的被占用文件不参与收编）
+        var pendingPaths = new HashSet<string>(
+            _pendingDeletes.Select(p => p.Path), StringComparer.OrdinalIgnoreCase);
+        var physicalFiles = (await _imageService.GetStickersAsync(libraryPath))
+            .Where(f => !pendingPaths.Contains(f.FullPath))
+            .ToList();
 
         // 2. 获取 JSON 记录（损坏时自愈：.bak 恢复 / .bad 留证——这里有全部标签，丢不起）
         List<StickerModel> savedRecords = new();
@@ -998,7 +1104,9 @@ public class MainViewModel : ViewModelBase
         Stickers.Clear();
         foreach (var s in finalStickers) Stickers.Add(s);
 
-        StatusText = $"同步完成，共有 {Stickers.Count} 个表情包";
+        StatusText = _pendingDeletes.Count > 0
+            ? $"同步完成，共有 {Stickers.Count} 个表情包；另有 {_pendingDeletes.Count} 个被占用文件将在下次启动继续删除"
+            : $"同步完成，共有 {Stickers.Count} 个表情包";
 
         // 5. 自动反向保存一次 JSON，修复差异
         await SaveDatabaseAsync();
@@ -1082,7 +1190,7 @@ public class MainViewModel : ViewModelBase
                 if (!knownMd5.Add(md5)) { report.Duplicates++; continue; }
 
                 string destinationPath = Path.Combine(appDataFolder, md5 + ext);
-                if (File.Exists(destinationPath)) { report.Duplicates++; continue; }
+                if (File.Exists(destinationPath)) { CancelPendingDelete(destinationPath); report.Duplicates++; continue; } // 命中待删旧文件=用户重新入库，销单放行
 
                 destinationPath = await ImageSniffer.MaterializeAsync(file, appDataFolder, md5, kind);
 
