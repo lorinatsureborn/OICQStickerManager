@@ -997,8 +997,18 @@
                                         </StackPanel>
                                     </Button>
                                     <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
+                                    <Button Style="{StaticResource RowButtonStyle}" Click="OpenLogs_Click"
+                                            AutomationProperties.Name="打开诊断日志文件夹">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE8B7;"
+                                                       FontSize="14" Foreground="{DynamicResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="打开诊断日志文件夹" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
                                     <Grid Margin="16,11">
-                                        <TextBlock Text="会打开 GitHub 的 issue 提交页，自动附上诊断日志（已脱敏）；提交前可以先描述你遇到的问题"
+                                        <TextBlock Text="预填正文已自动附带精选日志；如需完整日志，打开上面的文件夹把 asuka-watcher.log 拖进 GitHub 提交页的附件区即可"
                                                    Style="{StaticResource FootnoteTextStyle}" TextWrapping="Wrap"/>
                                     </Grid>
                                 </StackPanel>

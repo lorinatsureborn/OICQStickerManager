@@ -2166,6 +2166,33 @@ namespace OICQStickerManager.Views
             }
         }
 
+        // 打开日志所在文件夹并选中主日志（asuka-watcher.log）：GitHub issue 附件区支持拖拽，
+        // 用户从这里把日志拖进浏览器即可；日志还不存在时退化为打开 %TEMP%
+        private void OpenLogs_Click(object sender, RoutedEventArgs e)
+        {
+            var log = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "asuka-watcher.log");
+            try
+            {
+                if (System.IO.File.Exists(log))
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe")
+                    {
+                        Arguments = $"/select, \"{log}\"",
+                        UseShellExecute = true,
+                    });
+                }
+                else
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                        System.IO.Path.GetTempPath()) { UseShellExecute = true });
+                }
+            }
+            catch (Exception ex)
+            {
+                _ = ShowAlertAsync("未能打开日志文件夹", ex.Message, "知道了", showCancel: false);
+            }
+        }
+
         // ———— 启动询问（检测 → 猜测 → 询问，绝不擅自绑定） ————
 
         private async Task TryPromptQqBindingAsync()
