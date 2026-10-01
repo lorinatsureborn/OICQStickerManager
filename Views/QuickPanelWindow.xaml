@@ -146,6 +146,12 @@
                                     Visibility="{Binding IsGif, Converter={StaticResource BoolToVis}}">
                                 <TextBlock Text="GIF" FontSize="8" FontWeight="Bold" Foreground="#F2FFFFFF"/>
                             </Border>
+                            <!-- QQ 来源角标：混排里区分未入库的 QQ 收藏（发送即用，不进图库） -->
+                            <Border HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="8,0,0,8"
+                                    Background="#99000000" CornerRadius="6" Padding="4,1.5"
+                                    Visibility="{Binding IsQqItem, Converter={StaticResource BoolToVis}}">
+                                <TextBlock Text="QQ" FontSize="8" FontWeight="Bold" Foreground="#F2FFFFFF"/>
+                            </Border>
                         </Grid>
                     </Border>
                     <DataTemplate.Triggers>

@@ -12,6 +12,10 @@ public class QqStickerModel : StickerModel
     /// <summary>镜像所属账号（qq:&lt;uin&gt; 选项卡的归属）。</summary>
     public string Uin { get; set; } = "";
 
+    /// <summary>QQ 收藏标记（快捷面板混排的来源角标）。</summary>
+    [JsonIgnore]
+    public override bool IsQqItem => true;
+
     /// <summary>Thumb 目录下的静态缩略图（gif 没有），绑定对话框预览用。</summary>
     [JsonIgnore]
     public string? ThumbPath { get; set; }

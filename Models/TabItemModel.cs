@@ -20,6 +20,9 @@ public class TabItemModel
     /// <summary>QQ 绑定页：右键菜单走 重命名/解绑，普通标签页走 删除标签及其图片。</summary>
     public bool IsQq { get; }
 
+    /// <summary>「删除标签及其图片」菜单项的显隐：QQ 页与「最近」默认视图不可删。</summary>
+    public bool CanDeleteTags => !IsQq && Value != "最近";
+
     // ItemAutomationPeer 取名称的标准来源，读屏软件念标签文本而非类型名
     public override string ToString() => Label;
 }

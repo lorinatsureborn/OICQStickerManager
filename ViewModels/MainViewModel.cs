@@ -196,12 +196,19 @@ public class MainViewModel : ViewModelBase
         _stickersView.SortDescriptions.Add(new SortDescription(nameof(StickerModel.LastUsedTime), ListSortDirection.Descending));
 
         // 快捷面板专用视图：与图库默认视图（带标签页/搜索过滤）解耦，永远全量、同一把热度尺子；
-        // 不开实时排序——面板打开期间顺序冻结，发送不会让格子从光标下跳走，每次呼出时再重排
-        QuickPanelView = new ListCollectionView(Stickers);
+        // 不开实时排序——面板打开期间顺序冻结，发送不会让格子从光标下跳走，每次呼出时再重排。
+        // 数据源是 PanelItems（图库 ∪ QQ 未入库镜像，呼出时重建），不是 Stickers 本身
+        QuickPanelView = new ListCollectionView(PanelItems);
         QuickPanelView.SortDescriptions.Add(new SortDescription(nameof(StickerModel.RankScore), ListSortDirection.Descending));
         QuickPanelView.SortDescriptions.Add(new SortDescription(nameof(StickerModel.LastUsedTime), ListSortDirection.Descending));
-        // 面板过滤器：视角空 = 全部，非空 = 只看该标签（排序不受视角影响）
-        QuickPanelView.Filter = o => _panelSelectedTab.Length == 0 || ((StickerModel)o).Tags.Contains(_panelSelectedTab);
+        // 面板过滤器：视角空 = 全部；"qq" = 只看 QQ 收藏；其他 = 该标签下的图库表情
+        // （QQ 镜像条目没有标签，标签视角天然只出图库表情）
+        QuickPanelView.Filter = o =>
+        {
+            if (_panelSelectedTab.Length == 0) return true;
+            if (_panelSelectedTab == QqPanelTabValue) return o is QqStickerModel;
+            return o is not QqStickerModel && ((StickerModel)o).Tags.Contains(_panelSelectedTab);
+        };
 
         // 页脚计数：过滤结果变化（搜索/切标签/增删表情）都走这里实时刷新
         _stickersView.CollectionChanged += (_, _) => UpdateCounts();
@@ -210,6 +217,7 @@ public class MainViewModel : ViewModelBase
         // 💡 启动时自动加载
         _ = LoadConfigAsync();
         _ = LoadStickersAsync();
+        _ = LoadQqStatsAsync();
     }
 
     public void UpdateTabTags()
@@ -259,9 +267,46 @@ public class MainViewModel : ViewModelBase
         var selected = _panelSelectedTab;
         PanelTabs.Clear();
         PanelTabs.Add(new PanelTabItem("", "全部", isSelected: selected.Length == 0));
-        foreach (var tag in heat.Keys.OrderByDescending(t => heat[t]).ThenBy(t => t))
+        if (_qqBindings.Count > 0)
+            PanelTabs.Add(new PanelTabItem(QqPanelTabValue, "QQ", isSelected: selected == QqPanelTabValue));
+        foreach (var tag in heat.Keys.Where(t => t != QqPanelTabValue).OrderByDescending(t => heat[t]).ThenBy(t => t))
             PanelTabs.Add(new PanelTabItem(tag, tag, isSelected: tag == selected));
         OnPropertyChanged(nameof(HasPanelTabs));
+    }
+
+    // ———— 快捷面板数据源（图库 ∪ QQ 未入库镜像）————
+
+    /// <summary>
+    /// 面板网格的数据源：图库全部 + 各账号 QQ 收藏中未入库的镜像，按 Md5 去重——
+    /// 同一张表情已在图库就以图库身份出现（统计本就记在图库），不重复展示。
+    /// 只在呼出时整体重建（QuickPanelView 冻结排序语义），打开期间 QQ 收藏变化不打扰面板。
+    /// </summary>
+    public ObservableCollection<StickerModel> PanelItems { get; } = new();
+
+    /// <summary>呼出前面板数据源重建：合并 + 去重 + 热度排序（排序由 QuickPanelView 的 SortDescriptions 承担）。</summary>
+    public void RebuildPanelItems()
+    {
+        var items = new List<StickerModel>(Stickers);
+        var seenMd5 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in Stickers)
+        {
+            if (!string.IsNullOrEmpty(s.Md5)) seenMd5.Add(s.Md5);
+        }
+        foreach (var service in _qqServices.Values)
+        {
+            foreach (var mirror in service.Mirror)
+            {
+                if (!string.IsNullOrEmpty(mirror.Md5) && seenMd5.Add(mirror.Md5))
+                    items.Add(mirror);
+            }
+        }
+        items.Sort((a, b) =>
+        {
+            var byScore = b.RankScore.CompareTo(a.RankScore);
+            return byScore != 0 ? byScore : b.LastUsedTime.CompareTo(a.LastUsedTime);
+        });
+        PanelItems.Clear();
+        foreach (var item in items) PanelItems.Add(item);
     }
 
     // ———— QQ 账号绑定（一对多、显式绑定，设计见 docs §4.5/§4.6） ————
@@ -288,6 +333,7 @@ public class MainViewModel : ViewModelBase
         var service = new QqEmojiService(binding.Uin, oriDir, action => _uiDispatcher.Invoke(action));
         service.MirrorChanged += (_, _) =>
         {
+            ApplyQqStats(service);
             UpdateImportedFlags(service);
             UpdateCounts();
         };
@@ -693,6 +739,63 @@ public class MainViewModel : ViewModelBase
         foreach (var service in _qqServices.Values) UpdateImportedFlags(service);
     }
 
+    // ———— QQ 表情使用统计（快捷面板 frecency 的镜像侧输入）————
+    // QQ 收藏镜像不落 stickers.json（导入即出库原则），但快捷面板要与图库同一把热度尺子，
+    // 未入库镜像的发送次数/最近活跃单独存 qq-stats.json，键 = 内容 MD5。
+
+    private sealed class QqUsageStat
+    {
+        public int N { get; set; }          // 累计发送次数
+        public DateTime T { get; set; }     // 最近一次发送时间
+    }
+
+    private Dictionary<string, QqUsageStat> _qqStats = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly SemaphoreSlim _qqStatsWriteLock = new(1, 1);
+
+    private static string QqStatsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+        "OICQStickerManager", "qq-stats.json");
+
+    private async Task LoadQqStatsAsync()
+    {
+        try
+        {
+            if (!File.Exists(QqStatsPath)) return;
+            var json = await File.ReadAllTextAsync(QqStatsPath);
+            var loaded = JsonSerializer.Deserialize<Dictionary<string, QqUsageStat>>(json);
+            if (loaded == null) return;
+            _qqStats = new Dictionary<string, QqUsageStat>(loaded, StringComparer.OrdinalIgnoreCase);
+            // 统计晚于镜像到位的情况（QQ 扫描先完成）：补应用到已就绪的镜像
+            foreach (var service in _qqServices.Values) ApplyQqStats(service);
+        }
+        catch { /* 统计损坏按无统计处理，发送后会被新数据覆盖 */ }
+    }
+
+    /// <summary>把持久化的使用统计套到镜像条目上（RankScore 随之生效，与图库副本同尺）。</summary>
+    private void ApplyQqStats(QqEmojiService service)
+    {
+        foreach (var item in service.Mirror)
+        {
+            if (!string.IsNullOrEmpty(item.Md5) && _qqStats.TryGetValue(item.Md5, out var stat))
+            {
+                item.UseCount = stat.N;
+                if (stat.T > DateTime.MinValue) item.LastUsedTime = stat.T;
+            }
+        }
+    }
+
+    private async Task SaveQqStatsAsync()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(QqStatsPath)!;
+            if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
+            var json = JsonSerializer.Serialize(_qqStats);
+            await WriteJsonWithBackupAsync(QqStatsPath, json, _qqStatsWriteLock);
+        }
+        catch { /* 统计落盘失败不拖累发送链路，下次发送再写 */ }
+    }
+
     // ———— QQ 表情导入（复制转正：详见设计文档 §4.6） ————
 
     public RelayCommand<QqStickerModel> ImportQqStickerCommand { get; }
@@ -857,7 +960,9 @@ public class MainViewModel : ViewModelBase
     }
 
     // 💡 拖放入库：魔数定真实格式 + MD5 内容去重 + 以 <md5>.<ext> 命名（设计 §5.1）
-    public async Task<ImportReport> AddStickersFromPathAsync(string sourcePath)
+    // autoTag：自动打标签（反馈 2026-10-01）。null = 按来源推导（目录拖入 → 文件夹名）；
+    // 空串 = 明确不打；非空 = 调用方指定的标签（剪贴板链路传来源应用名）。
+    public async Task<ImportReport> AddStickersFromPathAsync(string sourcePath, string? autoTag = null)
     {
         var report = new ImportReport();
         string appDataFolder = EnsureLibraryFolder();
@@ -871,6 +976,12 @@ public class MainViewModel : ViewModelBase
             filesToProcess = Directory.EnumerateFiles(sourcePath, "*.*", SearchOption.AllDirectories)
                                       .Where(f => exts.Contains(Path.GetExtension(f).ToLower()))
                                       .ToList();
+            // 自动打标签：拖入文件夹 = 以文件夹名给整批打标签（最高频的整理场景，免手动逐张标）
+            if (autoTag == null && _autoTaggingEnabled)
+            {
+                var folder = Path.GetFileName(sourcePath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (!string.IsNullOrWhiteSpace(folder) && folder.Trim().Length <= 24) autoTag = folder.Trim();
+            }
         }
         else if (File.Exists(sourcePath))
         {
@@ -900,7 +1011,7 @@ public class MainViewModel : ViewModelBase
                 {
                     FullPath = destinationPath,
                     Md5 = md5,
-                    Tags = new List<string>(),
+                    Tags = !string.IsNullOrEmpty(autoTag) ? new List<string> { autoTag } : new List<string>(),
                     // 入库即活跃基线：新表情按"最近添加"高位起步，之后随时间自然下沉
                     LastUsedTime = DateTime.Now
                 };
@@ -997,6 +1108,7 @@ public class MainViewModel : ViewModelBase
                 CloseBehaviorDecided = this._closeBehaviorDecided,
                 SilentStart = this.SilentStart,
                 EnableGifHoverPreview = this.EnableGifHoverPreview,
+                AutoTaggingEnabled = this.AutoTaggingEnabled,
                 QqBindings = new List<QqBindingInfo>(this._qqBindings),
                 QqPromptDismissedUins = new List<string>(this._qqPromptDismissedUins),
                 WebpNoticeDismissed = this._webpNoticeDismissed
@@ -1083,10 +1195,13 @@ public class MainViewModel : ViewModelBase
 
     // ———— 快捷面板选项卡（悬浮切换视角）————
 
-    /// <summary>面板选项卡 = 「全部」+ 标签（热度序，与侧栏同口径；不含「最近」与 QQ 页——面板永远面向图库）。</summary>
+    /// <summary>「QQ」胶囊的保留视角值：QQ 收藏（未入库镜像）专用，用户标签撞名时让位。</summary>
+    public const string QqPanelTabValue = "qq";
+
+    /// <summary>面板选项卡 = 「全部」+ QQ（有绑定时）+ 标签（热度序，与侧栏同口径）。</summary>
     public ObservableCollection<PanelTabItem> PanelTabs { get; } = new();
 
-    /// <summary>存在用户标签才显示选项卡行（只有「全部」时整行隐藏，网格保持全高）。</summary>
+    /// <summary>存在用户标签或 QQ 绑定才显示选项卡行（只有「全部」时整行隐藏，网格保持全高）。</summary>
     public bool HasPanelTabs => PanelTabs.Any(t => t.Value.Length > 0);
 
     // 当前面板视角：空串 = 全部
@@ -1419,6 +1534,23 @@ public class MainViewModel : ViewModelBase
         }
     }
 
+    // 自动打标签（默认开）：拖入文件夹以文件夹名打整批标签；剪贴板入库以来源应用名打标签。
+    // 只做零猜测的规则式标注（来源信息本来就在手边），不做任何内容识别
+    private bool _autoTaggingEnabled = true;
+    public bool AutoTaggingEnabled
+    {
+        get => _autoTaggingEnabled;
+        set
+        {
+            if (_autoTaggingEnabled != value)
+            {
+                _autoTaggingEnabled = value;
+                OnPropertyChanged();
+                _ = SaveConfigAsync();
+            }
+        }
+    }
+
     // 快捷面板热键：Win32 MOD_* 标志（1=Alt 2=Ctrl 4=Shift 8=Win，与 WPF ModifierKeys 数值一致）+ 虚拟键码，默认 Ctrl+Alt+D
     // （旧默认 Ctrl+Alt+E 被 QQ 新版功能占用，2026-09 迁移，见 LoadConfigAsync）
     private uint _hotkeyModifiers = 0x3;
@@ -1593,6 +1725,12 @@ public class MainViewModel : ViewModelBase
         {
             var twin = Stickers.FirstOrDefault(x => x.Md5 == qq.Md5);
             if (twin != null) { twin.UseCount++; twin.LastUsedTime = s.LastUsedTime; }
+            // 未入库镜像没有落盘载体：统计单独记 qq-stats.json，快捷面板混排时与图库同尺排序
+            if (!string.IsNullOrEmpty(qq.Md5))
+            {
+                _qqStats[qq.Md5] = new QqUsageStat { N = qq.UseCount, T = qq.LastUsedTime };
+                _ = SaveQqStatsAsync();
+            }
         }
         await send(s.FullPath);
         await SaveDatabaseAsync();
@@ -1619,7 +1757,17 @@ public class MainViewModel : ViewModelBase
             this.HotkeyModifiers = 0x3;
             this.HotkeyKey = 0x44;
         }
+        // 放出"配置已就绪"信号：主窗口的热键注册等它（启动时默认键抢先注册会误报被占用）
+        _configLoaded.TrySetResult();
     }
+
+    /// <summary>配置加载中标志：热键注册等加载完成后才执行（IsLoadingConfig 供窗口守卫）。</summary>
+    public bool IsLoadingConfig => _loadingConfig;
+
+    /// <summary>config 加载完成信号（无论成败都会触发）：热键注册的启动时序锚点。</summary>
+    public Task ConfigLoaded => _configLoaded.Task;
+    private readonly TaskCompletionSource _configLoaded =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>returns: 是否需要旧默认热键迁移（迁移落盘在加载完成后统一执行）。</summary>
     private async Task<bool> LoadConfigCoreAsync()
@@ -1668,6 +1816,7 @@ public class MainViewModel : ViewModelBase
                     this._closeBehaviorDecided = config.CloseBehaviorDecided;
                     this.SilentStart = config.SilentStart;
                     this.EnableGifHoverPreview = config.EnableGifHoverPreview;
+                    this._autoTaggingEnabled = config.AutoTaggingEnabled;
                     // 主题已在启动时由 ThemeManager.ApplyInitial 同步应用；这里仅对齐 VM 状态
                     this.SelectedTheme = ThemeManager.Current.Id;
                     // QQ 绑定：按配置恢复（每绑定一个镜像服务），随后选项卡插入 QQ（账号）页
@@ -1690,6 +1839,7 @@ public class MainViewModel : ViewModelBase
                     OnPropertyChanged(nameof(StrategyIsAdopt));
                     OnPropertyChanged(nameof(QqSyncStrategyVisible));
                     OnPropertyChanged(nameof(AdoptBatchButtonVisible));
+                    OnPropertyChanged(nameof(AutoTaggingEnabled));
                 }
             }
             catch { /* 如果配置损坏则使用默认值 */ }

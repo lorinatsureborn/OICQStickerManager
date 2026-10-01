@@ -64,4 +64,7 @@ public class AppConfig
     // emoji.db 密钥（16 字符，官方脚本提取；QQ 大版本更新后可能失效需重新引导）
     public string QqDbKey { get; set; } = "";
 
+    // 自动打标签（默认开）：拖入文件夹以文件夹名打标签；剪贴板入库以来源应用名打标签
+    public bool AutoTaggingEnabled { get; set; } = true;
+
 }

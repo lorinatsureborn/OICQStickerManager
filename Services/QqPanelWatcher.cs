@@ -44,6 +44,13 @@ public class QqPanelWatcher : IDisposable
     private const string PanelClassName = "sticker-panel";
     private const string EditorClassKey = "ExEditor-qq-msg-editor";
 
+    /// <summary>
+    /// 表情按钮的宽松匹配：NTQQ 各版本的类名/文案会单独漂移（旧版如 9.9.19 可能改类名或加修饰），
+    /// 名称精确命中即认（聊天窗口里叫「表情」的元素就是表情按钮；误判代价只是面板贴错位置，可自愈）。
+    /// </summary>
+    private static bool LooksLikeEmojiButton(string name, string cls) =>
+        name.Trim() == EmojiButtonName;
+
     private readonly Action<string> _status;
     private readonly object _gate = new();
     private readonly Dictionary<IntPtr, AutomationElement> _subscribed = new();
@@ -99,9 +106,9 @@ public class QqPanelWatcher : IDisposable
                 var pt = new System.Windows.Point(rect.Left + rect.Width / 2.0, rect.Top + rect.Height / 2.0);
                 var el = System.Windows.Automation.AutomationElement.FromPoint(pt);
                 // 矩形中心常命中按钮内部的 svg 图标（/q-svg-icon q-icon），沿控制树向上回溯找
-                // 表情/icon-item 按钮本体（与面板检测的祖先回溯同款手法，≤12 级封顶）
+                // 表情按钮本体（与面板检测的祖先回溯同款手法，≤12 级封顶）
                 var btn = el;
-                for (int hop = 0; hop < 12 && !(SafeName(btn) == EmojiButtonName && SafeClass(btn).Contains(EmojiButtonClass)); hop++)
+                for (int hop = 0; hop < 12 && !LooksLikeEmojiButton(SafeName(btn), SafeClass(btn)); hop++)
                 {
                     var parent = System.Windows.Automation.TreeWalker.ControlViewWalker.GetParent(btn);
                     if (parent == null || parent == System.Windows.Automation.AutomationElement.RootElement)
@@ -298,9 +305,9 @@ public class QqPanelWatcher : IDisposable
 
             string name = SafeName(el);
             string cls = SafeClass(el);
-            if (name == EmojiButtonName && cls == EmojiButtonClass)
+            if (LooksLikeEmojiButton(name, cls))
             {
-                Log("focus hit emoji button");
+                Log($"focus hit emoji button (name={name}, class={cls})");
 
                 // 缓存按钮矩形与宿主窗口：低级鼠标钩子的命中目标 + 乐观打开的粘贴目标
                 try
@@ -413,7 +420,84 @@ public class QqPanelWatcher : IDisposable
             _optimisticPending = false;
             Log("optimistic open aborted (QQ panel never appeared)");
             PanelDisappeared?.Invoke(this, EventArgs.Empty);
+            // 用户明确点了表情按钮却始终检测不到面板 → 高概率是本机 QQ 版本的类名失配
+            // （如旧版 9.9.x 面板不叫 sticker-panel）。dump 一次 QQ 窗口树概要进日志，
+            // 反馈者把 %TEMP%\asuka-watcher.log 发回来即可定位该版本的真实标识。
+            DumpQqTreeDiagnostics("panel never detected after emoji button click");
         }
+    }
+
+    // ———— UIA 结构诊断（旧版 QQ 兼容定位）————
+
+    private long _lastDumpTicks;
+
+    /// <summary>
+    /// 把 QQ 可见窗口的 UIA 树概要（顶层窗口类名 + 前 N 层含面板/表情关键词的类名）写进
+    /// asuka-watcher.log。跨版本适配的地雷是写死的类名，这份日志直接暴露本机 QQ 的真实标识。
+    /// 限频 90 秒，遍历限深 3 层、命中上限 40 条，避免 Chromium 大树拖慢后台线程。
+    /// </summary>
+    private void DumpQqTreeDiagnostics(string reason)
+    {
+        var now = Environment.TickCount64;
+        if (now - _lastDumpTicks < 90_000) return;
+        _lastDumpTicks = now;
+
+        Task.Run(() =>
+        {
+            try
+            {
+                var pids = CollectQqPids();
+                if (pids.Count == 0) { Log($"diag ({reason}): no QQ process found"); return; }
+                Log($"diag ({reason}): QQ pids=[{string.Join(',', pids)}], dumping window tree summary");
+                foreach (var hwnd in GetVisibleWindowsOf(pids))
+                {
+                    try
+                    {
+                        var root = AutomationElement.FromHandle(hwnd);
+                        Log($"diag window hwnd={hwnd} class=\"{SafeClass(root)}\" name=\"{SafeName(root)}\"");
+                        DumpCandidateClasses(root, depth: 0, maxDepth: 3, hits: new List<string>());
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"diag window hwnd={hwnd} failed: {ex.Message}");
+                    }
+                }
+                Log("diag dump complete");
+            }
+            catch (Exception ex)
+            {
+                Log("diag dump failed: " + ex.Message);
+            }
+        });
+    }
+
+    /// <summary>限深收集类名/名称含关键词的元素（面板候选）与全部子窗口类名，逐条落日志。</summary>
+    private void DumpCandidateClasses(AutomationElement element, int depth, int maxDepth, List<string> hits)
+    {
+        if (_disposed || depth > maxDepth || hits.Count > 40) return;
+        try
+        {
+            var children = element.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
+            foreach (AutomationElement child in children)
+            {
+                var cls = SafeClass(child);
+                var name = SafeName(child);
+                if (cls.Length > 0)
+                {
+                    bool interesting = cls.Contains("sticker", StringComparison.OrdinalIgnoreCase)
+                        || cls.Contains("panel", StringComparison.OrdinalIgnoreCase)
+                        || cls.Contains("emoji", StringComparison.OrdinalIgnoreCase)
+                        || name.Contains("表情", StringComparison.Ordinal);
+                    if (interesting)
+                    {
+                        hits.Add($"class=\"{cls}\" name=\"{name}\"");
+                        Log($"diag   depth={depth} CANDIDATE class=\"{cls}\" name=\"{name}\"");
+                    }
+                }
+                DumpCandidateClasses(child, depth + 1, maxDepth, hits);
+            }
+        }
+        catch { /* 元素中途失效即止 */ }
     }
 
     // --- 点击后补验尾迹 ---

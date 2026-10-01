@@ -348,7 +348,11 @@ namespace OICQStickerManager.Views
         private void OpenQuickPanel_Click(object sender, RoutedEventArgs e)
         {
             HideOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
-            ToggleQuickPanel();
+            // 设置入口走钉住模式：光标不在面板上，普通呼出的"鼠标离开 300ms 自动关"
+            // 会让面板一秒内消失；钉住后靠 ✕ / 热键 / 再点本按钮收起（ToggleQuickPanel）
+            if (_quickPanel == null) _quickPanel = new QuickPanelWindow((MainViewModel)DataContext);
+            if (_quickPanel.IsVisible) _quickPanel.HideSoft();
+            else _quickPanel.OpenPinnedNearCursor();
         }
 
         private void ThemeSwatch_Checked(object sender, RoutedEventArgs e)
@@ -407,6 +411,10 @@ namespace OICQStickerManager.Views
                 : FindResource("AccentBrush") as Brush;
             AlertCancelButton.Content = cancel ?? "取消";
             AlertCancelButton.Visibility = showCancel ? Visibility.Visible : Visibility.Collapsed;
+            // 取消列折叠：单按钮时确认钮独占整行（列留着会空出一格、分隔线孤悬在左半边）
+            AlertCancelColumn.Width = new GridLength(showCancel ? 1 : 0, showCancel ? GridUnitType.Star : GridUnitType.Auto);
+            AlertCancelSeparatorColumn.Width = new GridLength(showCancel ? 1 : 0, GridUnitType.Auto);
+            AlertCancelSeparator.Visibility = showCancel ? Visibility.Visible : Visibility.Collapsed;
 
             // 中性按钮（如"不再询问"）：显示时展开为三等分；隐藏时折叠回双按钮布局
             if (neutral != null)
@@ -483,7 +491,11 @@ namespace OICQStickerManager.Views
             base.OnSourceInitialized(e);
             ((HwndSource)PresentationSource.FromVisual(this)!).AddHook(WndProc);
             ClipboardCapture.Register(new WindowInteropHelper(this).Handle); // M2 剪贴板图片捕获
-            RegisterCurrentHotkey();
+            // 热键注册等 config 加载完成：启动瞬间 VM 的热键还是代码默认值，直接注册会
+            // 先拿默认键撞一次（被占即弹"注册失败"误报，随后配置值才姗姗来迟地换上）
+            if (DataContext is MainViewModel vmBoot)
+                _ = vmBoot.ConfigLoaded.ContinueWith(
+                    _ => Dispatcher.BeginInvoke(RegisterCurrentHotkey));
             UpdateWatcherState();
         }
 
@@ -491,6 +503,9 @@ namespace OICQStickerManager.Views
         private void RegisterCurrentHotkey()
         {
             if (DataContext is not MainViewModel vm) return;
+            // 配置还在加载时跳过：此时热键还是代码默认值，拿它注册会把"默认键被占用"
+            // 的误报提前弹出来（用户的键加载完成后会再触发一次真正的注册）
+            if (vm.IsLoadingConfig) return;
             var hwnd = new WindowInteropHelper(this).Handle;
             if (_hotkeyRegistered)
             {
@@ -544,7 +559,7 @@ namespace OICQStickerManager.Views
             if (DataContext is not MainViewModel vm) return;
             vm.HotkeyModifiers = MOD_CONTROL | MOD_ALT;
             vm.HotkeyKey = VK_D;
-            vm.StatusText = "快捷键已恢复为 Ctrl + Alt + E";
+            vm.StatusText = $"快捷键已恢复为 {vm.HotkeyDisplay}";
         }
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -644,16 +659,39 @@ namespace OICQStickerManager.Views
                 if (sig == _lastClipboardSig) return;
                 _lastClipboardSig = sig;
 
-                ShowCaptureToast(path, isTemp);
+                // 自动打标签：捕获瞬间（复制后约 300ms，用户多半没切窗）记下来源应用，
+                // 点入库时以应用名打标签；前台是自己（本应用内复制）则不打
+                ShowCaptureToast(path, isTemp, vm.AutoTaggingEnabled ? GetForegroundProcessName() : null);
             }
             catch { /* 剪贴板被占用/无图等，忽略本次 */ }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        /// <summary>当前前台窗口的进程名（自动打标签用，如 QQ / WeChat / msedge）；取不到或是自己则 null。</summary>
+        private static string? GetForegroundProcessName()
+        {
+            try
+            {
+                var hwnd = GetForegroundWindow();
+                if (hwnd == IntPtr.Zero) return null;
+                GetWindowThreadProcessId(hwnd, out var pid);
+                if (pid == 0 || pid == (uint)Environment.ProcessId) return null;
+                using var p = System.Diagnostics.Process.GetProcessById((int)pid);
+                var name = p.ProcessName.Trim();
+                return name.Length > 0 && name.Length <= 24 ? name : null;
+            }
+            catch { return null; }
         }
 
         private string? _lastClipboardSig;
 
         private ClipboardToastWindow? _captureToast;
 
-        private void ShowCaptureToast(string imagePath, bool isTemp)
+        private void ShowCaptureToast(string imagePath, bool isTemp, string? autoTag = null)
         {
             // 新捕获顶掉旧的（旧临时文件顺带清理）
             if (_captureToast != null)
@@ -673,7 +711,7 @@ namespace OICQStickerManager.Views
             toast.ImportClicked += () =>
             {
                 if (_captureToast == toast) _captureToast = null;
-                _ = HandleCaptureImportAsync(imagePath, isTemp);
+                _ = HandleCaptureImportAsync(imagePath, isTemp, autoTag);
             };
             toast.Dismissed += () =>
             {
@@ -683,13 +721,13 @@ namespace OICQStickerManager.Views
             toast.Show();
         }
 
-        private async Task HandleCaptureImportAsync(string imagePath, bool isTemp)
+        private async Task HandleCaptureImportAsync(string imagePath, bool isTemp, string? autoTag = null)
         {
             try
             {
                 if (DataContext is MainViewModel vm)
                 {
-                    var report = await vm.AddStickersFromPathAsync(imagePath);
+                    var report = await vm.AddStickersFromPathAsync(imagePath, autoTag);
                     OnQqImportCompleted(report.Added, report.Duplicates, report.Unsupported);
                 }
             }
@@ -1171,13 +1209,23 @@ namespace OICQStickerManager.Views
 
         private async void DeleteTagAndFiles_Click(object sender, RoutedEventArgs e)
         {
-            // 💡 修正 1：sender 是 MenuItem，它的 DataContext 才是我们要删除的标签字符串
+            // 💡 sender 是 MenuItem，DataContext 是右键的那个选项卡（TabItemModel，见侧栏 ItemContainerStyle）
             if (!(sender is MenuItem menuItem)) return;
-            var tagName = menuItem.DataContext as string;
+            var tagName = menuItem.DataContext switch
+            {
+                TabItemModel tab => tab.Value,          // 侧栏选项卡：Value = 标签名或 qq:<uin>
+                string s => s,                          // 兼容历史调用
+                _ => null,
+            };
 
             if (string.IsNullOrEmpty(tagName) || tagName == "最近")
             {
                 await ShowAlertAsync("无法删除", "「最近」是默认视图，不能删除。");
+                return;
+            }
+            if (tagName.StartsWith("qq:", StringComparison.Ordinal))
+            {
+                await ShowAlertAsync("无法删除", "QQ（账号）页请通过右键「解除绑定」移除。");
                 return;
             }
 

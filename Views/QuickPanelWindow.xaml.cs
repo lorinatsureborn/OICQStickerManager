@@ -25,6 +25,7 @@ namespace OICQStickerManager.Views
         private readonly DispatcherTimer _closeTimer;
         private readonly MainViewModel _viewModel;
         private bool _coexistMode; // 是否由 QQ 表情面板共存触发打开
+        private bool _pinned;      // 钉住模式（设置按钮唤出）：不因鼠标离开自动关闭，靠 ✕/热键/再点按钮收起
         private bool _suppressShowAnimation; // 预热时在屏幕外显示，不播动画
         private DispatcherTimer? _hideTimer; // HideSoft 的淡出收尾定时器：淡出途中重新打开时必须取消，否则窗口会在收尾时被 Hide
 
@@ -175,13 +176,14 @@ namespace OICQStickerManager.Views
 
         /// <summary>
         /// 呼出前按最新热度重排（QuickPanelView 不做实时排序，打开期间顺序冻结、发送不跳格）；
-        /// 视角复位为「全部」，不跨会话残留；已可见时（共存链路重复触发）不动，
-        /// 避免面板开着时格子重排。
+        /// 数据源顺带重建（图库 ∪ QQ 未入库镜像，见 RebuildPanelItems）；视角复位为「全部」，
+        /// 不跨会话残留；已可见时（共存链路重复触发）不动，避免面板开着时格子重排。
         /// </summary>
         private void ResortForOpen()
         {
             if (IsVisible) return;
             _viewModel.ResetPanelTab();
+            _viewModel.RebuildPanelItems();
             _viewModel.QuickPanelView.Refresh();
         }
 
@@ -226,9 +228,19 @@ namespace OICQStickerManager.Views
             e.Handled = true;
         }
 
-        public void OpenNearCursor()
+        public void OpenNearCursor() => OpenNearCursorCore(pinned: false);
+
+        /// <summary>
+        /// 钉住模式呼出（设置 → 打开快捷表情面板）：光标不在面板上，鼠标一动就会触发
+        /// "离开 300ms 自动关闭"，面板活不过一秒。此来源不走鼠标离开关闭，
+        /// 收起靠面板 ✕ / 热键 toggle / 再点设置按钮。
+        /// </summary>
+        public void OpenPinnedNearCursor() => OpenNearCursorCore(pinned: true);
+
+        private void OpenNearCursorCore(bool pinned)
         {
             _coexistMode = false;
+            _pinned = pinned;
             _viewModel.SetQuickPanelCoexistTarget(IntPtr.Zero);
 
             GetCursorPos(out var pt);
@@ -329,7 +341,8 @@ namespace OICQStickerManager.Views
         private void PanelRoot_MouseLeave(object sender, MouseEventArgs e)
         {
             // 共存模式：生命周期跟随 QQ 表情面板（鼠标本来就停在 QQ 侧），不因鼠标离开而收起
-            if (_coexistMode) return;
+            // 钉住模式（设置唤出）：显式关闭制，鼠标离开不收
+            if (_coexistMode || _pinned) return;
             _closeTimer.Start();
         }
 

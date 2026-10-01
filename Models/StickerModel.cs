@@ -100,6 +100,10 @@ public class StickerModel : ViewModelBase // 💡 继承基类
         }
     }
 
+    /// <summary>QQ 收藏镜像条目标记：快捷面板混排时给来源角标用（图库条目恒为 false）。</summary>
+    [JsonIgnore]
+    public virtual bool IsQqItem => false;
+
     [JsonIgnore]
     public virtual string DisplayName => Tags.Count > 0 ? string.Join("、", Tags) : "未命名表情"; // 无障碍/界面显示用
 

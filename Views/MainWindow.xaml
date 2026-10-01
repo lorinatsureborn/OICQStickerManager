@@ -316,27 +316,37 @@
                          SelectedValuePath="Value"
                          SelectedValue="{Binding SelectedTab}"
                          ScrollViewer.VerticalScrollBarVisibility="Auto">
+                    <!-- 右键菜单挂在 ListBoxItem 上：胶囊整行可右键。挂在模板内 TextBlock 上时
+                         可命中区域只有文字字形，点到胶囊空白处右键无反应（"触发不稳定"的根源）。
+                         菜单定义在 Resources（x:Shared=False 每次右键新建实例）——Style.Setter 内的
+                         元素树挂 Click 事件会让 XAML 编译器生成错误的 connectionId 挂接（启动即崩，
+                         实测 MenuItem 被错 cast 成 Border），Setter 只能引用不能内联。
+                         MenuItem 的 DataContext 继承自 placement target = TabItemModel。 -->
+                    <ListBox.Resources>
+                        <ContextMenu x:Key="TabContextMenu" x:Shared="False">
+                            <!-- QQ（账号）页：重命名 / 解绑；普通标签页：删除标签及其图片 -->
+                            <MenuItem Header="重命名" Click="RenameQqTab_Click"
+                                      Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
+                            <MenuItem Header="解除绑定" Click="UnbindQqTab_Click"
+                                      Foreground="{DynamicResource DangerBrush}"
+                                      Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
+                            <MenuItem Header="删除标签及其图片"
+                                      Foreground="{DynamicResource DangerBrush}"
+                                      Click="DeleteTagAndFiles_Click"
+                                      Visibility="{Binding CanDeleteTags, Converter={StaticResource BoolToVis}}"/>
+                        </ContextMenu>
+                    </ListBox.Resources>
                     <ListBox.ItemTemplate>
                         <DataTemplate>
                             <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"
-                                       ToolTip="{Binding Label}">
-                                <TextBlock.ContextMenu>
-                                    <ContextMenu>
-                                        <!-- QQ（账号）页：重命名 / 解绑；普通标签页：删除标签及其图片 -->
-                                        <MenuItem Header="重命名" Click="RenameQqTab_Click"
-                                                  Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
-                                        <MenuItem Header="解除绑定" Click="UnbindQqTab_Click"
-                                                  Foreground="{DynamicResource DangerBrush}"
-                                                  Visibility="{Binding IsQq, Converter={StaticResource BoolToVis}}"/>
-                                        <MenuItem Header="删除标签及其图片"
-                                                  Foreground="{DynamicResource DangerBrush}"
-                                                  Click="DeleteTagAndFiles_Click"
-                                                  Visibility="{Binding IsQq, Converter={StaticResource InverseBoolToVis}}"/>
-                                    </ContextMenu>
-                                </TextBlock.ContextMenu>
-                            </TextBlock>
+                                       ToolTip="{Binding Label}"/>
                         </DataTemplate>
                     </ListBox.ItemTemplate>
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem" BasedOn="{StaticResource SidebarItemStyle}">
+                            <Setter Property="ContextMenu" Value="{StaticResource TabContextMenu}"/>
+                        </Style>
+                    </ListBox.ItemContainerStyle>
                 </ListBox>
             </Grid>
 
@@ -736,7 +746,7 @@
                                         </Grid.ColumnDefinitions>
                                         <StackPanel>
                                             <TextBlock Text="轮询保底" Style="{StaticResource BodyTextStyle}"/>
-                                            <TextBlock Text="推荐快捷表情面板弹出异常时开启；开启后会定期查询 QQ 的表情面板状态，保证面板联动不失效，对性能影响很小"
+                                            <TextBlock Text="推荐快捷表情面板弹出异常时开启；开启后会定期查询 QQ 的表情面板状态，保证面板联动不失效，对性能影响很小。若开启后仍不联动，可能是 QQ 版本界面结构变化，请把 %TEMP%\asuka-watcher.log 发给开发者定位"
                                                        Style="{StaticResource FootnoteTextStyle}"
                                                        Margin="0,2,0,0" TextWrapping="Wrap"/>
                                         </StackPanel>
@@ -856,20 +866,38 @@
 
                             <TextBlock Text="图库" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
                             <Border Style="{StaticResource SettingsGroupStyle}">
-                                <Grid Margin="16,11">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
-                                    <StackPanel>
-                                        <TextBlock Text="GIF 悬浮预览" Style="{StaticResource BodyTextStyle}"/>
-                                        <TextBlock Text="悬浮表情时自动播放动图气泡"
-                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
-                                    </StackPanel>
-                                    <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
-                                              IsChecked="{Binding EnableGifHoverPreview}"
-                                              VerticalAlignment="Center"/>
-                                </Grid>
+                                <StackPanel>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="GIF 悬浮预览" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="悬浮表情时自动播放动图气泡"
+                                                       Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding EnableGifHoverPreview}"
+                                                  VerticalAlignment="Center"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="自动打标签" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="拖入文件夹时以文件夹名打标签；从剪贴板入库时以来源应用名打标签"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
+                                                  IsChecked="{Binding AutoTaggingEnabled}"
+                                                  VerticalAlignment="Center" Margin="12,0,0,0"/>
+                                    </Grid>
+                                </StackPanel>
                             </Border>
 
                             <TextBlock Text="资源库" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
@@ -884,7 +912,8 @@
                                         </StackPanel>
                                     </Button>
                                     <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
-                                    <Button Style="{StaticResource RowButtonStyle}" Click="OpenQuickPanel_Click">
+                                    <Button Style="{StaticResource RowButtonStyle}" Click="OpenQuickPanel_Click"
+                                            AutomationProperties.Name="打开快捷表情面板">
                                         <StackPanel Orientation="Horizontal">
                                             <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE765;"
                                                        FontSize="14" Foreground="{DynamicResource TextSecondaryBrush}"
@@ -1059,17 +1088,19 @@
                         </Grid.RowDefinitions>
                         <Border Grid.Row="0" Height="1" Background="{DynamicResource SeparatorBrush}"/>
                         <Grid Grid.Row="1">
-                            <!-- 中性按钮（如"不再询问"）默认隐藏折叠为 [取消|确认] 双按钮 -->
+                            <!-- 中性按钮（如"不再询问"）默认隐藏折叠为 [取消|确认] 双按钮；
+                                 取消列同样可折叠：单按钮时确认钮独占整行（否则左边空一格还挂着分隔线） -->
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition x:Name="AlertCancelColumn" Width="*"/>
+                                <ColumnDefinition x:Name="AlertCancelSeparatorColumn" Width="Auto"/>
                                 <ColumnDefinition x:Name="AlertNeutralColumn" Width="0"/>
                                 <ColumnDefinition x:Name="AlertNeutralSeparatorColumn" Width="0"/>
                                 <ColumnDefinition Width="*"/>
                             </Grid.ColumnDefinitions>
                             <Button x:Name="AlertCancelButton" Grid.Column="0" Style="{StaticResource AlertButtonLeftStyle}"
                                     Content="取消" Click="AlertCancel_Click"/>
-                            <Border Grid.Column="1" Width="1" Background="{DynamicResource SeparatorBrush}"/>
+                            <Border x:Name="AlertCancelSeparator" Grid.Column="1" Width="1"
+                                    Background="{DynamicResource SeparatorBrush}"/>
                             <Button x:Name="AlertNeutralButton" Grid.Column="2" Style="{StaticResource AlertButtonLeftStyle}"
                                     Visibility="Collapsed" Click="AlertNeutral_Click"/>
                             <Border x:Name="AlertNeutralSeparator" Grid.Column="3" Width="1"
