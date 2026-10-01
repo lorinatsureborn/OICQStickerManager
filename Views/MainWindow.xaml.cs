@@ -1630,7 +1630,8 @@ namespace OICQStickerManager.Views
 
         // ———— QQ（账号）页：数据源切换与空状态 ————
 
-        // 切到 QQ 页时网格换成该账号镜像 + QqTileTemplate；切回图库时还原
+        // 切到 QQ 页时网格换成该账号镜像的分桶排序视图（搜索命中优先，见 VM.ApplyQqSearchBuckets）+
+        // QqTileTemplate；切回图库时还原
         private void UpdateGalleryMode()
         {
             if (DataContext is not MainViewModel vm) return;
@@ -1638,7 +1639,7 @@ namespace OICQStickerManager.Views
             if (service != null)
             {
                 StickersList.ItemTemplate = (DataTemplate)FindResource("QqTileTemplate");
-                StickersList.ItemsSource = service.Mirror;
+                StickersList.ItemsSource = vm.GetQqMirrorView(service.Uin);
                 UpdateQqEmptyState(service);
             }
             else

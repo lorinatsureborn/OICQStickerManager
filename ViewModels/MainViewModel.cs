@@ -175,14 +175,14 @@ public class MainViewModel : ViewModelBase
         {
             var sticker = (StickerModel)obj;
 
-            // 搜索只在「最近」视图生效（「最近」=搜索宿主）：搜索中切到标签页就看该标签全量，
-            // 高亮与结果永远诚实；搜索词保留在搜索框，切回「最近」结果还在
-            if (SelectedTab == "最近")
-            {
-                if (!string.IsNullOrWhiteSpace(SearchText))
-                    return sticker.Tags.Any(t => t.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
+            // 搜索对图库全页签生效（2026-10-01 用户定案）：命中 = 标签名含搜索词；
+            // 「最近」= 纯搜索，标签页 = 搜索词 AND 标签交集（侧栏只显示匹配标签，交集=该标签
+            // 下与搜索相关的表情）。QQ 页不使用图库视图（ItemsSource 已切镜像分桶视图）
+            if (!string.IsNullOrWhiteSpace(SearchText) &&
+                !sticker.Tags.Any(t => t.Contains(SearchText, StringComparison.OrdinalIgnoreCase)))
+                return false;
+            if (SelectedTab == "最近" || SelectedTab.StartsWith("qq:", StringComparison.Ordinal))
                 return true;
-            }
 
             // 选项卡过滤
             return sticker.Tags.Contains(SelectedTab);
@@ -222,8 +222,13 @@ public class MainViewModel : ViewModelBase
     public void UpdateTabTags()
     {
         var current = SelectedTab;
-        // 侧栏永远全量标签：搜索中切页签是正常操作（2026-10-01 用户定案），不再按搜索词过滤侧栏
+        // 搜索中侧栏只显示匹配的标签（"小猫/小狗/小马"）：用户逐个点过去浏览，
+        // 这是"搜索穿透页签"语义的一半（2026-10-01 用户定案）；最近与 QQ 页恒在
         var allTags = Stickers.SelectMany(s => s.Tags).Distinct();
+        if (!string.IsNullOrEmpty(SearchText))
+        {
+            allTags = allTags.Where(t => t.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
+        }
 
         // 标签按内容热度排：标签热度 = 该标签下最热表情的 RankScore（用大而冷的标签堆分数会失真，故取峰值不取总和），
         // 最近活跃/高频使用的标签随之浮到顶部；同分按名称定序保持稳定
@@ -307,6 +312,7 @@ public class MainViewModel : ViewModelBase
     // ———— QQ 账号绑定（一对多、显式绑定，设计见 docs §4.5/§4.6） ————
 
     private readonly Dictionary<string, QqEmojiService> _qqServices = new();
+    private readonly Dictionary<string, ListCollectionView> _qqMirrorViews = new();
     private readonly List<QqBindingInfo> _qqBindings = new();
     private List<string> _qqPromptDismissedUins = new();
 
@@ -328,6 +334,7 @@ public class MainViewModel : ViewModelBase
         var service = new QqEmojiService(binding.Uin, oriDir, action => _uiDispatcher.Invoke(action));
         service.MirrorChanged += (_, _) =>
         {
+            ApplyQqSearchBuckets(); // 新收藏条目也参与搜索分桶（搜索中新增的置顶条目需判命中）
             ApplyQqStats(service);
             UpdateImportedFlags(service);
             UpdateCounts();
@@ -347,6 +354,7 @@ public class MainViewModel : ViewModelBase
     {
         foreach (var service in _qqServices.Values) service.Dispose();
         _qqServices.Clear();
+        _qqMirrorViews.Clear();
         _qqBindings.Clear();
         _qqBindings.AddRange(bindings);
         _qqPromptDismissedUins = dismissed;
@@ -377,6 +385,7 @@ public class MainViewModel : ViewModelBase
         if (binding == null) return;
         _qqBindings.Remove(binding);
         if (_qqServices.Remove(uin, out var service)) service.Dispose();
+        _qqMirrorViews.Remove(uin);
         if (CurrentQqUin == uin) SelectedTab = "最近";
         UpdateTabTags();
         await SaveConfigAsync();
@@ -727,6 +736,62 @@ public class MainViewModel : ViewModelBase
     {
         foreach (var item in service.Mirror)
             item.IsImported = Stickers.Any(s => s.Md5 == item.Md5);
+    }
+
+    // ———— QQ 页搜索分桶（2026-10-01 用户定案：QQ 页搜索不过滤、按命中优先排序）————
+    // QQ 页可能有用户标注的标签（镜像自身暂无标签时，按 Md5 对账"借"图库同款副本的标签判命中）：
+    // 搜索词生效时命中桶永远在前、未命中桶永远在后，两桶内部都按时序+频率（RankScore）排序；
+    // 搜索词为空时整体就是热度序，与无搜索一致。
+
+    /// <summary>QQ 页网格的数据源：镜像的分桶排序视图（每账号一个，缓存复用）。</summary>
+    public ListCollectionView GetQqMirrorView(string uin)
+    {
+        if (!_qqMirrorViews.TryGetValue(uin, out var view))
+        {
+            view = new ListCollectionView(_qqServices[uin].Mirror)
+            {
+                CustomSort = Comparer<QqStickerModel>.Create(CompareQqMirror),
+            };
+            _qqMirrorViews[uin] = view;
+        }
+        return view;
+    }
+
+    private int CompareQqMirror(QqStickerModel a, QqStickerModel b)
+    {
+        if (!string.IsNullOrWhiteSpace(_searchText) && a.SearchHit != b.SearchHit)
+            return a.SearchHit ? -1 : 1; // 命中桶恒在前
+        var byScore = b.RankScore.CompareTo(a.RankScore);
+        return byScore != 0 ? byScore : b.LastUsedTime.CompareTo(a.LastUsedTime);
+    }
+
+    /// <summary>搜索词变化时重算各账号镜像的命中标记并重排（比较器只读标记，命中计算集中在此一次）。</summary>
+    private void ApplyQqSearchBuckets()
+    {
+        if (_qqServices.Count == 0) return;
+
+        // 图库标签按 Md5 建索引：镜像条目借用图库同款副本的标签判命中
+        var libTagsByMd5 = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in Stickers)
+        {
+            if (!string.IsNullOrEmpty(s.Md5)) libTagsByMd5[s.Md5] = s.Tags;
+        }
+
+        foreach (var kv in _qqServices)
+        {
+            foreach (var m in kv.Value.Mirror)
+            {
+                bool hit = false;
+                if (!string.IsNullOrWhiteSpace(_searchText))
+                {
+                    hit = m.Tags.Any(t => t.Contains(_searchText, StringComparison.OrdinalIgnoreCase));
+                    if (!hit && m.Md5 != null && libTagsByMd5.TryGetValue(m.Md5, out var tags))
+                        hit = tags.Any(t => t.Contains(_searchText, StringComparison.OrdinalIgnoreCase));
+                }
+                m.SearchHit = hit;
+            }
+            GetQqMirrorView(kv.Key).Refresh();
+        }
     }
 
     private void UpdateImportedFlagsAll()
@@ -1248,14 +1313,17 @@ public class MainViewModel : ViewModelBase
             {
                 var back = _tabBeforeSearch;
                 _tabBeforeSearch = null;
-                if (back != null && SelectedTab == "最近" && TabTags.Any(t => t.Value == back)) SelectedTab = back;
+                // 直接回跳：TabTags 此刻还是搜索过滤后的列表，用它判存在会漏（搜无匹配词再清空
+                // 就永远不回跳）。若期间标签真被删，setter 末尾的 UpdateTabTags 兜底拉回「最近」
+                if (back != null && SelectedTab == "最近") SelectedTab = back;
             }
 
             _searchText = newText;
             OnPropertyChanged();
             OnPropertyChanged(nameof(HasSearchText));
-            _stickersView?.Refresh(); // 刷新图片列表
-            UpdateTabTags();          // 刷新左侧选项卡
+            _stickersView?.Refresh();  // 刷新图片列表
+            UpdateTabTags();           // 刷新左侧选项卡
+            ApplyQqSearchBuckets();    // QQ 页分桶重排（命中前/未命中后）
         }
     }
 

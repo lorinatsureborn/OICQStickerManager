@@ -16,6 +16,13 @@ public class QqStickerModel : StickerModel
     [JsonIgnore]
     public override bool IsQqItem => true;
 
+    /// <summary>
+    /// 搜索命中标记（QQ 页分桶排序用，见 MainViewModel.ApplyQqSearchBuckets）：
+    /// 命中的排前、未命中的排后，桶内各按时序+频率。UI 辅助态，不落盘。
+    /// </summary>
+    [JsonIgnore]
+    public bool SearchHit { get; set; }
+
     /// <summary>Thumb 目录下的静态缩略图（gif 没有），绑定对话框预览用。</summary>
     [JsonIgnore]
     public string? ThumbPath { get; set; }
