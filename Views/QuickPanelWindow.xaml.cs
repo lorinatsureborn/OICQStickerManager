@@ -218,10 +218,13 @@ namespace OICQStickerManager.Views
         }
 
         // ———— GIF 悬浮原地动画（与图库共用开关 EnableGifHoverPreview；2026-10-02 用户定案）————
-        // 图库悬浮弹气泡预览，面板空间紧凑改为格子内原地播放：只动画当前悬浮的一格，
-        // 移开/隐藏/容器回收即回落静态首帧，同一时刻至多一张在动，不影响面板呼出性能。
+        // 图库悬浮弹气泡预览，面板空间紧凑改为格子内原地播放：悬浮时把动画挂到覆盖层 Image 上
+        // 盖住静态首帧。绝不直接动 StaticFrame 的 Source——WpfAnimatedGif 的动画会接管 Source
+        // 属性且摘除后不回填绑定值（实测格子直接空掉）。移开/隐藏/容器回收即隐藏覆盖层回落首帧，
+        // 同一时刻至多一张在动，不影响面板呼出性能。
 
-        private Image? _animatedGifImage;
+        private Image? _animatedGifHost;    // 触发动画的静态图（事件源，用于配对清理）
+        private Image? _animatedGifOverlay; // 正在播动画的覆盖层
 
         private void PanelGifImage_MouseEnter(object sender, MouseEventArgs e)
         {
@@ -229,6 +232,7 @@ namespace OICQStickerManager.Views
             if (sender is not Image img) return;
             if (DataContext is not MainViewModel vm || !vm.EnableGifHoverPreview) return;
             if (img.DataContext is not StickerModel sticker || !sticker.IsGif || !File.Exists(sticker.FullPath)) return;
+            if (img.FindName("AnimatedFrame") is not Image overlay) return;
 
             // ImageSource 是缩放解码的首帧且已冻结，带不动动画；须从文件新解一份原始 GIF
             // （WpfAnimatedGif 要读解码器帧序列：不可 Freeze，也不可设 DecodePixelWidth）
@@ -237,26 +241,32 @@ namespace OICQStickerManager.Views
             animated.CacheOption = BitmapCacheOption.OnLoad;
             animated.UriSource = new Uri(sticker.FullPath);
             animated.EndInit();
-            _animatedGifImage = img;
-            ImageBehavior.SetAnimatedSource(img, animated); // 挂上即自动循环播放
+            _animatedGifHost = img;
+            _animatedGifOverlay = overlay;
+            overlay.Visibility = Visibility.Visible;
+            ImageBehavior.SetAnimatedSource(overlay, animated); // 挂上即自动循环播放
         }
 
         private void PanelGifImage_MouseLeave(object sender, MouseEventArgs e)
         {
-            if (sender is Image img && ReferenceEquals(_animatedGifImage, img)) StopPanelGifAnimation();
+            if (sender is Image img && ReferenceEquals(_animatedGifHost, img)) StopPanelGifAnimation();
         }
 
-        // VirtualizationMode=Recycling：格子容器滚动回收时必须摘动画，否则旧 GIF 会借别的表情格子还魂
+        // VirtualizationMode=Recycling：格子容器滚动回收时必须停动画并隐藏覆盖层，否则旧 GIF 会借别的表情格子还魂
         private void PanelGifImage_Unloaded(object sender, RoutedEventArgs e)
         {
-            if (sender is Image img && ReferenceEquals(_animatedGifImage, img)) StopPanelGifAnimation();
+            if (sender is Image img &&
+                (ReferenceEquals(_animatedGifHost, img) || ReferenceEquals(_animatedGifOverlay, img)))
+                StopPanelGifAnimation();
         }
 
         private void StopPanelGifAnimation()
         {
-            if (_animatedGifImage == null) return;
-            ImageBehavior.SetAnimatedSource(_animatedGifImage, null); // 摘除后回落 Source 绑定的静态首帧
-            _animatedGifImage = null;
+            if (_animatedGifOverlay == null) return;
+            ImageBehavior.SetAnimatedSource(_animatedGifOverlay, null); // 释放 GIF 解码与帧动画
+            _animatedGifOverlay.Visibility = Visibility.Collapsed;      // 露出底下静态首帧绑定
+            _animatedGifOverlay = null;
+            _animatedGifHost = null;
         }
 
         // --- 选项卡悬浮切换 ---

@@ -142,6 +142,11 @@
                                    Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"
                                    MouseEnter="PanelGifImage_MouseEnter" MouseLeave="PanelGifImage_MouseLeave"
                                    Unloaded="PanelGifImage_Unloaded"/>
+                            <!-- GIF 原地动画覆盖层：悬浮时挂 AnimatedSource 盖住首帧（绝不碰 Source 绑定，
+                                 动画摘除后绑定不会回填、格子会空），隐藏覆盖层即回落静态首帧 -->
+                            <Image x:Name="AnimatedFrame" Width="86" Height="86"
+                                   Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                   Visibility="Collapsed" IsHitTestVisible="False"/>
                             <!-- GIF 角标：提示该表情会以动图形式发出 -->
                             <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,8,8,0"
                                     Background="#99000000" CornerRadius="6" Padding="4,1.5"
