@@ -9,12 +9,14 @@ namespace OICQStickerManager.Services;
 public class QqPanelEventArgs : EventArgs
 {
     public IntPtr HostHwnd { get; }
-    public Rect PanelRect { get; } // 物理像素
+    public Rect PanelRect { get; } // 物理像素；首次乐观打开时可能为 Empty（本会话还没见过面板）
+    public Rect EmojiButtonRect { get; } // 表情按钮矩形（物理像素），PanelRect 为 Empty 时用作定位锚
 
-    public QqPanelEventArgs(IntPtr hostHwnd, Rect panelRect)
+    public QqPanelEventArgs(IntPtr hostHwnd, Rect panelRect, Rect emojiButtonRect = default)
     {
         HostHwnd = hostHwnd;
         PanelRect = panelRect;
+        EmojiButtonRect = emojiButtonRect;
     }
 }
 
@@ -239,7 +241,7 @@ public class QqPanelWatcher : IDisposable
                 {
                     try
                     {
-                        CheckNow();
+                        CheckNow(missCacheable: true); // 轮询保底本就接受秒级感知延迟，可吃负缓存
                         consecutiveErrors = 0;
                         if (degraded) { degraded = false; _status("QQ 表情面板监听已恢复"); }
                     }
@@ -335,7 +337,7 @@ public class QqPanelWatcher : IDisposable
                         _optimisticPending = true;
                         ArmTailVerify();
                         Log($"emoji button clicked via focus event (optimistic, cachedRect={cachedRect})");
-                        EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hostHwnd, cachedRect));
+                        EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hostHwnd, cachedRect, _emojiBtnRect));
                     }
                 }
 
@@ -389,7 +391,7 @@ public class QqPanelWatcher : IDisposable
             {
                 await Task.Delay(delay);
                 Interlocked.Exchange(ref _verifyScheduled, 0);
-                if (!_disposed) CheckNow();
+                if (!_disposed) CheckNow(missCacheable: true); // 风暴合并出的验证没有点击信号，可吃负缓存
             });
         }
     }
@@ -455,7 +457,8 @@ public class QqPanelWatcher : IDisposable
                     {
                         var root = AutomationElement.FromHandle(hwnd);
                         Log($"diag window hwnd={hwnd} class=\"{SafeClass(root)}\" name=\"{SafeName(root)}\"");
-                        DumpCandidateClasses(root, depth: 0, maxDepth: 3, hits: new List<string>());
+                        var visited = 0;
+                        DumpCandidateClasses(root, depth: 0, maxDepth: 3, hits: new List<string>(), ref visited);
                     }
                     catch (Exception ex)
                     {
@@ -471,15 +474,18 @@ public class QqPanelWatcher : IDisposable
         });
     }
 
-    /// <summary>限深收集类名/名称含关键词的元素（面板候选）与全部子窗口类名，逐条落日志。</summary>
-    private void DumpCandidateClasses(AutomationElement element, int depth, int maxDepth, List<string> hits)
+    /// <summary>限深收集类名/名称含关键词的元素（面板候选）与全部子窗口类名，逐条落日志。
+    /// 访问节点总数单独封顶：hits 只限命中数，不封遍历量的话一棵不匹配的 Chromium 大树
+    /// 会被完整走完（实测 300+ 节点、上千次跨进程往返、后台线程 3–10 秒）。</summary>
+    private void DumpCandidateClasses(AutomationElement element, int depth, int maxDepth, List<string> hits, ref int visited)
     {
-        if (_disposed || depth > maxDepth || hits.Count > 40) return;
+        if (_disposed || depth > maxDepth || hits.Count > 40 || visited > 400) return;
         try
         {
             var children = element.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
             foreach (AutomationElement child in children)
             {
+                visited++; // 限的是跨进程成本（FindAll 遍历 + 每个子元素 2 次属性读），不是命中数
                 var cls = SafeClass(child);
                 var name = SafeName(child);
                 if (cls.Length > 0)
@@ -494,7 +500,7 @@ public class QqPanelWatcher : IDisposable
                         Log($"diag   depth={depth} CANDIDATE class=\"{cls}\" name=\"{name}\"");
                     }
                 }
-                DumpCandidateClasses(child, depth + 1, maxDepth, hits);
+                DumpCandidateClasses(child, depth + 1, maxDepth, hits, ref visited);
             }
         }
         catch { /* 元素中途失效即止 */ }
@@ -545,14 +551,21 @@ public class QqPanelWatcher : IDisposable
 
     // --- 面板检测（所有信号共用，互斥防重入；错误计入降级统计） ---
 
-    private bool CheckNow()
+    /// <param name="missCacheable">
+    /// true = 允许吃"未命中负缓存"：面板未开时的全树 FindFirst 是单次验证最贵的一段
+    /// （对真实 QQ 窗口实测 18–66 ms，全部是 QQ 进程内的同步跨进程成本），
+    /// 输入法打字等引起的结构事件风暴会把它打到节流上限 6.7 次/秒。
+    /// 负缓存把无信号的常态验证降到 ≤1 次/秒——事件驱动的面板出现（乐观打开/点击重试/关闭确认）
+    /// 一律强制全扫，不受缓存影响；无信号"惊现"的面板最多延迟 1s 被发现（与轮询保底的常态间隔同级）。
+    /// </param>
+    private bool CheckNow(bool missCacheable = false)
     {
         if (Interlocked.Exchange(ref _verifying, 1) == 1) return _panelOpen;
         Interlocked.Exchange(ref _lastVerifyRanTicks, Environment.TickCount64);
         try
         {
             RefreshPidsIfNeeded();
-            var (open, hwnd, rect) = ScanQqWindows(_qqPids);
+            var (open, hwnd, rect) = ScanQqWindows(_qqPids, missCacheable);
             if (open)
             {
                 _openMisses = 0;
@@ -647,17 +660,24 @@ public class QqPanelWatcher : IDisposable
     {
         lock (_gate)
         {
-            // 窗口销毁后订阅会随元素失效自然停止派发，这里仅清理字典引用防止增长
-            var dead = new List<IntPtr>();
+            // 窗口销毁/隐藏后不能只删字典引用：订阅本身还挂在 UIA 上（结构事件照常派发、
+            // 底层 Event 句柄不回收）。逐元素退订与 RemoveAllEventHandlers 一样可能被在途
+            // 回调拖住，放后台线程拆，不等（漏进的残留事件由入口守卫丢弃）。
+            var dead = new List<(IntPtr Hwnd, AutomationElement Element)>();
             foreach (var kv in _subscribed)
             {
-                if (!IsWindowVisible(kv.Key)) dead.Add(kv.Key);
+                if (!IsWindowVisible(kv.Key)) dead.Add((kv.Key, kv.Value));
             }
-            foreach (var h in dead)
+            foreach (var (hwnd, element) in dead)
             {
-                _subscribed.Remove(h);
+                _subscribed.Remove(hwnd);
+                _ = Task.Run(() =>
+                {
+                    try { Automation.RemoveStructureChangedEventHandler(element, OnStructureChanged); }
+                    catch { /* 元素已失效 = 订阅已随进程/窗口消亡 */ }
+                });
             }
-            if (dead.Count > 0) Log($"pruned {dead.Count} stale subscriptions");
+            if (dead.Count > 0) Log($"pruned {dead.Count} stale subscriptions (unsubscribed)");
         }
     }
 
@@ -665,6 +685,8 @@ public class QqPanelWatcher : IDisposable
 
     private AutomationElement? _cachedPanel;     // 上次找到的面板元素：验证时先廉价探测，避免每次全树扫描
     private IntPtr _cachedPanelHwnd;
+    private long _lastFullScanMissTicks = long.MinValue; // 上次全扫未命中的时刻：无信号验证在 TTL 内直接复用结果
+    private const int FullScanMissTtlMs = 1000;
     private Rect _lastPanelRect = Rect.Empty;    // 上次面板矩形（物理像素）：乐观打开时的定位来源
     private IntPtr _lastPanelRectHwnd;
     private volatile bool _optimisticPending;    // 已按按下时点乐观打开，等待 QQ 面板真正出现
@@ -676,7 +698,7 @@ public class QqPanelWatcher : IDisposable
     private uint _hookThreadId;
     private bool _hookAliveLogged;
 
-    private (bool open, IntPtr hwnd, Rect rect) ScanQqWindows(HashSet<int> pids)
+    private (bool open, IntPtr hwnd, Rect rect) ScanQqWindows(HashSet<int> pids, bool missCacheable)
     {
         var myPid = Environment.ProcessId;
 
@@ -692,6 +714,9 @@ public class QqPanelWatcher : IDisposable
                     var crect = cached.Current.BoundingRectangle;
                     if (IsPanelVisuallyRendered(cached, crect, myPid))
                         return (true, cachedHwnd, crect);
+                    // 命中测试判负 = 面板已被透明隐藏（产品语义即关闭）：元素是滞留的陈旧引用，
+                    // 丢弃它，让后续验证直接吃到全扫未命中的负缓存（零跨进程）
+                    _cachedPanel = null;
                 }
             }
             catch
@@ -699,6 +724,12 @@ public class QqPanelWatcher : IDisposable
                 _cachedPanel = null; // 元素已失效（QQ 重建/关闭），走全树扫描
             }
         }
+
+        // 负缓存：最近一次全扫就没找到面板、且本轮无强制信号（点击重试/关闭确认）→ 直接报未开。
+        // 只吃"全扫过且没找到"的结果；上面缓存元素刚失效不算（那本身就是新信息）。
+        var nowTicks = Environment.TickCount64;
+        if (missCacheable && nowTicks - _lastFullScanMissTicks < FullScanMissTtlMs)
+            return (false, IntPtr.Zero, Rect.Empty);
 
         foreach (var hwnd in GetVisibleWindowsOf(pids))
         {
@@ -721,6 +752,7 @@ public class QqPanelWatcher : IDisposable
             }
             catch { /* 单个窗口失败（树未激活/元素失效）不影响整体 */ }
         }
+        _lastFullScanMissTicks = Environment.TickCount64; // 完整扫过且未命中，才开始计时
         return (false, IntPtr.Zero, Rect.Empty);
     }
 
@@ -839,7 +871,7 @@ public class QqPanelWatcher : IDisposable
                     Log($"mouse hook: emoji button clicked (optimistic, cachedRect={crect})");
                     Task.Run(() =>
                     {
-                        try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hwnd, crect)); }
+                        try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hwnd, crect, _emojiBtnRect)); }
                         catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
                     });
                     _ = VerifyWithOpenRetriesAsync();

@@ -125,6 +125,10 @@ namespace OICQStickerManager.Views
 
                 // 深度同步开着但密钥还没拿到 → 静默续抓（等下次 QQ 登录）
                 if (DataContext is MainViewModel vmResume) vmResume.ResumeKeyWatcherIfPending();
+
+                // 深度同步开着且密钥在手 → 启动补跑一次对账（角标是运行时状态，
+                // 此前只有打开开关那一刻对账，重启后真实残留零角标——2026-10-02 用户实测）
+                if (DataContext is MainViewModel vmSync) _ = vmSync.RunStartupReconcileIfDueAsync();
             });
 
             // 发送表情会最小化窗口；窗口失焦时收起 GIF 预览并停止计时，避免残留
@@ -132,6 +136,24 @@ namespace OICQStickerManager.Views
             {
                 _gifPreviewTimer?.Stop();
                 CloseGifPreview();
+            };
+            // 最小化/藏进托盘不会触发 Deactivated（焦点可以还"在"一个不可见的窗口上）：
+            // 状态/可见性变化时同样收起，别让 GIF 解码动画在幕后空转
+            StateChanged += (s, e) =>
+            {
+                if (WindowState == WindowState.Minimized)
+                {
+                    _gifPreviewTimer?.Stop();
+                    CloseGifPreview();
+                }
+            };
+            IsVisibleChanged += (s, e) =>
+            {
+                if (!IsVisible)
+                {
+                    _gifPreviewTimer?.Stop();
+                    CloseGifPreview();
+                }
             };
 
             // 切换配色后丢弃旧快捷面板（其 BAML 资源表达式不响应运行时换肤），
@@ -491,12 +513,17 @@ namespace OICQStickerManager.Views
             base.OnSourceInitialized(e);
             ((HwndSource)PresentationSource.FromVisual(this)!).AddHook(WndProc);
             ClipboardCapture.Register(new WindowInteropHelper(this).Handle); // M2 剪贴板图片捕获
-            // 热键注册等 config 加载完成：启动瞬间 VM 的热键还是代码默认值，直接注册会
-            // 先拿默认键撞一次（被占即弹"注册失败"误报，随后配置值才姗姗来迟地换上）
+            // 热键注册、共存触发器启动都等 config 加载完成：启动瞬间 VM 里还是代码默认值，
+            // 直接注册/启动会先拿默认值撞一次（默认键被占误报"注册失败"、共存触发器设为关的
+            // 用户也会被先装一轮钩子再拆——加载完成后的 PropertyChanged 不补这一刀，
+            // 因为配置值与默认值相同时 setter 不发通知，必须在这里显式补跑一次）
             if (DataContext is MainViewModel vmBoot)
                 _ = vmBoot.ConfigLoaded.ContinueWith(
-                    _ => Dispatcher.BeginInvoke(RegisterCurrentHotkey));
-            UpdateWatcherState();
+                    _ => Dispatcher.BeginInvoke(() =>
+                    {
+                        RegisterCurrentHotkey();
+                        UpdateWatcherState();
+                    }));
         }
 
         // 按当前设置注册热键：先注销旧组合再注册新组合；冲突时状态栏提示（快捷面板设置按钮仍是可用入口）
@@ -593,7 +620,10 @@ namespace OICQStickerManager.Views
             return timer;
         }
 
-        // M2：剪贴板里有图片 → 落临时文件 → 右下角非激活轻提示一键入库
+        // M2：剪贴板里有图片 → 落临时文件 → 右下角非激活轻提示一键入库。
+        // 剪贴板是全系统串行资源，OLE 读取是跨进程调用：来源进程挂起/被占用时（RDP 剪贴板
+        // 重定向是经典挂起源）可在调用线程挂数秒——整段重活（OLE 读 + PNG 编码 + 哈希）挪到
+        // 专用 STA 线程（OLE 要求 STA，不能 Task.Run 的 MTA 线程池），UI 线程只做判定收尾。
         private void EvaluateClipboardCapture()
         {
             try
@@ -601,70 +631,132 @@ namespace OICQStickerManager.Views
                 if (ClipboardCapture.Suppress) return; // 发送通道写入/恢复期间静默
                 if (DataContext is not MainViewModel vm || !vm.CaptureClipboardImages) return;
                 if (_alertTcs != null) return; // 有弹窗在前台时不叠加
-
-                var data = Clipboard.GetDataObject();
-                if (data == null) return;
-
-                // 优先取文件（聊天工具"复制图片"常给 FileDropList），其次取位图
-                string? path = null;
-                bool isTemp = false;
-                byte[]? pngBytes = null;
-                string sig;
-                if (data.GetDataPresent(DataFormats.FileDrop)
-                    && data.GetData(DataFormats.FileDrop) is string[] files
-                    && files.Length > 0 && File.Exists(files[0])
-                    && ImageSniffer.Detect(files[0]) != ImageKind.Unknown)
-                {
-                    path = files[0];
-                    var fi = new FileInfo(path);
-                    sig = "f|" + path + "|" + fi.Length + "|" + fi.LastWriteTimeUtc.Ticks;
-                }
-                else if (Clipboard.ContainsImage())
-                {
-                    var src = Clipboard.GetImage();
-                    if (src == null) return;
-
-                    var encoder = new PngBitmapEncoder();
-                    encoder.Frames.Add(BitmapFrame.Create(src));
-                    using var ms = new MemoryStream();
-                    encoder.Save(ms);
-                    pngBytes = ms.ToArray();
-
-                    var dir = Path.Combine(Path.GetTempPath(), "asuka-capture");
-                    Directory.CreateDirectory(dir);
-                    path = Path.Combine(dir, $"clip-{DateTime.Now:yyyyMMdd-HHmmss-fff}.png");
-                    File.WriteAllBytes(path, pngBytes);
-                    isTemp = true;
-                    sig = "b|" + Convert.ToHexString(System.Security.Cryptography.MD5.HashData(pngBytes));
-                }
-                else return;
-
-                if (path == null) return;
-
-                // 内容级去重（2026-10-01 用户实测：部分应用会周期性重写相同剪贴板内容，
-                // 同一张图的入库提示反复弹）：
-                // ①已入库的图（MD5 与图库对账）直接静默，复制多少遍都不再提示；
-                // ②与上一次提示过的内容相同也静默——除非期间它被删出图库（那时 MD5 对不上，会重新提示）
-                try
-                {
-                    var md5Hex = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(
-                        pngBytes ?? File.ReadAllBytes(path)));
-                    if (vm.Stickers.Any(s => s.Md5 == md5Hex))
-                    {
-                        _lastClipboardSig = sig;
-                        return;
-                    }
-                }
-                catch { /* 哈希失败不拦截提示 */ }
-                if (sig == _lastClipboardSig) return;
-                _lastClipboardSig = sig;
-
-                ShowCaptureToast(path, isTemp);
+                KickClipboardWorker();
             }
-            catch { /* 剪贴板被占用/无图等，忽略本次 */ }
+            catch { /* 忽略本次 */ }
         }
 
-        private string? _lastClipboardSig;
+        private readonly object _clipboardGate = new();
+        private Thread? _clipboardWorker;
+        private long _clipboardWorkerStartMs;
+        private bool _clipboardPending;
+        private int _clipboardProbeSeq;  // 探测序号：UI 侧只认最新结果，防两次探测乱序回放陈旧内容
+        private int _clipboardSeenSeq;
+
+        private void KickClipboardWorker()
+        {
+            lock (_clipboardGate)
+            {
+                _clipboardPending = true;
+                var w = _clipboardWorker;
+                if (w != null && w.IsAlive && Environment.TickCount64 - _clipboardWorkerStartMs < 10_000)
+                    return; // 上次探测还在正常跑：合并本轮（完成时会看见 pending 再跑一遍）
+                _clipboardWorkerStartMs = Environment.TickCount64;
+                _clipboardWorker = new Thread(ClipboardWorkerLoop)
+                {
+                    IsBackground = true,
+                    Name = "AsukaClipboard",
+                };
+                _clipboardWorker.SetApartmentState(ApartmentState.STA);
+                _clipboardWorker.Start();
+            }
+        }
+
+        private void ClipboardWorkerLoop()
+        {
+            while (true)
+            {
+                lock (_clipboardGate) _clipboardPending = false;
+                try { ProbeClipboard(); }
+                catch { /* 剪贴板被占用/无图等，吞掉本轮 */ }
+                lock (_clipboardGate)
+                {
+                    if (!_clipboardPending) return;
+                    _clipboardWorkerStartMs = Environment.TickCount64; // 还有活，给本线程续期
+                }
+            }
+        }
+
+        private sealed record ClipboardProbe(int Seq, string Path, bool IsTemp, string Sig, string? Md5Hex);
+
+        private void ProbeClipboard()
+        {
+            var data = Clipboard.GetDataObject();
+            if (data == null) return;
+
+            // 优先取文件（聊天工具"复制图片"常给 FileDropList），其次取位图
+            string? path = null;
+            bool isTemp = false;
+            string sig;
+            string? md5Hex = null;
+            if (data.GetDataPresent(DataFormats.FileDrop)
+                && data.GetData(DataFormats.FileDrop) is string[] files
+                && files.Length > 0 && File.Exists(files[0])
+                && ImageSniffer.Detect(files[0]) != ImageKind.Unknown)
+            {
+                path = files[0];
+                var fi = new FileInfo(path);
+                sig = "f|" + path + "|" + fi.Length + "|" + fi.LastWriteTimeUtc.Ticks;
+                // 廉价判据先行：签名与上次一致（部分应用会周期性重写相同内容）就到此为止，
+                // 连文件都不必读——哈希是这条路径上最贵的一步
+                if (sig == _lastClipboardSig) return;
+                // 流式哈希，不把整文件读进内存（此前 File.ReadAllBytes 对大图是纯浪费）
+                using var fs = File.OpenRead(path);
+                md5Hex = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs));
+            }
+            else if (Clipboard.ContainsImage())
+            {
+                var src = Clipboard.GetImage();
+                if (src == null) return;
+
+                var encoder = new PngBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(src));
+                using var ms = new MemoryStream();
+                encoder.Save(ms);
+                var pngBytes = ms.ToArray();
+
+                sig = "b|" + Convert.ToHexString(System.Security.Cryptography.MD5.HashData(pngBytes));
+                if (sig == _lastClipboardSig) return; // 内容没变：不再落临时文件
+                var dir = Path.Combine(Path.GetTempPath(), "asuka-capture");
+                Directory.CreateDirectory(dir);
+                path = Path.Combine(dir, $"clip-{DateTime.Now:yyyyMMdd-HHmmss-fff}.png");
+                File.WriteAllBytes(path, pngBytes);
+                isTemp = true;
+                md5Hex = sig[2..];
+            }
+            else return;
+
+            if (path == null) return;
+            var probe = new ClipboardProbe(
+                Interlocked.Increment(ref _clipboardProbeSeq), path, isTemp, sig, md5Hex);
+            Dispatcher.BeginInvoke(() => FinishClipboardProbe(probe));
+        }
+
+        // UI 线程收尾：图库对账（集合只许 UI 线程碰）与去重落定、弹提示。
+        // 哈希失败（文件被独占锁住等）不拦截提示，沿用原语义。
+        private void FinishClipboardProbe(ClipboardProbe probe)
+        {
+            if (probe.Seq <= _clipboardSeenSeq) return; // 乱序的陈旧结果
+            _clipboardSeenSeq = probe.Seq;
+            if (DataContext is not MainViewModel vm) return;
+
+            // 内容级去重（2026-10-01 用户实测：部分应用会周期性重写相同剪贴板内容，
+            // 同一张图的入库提示反复弹）：
+            // ①已入库的图（MD5 与图库对账）直接静默，复制多少遍都不再提示；
+            // ②与上一次提示过的内容相同也静默——除非期间它被删出图库（那时 MD5 对不上，会重新提示）
+            if (probe.Md5Hex != null && vm.Stickers.Any(s => s.Md5 == probe.Md5Hex))
+            {
+                _lastClipboardSig = probe.Sig;
+                return;
+            }
+            if (probe.Sig == _lastClipboardSig) return;
+            _lastClipboardSig = probe.Sig;
+
+            ShowCaptureToast(probe.Path, probe.IsTemp);
+        }
+
+        // 上次提示过的内容签名：worker 线程（探测）与 UI 线程（收尾）都会读写，volatile 保证可见
+        private volatile string? _lastClipboardSig;
 
         private ClipboardToastWindow? _captureToast;
 
@@ -737,21 +829,37 @@ namespace OICQStickerManager.Views
             else _quickPanel.OpenNearCursor();
         }
 
-        // 共存触发器：监听 QQ 原生表情面板的出现/消失，联动快捷面板
+        // 共存触发器：监听 QQ 原生表情面板的出现/消失，联动快捷面板。
+        // 整个启停放后台线程：Start→EnsureSubscribed 是跨进程 UIA（QQ 侧 UI 线程若卡住，
+        // 调用方可无限期挂住），在 UI 线程上执行 = QQ 卡咱们跟着卡（2026-10-02 实测：
+        // 启动即冻结在透明窗口，预热/焦点注册全没跑到，真凶就是这里）。
+        // 信号量串行化启停，防快速开关时 Dispose 与 Start 交错。
+        private static readonly System.Threading.SemaphoreSlim _watcherStateGate = new(1, 1);
+
         private void UpdateWatcherState()
         {
             if (DataContext is not MainViewModel vm) return;
-            if (vm.EnableQqCoexistTrigger)
+            bool enable = vm.EnableQqCoexistTrigger;
+            bool polling = vm.EnableWatcherPolling;
+            Task.Run(async () =>
             {
-                _panelWatcher ??= CreatePanelWatcher();
-                _panelWatcher.SetPollingFallback(vm.EnableWatcherPolling);
-                _panelWatcher.Start();
-            }
-            else
-            {
-                _panelWatcher?.Dispose();
-                _panelWatcher = null;
-            }
+                await _watcherStateGate.WaitAsync();
+                try
+                {
+                    if (enable)
+                    {
+                        _panelWatcher ??= CreatePanelWatcher();
+                        _panelWatcher.SetPollingFallback(polling);
+                        _panelWatcher.Start();
+                    }
+                    else
+                    {
+                        _panelWatcher?.Dispose();
+                        _panelWatcher = null;
+                    }
+                }
+                finally { _watcherStateGate.Release(); }
+            });
         }
 
         private QqPanelWatcher CreatePanelWatcher()
@@ -771,13 +879,20 @@ namespace OICQStickerManager.Views
             });
 
             // 按下 QQ 表情按钮的瞬间（乐观路径）：用缓存矩形立即打开，QQ 面板出现后 OpenForCoexist 会以真实矩形自校正；
-            // 矩形为 Empty 表示本会话还没有过面板位置，等 PanelAppeared 再打开
+            // 矩形为 Empty 表示本会话还没见过面板位置——改用表情按钮矩形合成锚点（面板贴在按钮上方），
+            // 不能直接 return：首次点击没有锚会把面板定位到主屏左上角，用户看到的就是"第一次点不弹出"
             watcher.EmojiButtonClicked += (s, e) => Dispatcher.BeginInvoke(() =>
             {
-                if (e.PanelRect == Rect.Empty) return;
+                var anchor = e.PanelRect;
+                if (anchor == Rect.Empty)
+                {
+                    if (e.EmojiButtonRect == Rect.Empty) return;
+                    // QQ 原生面板标准尺寸 675x506（物理像素），出现在表情按钮上方、右缘对齐按钮右缘
+                    anchor = new Rect(e.EmojiButtonRect.Right - 675, e.EmojiButtonRect.Top - 506, 675, 506);
+                }
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 if (_quickPanel == null) _quickPanel = new QuickPanelWindow((MainViewModel)DataContext);
-                _quickPanel.OpenForCoexist(e.PanelRect, e.HostHwnd);
+                _quickPanel.OpenForCoexist(anchor, e.HostHwnd);
                 QqPanelWatcher.Log($"optimistic panel shown in {sw.ElapsedMilliseconds} ms");
             });
 
@@ -2157,6 +2272,12 @@ namespace OICQStickerManager.Views
         }
 
         // ———— 深度同步密钥获取流：说明 Alert → 官方脚本（调试版 QQ 等登录）→ 回填 ————
+
+        private async void ReconcileNow_Click(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is not MainViewModel vm) return;
+            await vm.ReconcileNowAsync(); // 结果经状态行与 StatusText 反馈（与打开开关同链路）
+        }
 
         private async Task RunKeyAcquisitionFlowAsync()
         {

@@ -61,12 +61,22 @@ namespace OICQStickerManager.Views
             };
 
             // 发送发起瞬间立即收起（对齐 QQ 原生面板"点完即关"；粘贴/剪贴板恢复的等待不拖面板）。
-            // 共存模式附加同步关掉 QQ 原生表情面板（UIA Invoke 表情按钮，尽力而为）
-            viewModel.QuickPanelSendInitiated += (s, e) =>
-            {
-                HideSoft();
-                if (_coexistMode) QqPanelWatcher.TryCloseQqPanel();
-            };
+            // 关 QQ 原生表情面板不在这里做：它的 UIA Invoke 会把 QQ 焦点搬到表情按钮上，
+            // 与共存发送的焦点修复并发互踩，会把搜狗输入法的上下文搞脱钩（候选框跑屏幕边缘）——
+            // 挪到 CoexistPasteAsync 粘贴落地之后执行。
+            viewModel.QuickPanelSendInitiated += OnSendInitiated;
+        }
+
+        private void OnSendInitiated(object? sender, EventArgs e)
+        {
+            HideSoft();
+        }
+
+        // VM 是 App 静态单例、面板会随换肤整体重建：不退订的话旧窗体整棵对象图被静态根吊住
+        protected override void OnClosed(EventArgs e)
+        {
+            if (_viewModel != null) _viewModel.QuickPanelSendInitiated -= OnSendInitiated;
+            base.OnClosed(e);
         }
 
         // --- 非激活窗口 ---
