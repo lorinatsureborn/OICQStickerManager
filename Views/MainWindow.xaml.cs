@@ -792,6 +792,9 @@ namespace OICQStickerManager.Views
 
         private async Task HandleCaptureImportAsync(string imagePath, bool isTemp)
         {
+            // 托盘驻留时点「入库」：先唤回主窗口，否则接下来的标签编辑器/结果提示
+            // 全画在隐藏窗口里，看起来就是点了没反应（2026-10-03 用户反馈）
+            RestoreFromTray();
             try
             {
                 if (DataContext is MainViewModel vm)
