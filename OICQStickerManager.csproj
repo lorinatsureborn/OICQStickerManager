@@ -9,11 +9,16 @@
     <!-- 托盘图标用 WinForms 的 NotifyIcon（随运行时自带，任务栏重启等 shell 边界它都处理了） -->
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>Asuka</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\Asuka.ico</ApplicationIcon>
     <!-- 程序集版本 = 反馈表单「飞鸟版本」的来源（FeedbackService.AppVersion 读程序集版本）。
          此前从未设置 → 恒为默认 1.0.0.0，用户反馈里的版本标记全部误报 v1.0.0（Issue #2 实锤）。
          发版时必须与 GitHub tag 同步更新。 -->
     <Version>1.3.1</Version>
+    <!-- WFO0003 是 WinForms 的提示（建议改用 ApplicationHighDpiMode 属性），WPF 不经过那条路径。
+         DPI 感知必须留在 app.manifest（进程创建期生效，WinForms/WPF/UIA 全局一致），
+         压掉警告防止后人按提示删 manifest 设置，重新引入 Win11 缩放下点击跑偏的 bug。 -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
