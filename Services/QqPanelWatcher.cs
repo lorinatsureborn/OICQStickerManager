@@ -28,6 +28,8 @@ public class QqPanelEventArgs : EventArgs
 /// - 关闭：QQ 窗口的 UIA 结构变化事件（面板增删触发 ChildAdded/ChildRemoved，节流后验证），
 ///   以及焦点移回输入框等焦点变化（节流验证）。
 /// 轮询保底（可选设置项，默认关）：事件在个别 QQ 版本上失灵时的兜底，常开会持续查询 QQ。
+/// 打开保障：QQ 窗口订阅/获得焦点时主动发 MSAA 查询激活其无障碍树——Chromium 只在检测到
+/// 屏幕阅读器式查询时才把 DOM 挂进 UIA，被动等待在个别环境（Win11 实报）永不发生（Issue #2）。
 /// 定位串随 QQ 版本更新可能失配：连续异常自动降级并提示，失败模式良性（热键不受影响）。
 /// 纯只读 UIA，不注入不挂钩。
 /// </summary>
@@ -47,6 +49,12 @@ public class QqPanelWatcher : IDisposable
     private const string PanelClassName = "sticker-panel";
     private const string EditorClassKey = "ExEditor-qq-msg-editor";
 
+    // 无障碍树主动激活：WM_GETOBJECT/OBJID_CLIENT 是屏幕阅读器的标准查询
+    private const uint WM_GETOBJECT = 0x003D;
+    private const int OBJID_CLIENT = unchecked((int)0xFFFFFFFC);
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
+    private const int WarmupIntervalMs = 60_000;
+
     /// <summary>
     /// 表情按钮的宽松匹配：NTQQ 各版本的类名/文案会单独漂移（旧版如 9.9.19 可能改类名或加修饰），
     /// 名称精确命中即认（聊天窗口里叫「表情」的元素就是表情按钮；误判代价只是面板贴错位置，可自愈）。
@@ -57,6 +65,8 @@ public class QqPanelWatcher : IDisposable
     private readonly Action<string> _status;
     private readonly object _gate = new();
     private readonly Dictionary<IntPtr, AutomationElement> _subscribed = new();
+    private readonly Dictionary<IntPtr, long> _warmupTicks = new();
+    private readonly HashSet<IntPtr> _warmupLogged = new();
 
     private CancellationTokenSource? _pollCts;
     private Task? _pollLoop;
@@ -326,6 +336,9 @@ public class QqPanelWatcher : IDisposable
                 if (hwnd != IntPtr.Zero) EnsureSubscribed(hwnd);
             }
             catch { }
+
+            // 用户正在交互 = 即将需要 DOM（表情按钮焦点命中/面板扫描）：确保无障碍树已激活
+            try { WarmUpAccessibility(GetTopWindowHwnd(el)); } catch { }
 
             string name = SafeName(el);
             string cls = SafeClass(el);
@@ -720,6 +733,36 @@ public class QqPanelWatcher : IDisposable
                 Log($"subscribe failed hwnd={hwnd}: {ex.Message}");
             }
         }
+        WarmUpAccessibility(hwnd);
+    }
+
+    /// <summary>主动激活 QQ 的无障碍树：向 QQ 顶层窗口发一次 MSAA WM_GETOBJECT(OBJID_CLIENT)。
+    /// Chromium/CEF 只在检测到屏幕阅读器式查询时才开启渲染进程 accessibility，被动等待在
+    /// 个别环境永远不会发生——DOM 不进 UIA，表情按钮焦点/sticker-panel 扫描全部落空且零报错
+    /// （Issue #2 的实证形态）。本机实测：空闲冷树仅 5 个壳层节点，一发查询即可在树中找到
+    /// 「表情」按钮；激活按渲染进程生效且持续，隐藏窗口保持挂起（等可见/聚焦时再暖）。
+    /// 60s 节流；SMTO_ABORTIFHUNG：目标窗口卡死时 500ms 内放弃，不拖累调用线程。</summary>
+    private void WarmUpAccessibility(IntPtr topHwnd)
+    {
+        if (topHwnd == IntPtr.Zero) return;
+        var now = Environment.TickCount64;
+        bool firstTime;
+        lock (_gate)
+        {
+            if (_warmupTicks.TryGetValue(topHwnd, out var last) && now - last < WarmupIntervalMs) return;
+            _warmupTicks[topHwnd] = now;
+            firstTime = _warmupLogged.Add(topHwnd);
+        }
+        Task.Run(() =>
+        {
+            try
+            {
+                SendMessageTimeout(topHwnd, WM_GETOBJECT, IntPtr.Zero, (IntPtr)OBJID_CLIENT,
+                    SMTO_ABORTIFHUNG, 500, out var lresult);
+                if (firstTime) Log($"a11y warmup sent hwnd={topHwnd} lresult=0x{lresult.ToInt64():X}");
+            }
+            catch { }
+        });
     }
 
     private void PruneSubscriptions()
@@ -737,6 +780,8 @@ public class QqPanelWatcher : IDisposable
             foreach (var (hwnd, element) in dead)
             {
                 _subscribed.Remove(hwnd);
+                _warmupTicks.Remove(hwnd);
+                _warmupLogged.Remove(hwnd);
                 _ = Task.Run(() =>
                 {
                     try { Automation.RemoveStructureChangedEventHandler(element, OnStructureChanged); }
@@ -1010,6 +1055,9 @@ public class QqPanelWatcher : IDisposable
         public uint time;
         public IntPtr dwExtraInfo;
     }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
