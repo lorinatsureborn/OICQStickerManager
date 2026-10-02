@@ -19,12 +19,24 @@ public class QqStickerModel : StickerModel
     private List<string>? _borrowedTags;
 
     /// <summary>图库同款副本的标签（Md5 对账借入，见 MainViewModel.UpdateImportedFlags）；
-    /// null=图库没有同款。用户在图库给表情打的标签通过它显现在 QQ 页。</summary>
+    /// null=图库没有同款。用户在图库打的标签通过它显现在 QQ 页。</summary>
     [JsonIgnore]
     public List<string>? BorrowedTags
     {
         get => _borrowedTags;
-        set { _borrowedTags = value; OnPropertyChanged(); }
+        set
+        {
+            // 同引用或同内容都不发通知：UpdateImportedFlags 对每个镜像条目赋值，
+            // 图库标签没变时发通知 = 整个 QQ 页绑定全刷一遍
+            if (ReferenceEquals(_borrowedTags, value)) return;
+            if (_borrowedTags != null && value != null && _borrowedTags.SequenceEqual(value))
+            {
+                _borrowedTags = value;
+                return;
+            }
+            _borrowedTags = value;
+            OnPropertyChanged();
+        }
     }
 
     /// <summary>有效标签：自身标签优先（未来镜像原生标签），否则借图库同款的——QQ 页悬浮页脚

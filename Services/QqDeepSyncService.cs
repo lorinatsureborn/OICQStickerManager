@@ -123,6 +123,7 @@ public class QqDeepSyncService
             {
                 DataSource = plainDbPath,
                 Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadOnly,
+                Pooling = false, // 默认连接池让 Dispose 只还池不释放句柄，快照临时目录删不掉（实测残留 plain.db/-shm）
             }.ToString());
         conn.Open();
         using var cmd = conn.CreateCommand();

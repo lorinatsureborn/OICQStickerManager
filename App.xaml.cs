@@ -14,8 +14,14 @@ namespace OICQStickerManager
     /// </summary>
     public partial class App : Application
     {
-        // 全局共享 ViewModel：主窗口与快捷面板绑定同一实例（同一图库、同一过滤/排序视图状态）
-        public static MainViewModel SharedViewModel { get; } = new();
+        // 全局共享 ViewModel：主窗口与快捷面板绑定同一实例（同一图库、同一过滤/排序视图状态）。
+        // 懒构造：静态初始化器会在单实例互斥判定之前把整个 VM（图库装载+QQ 扫描）跑完，
+        // 第二实例白白做全套 IO 才退出；且 VM 构造会绑定当前 Dispatcher，首次取用必须在 UI 线程
+        private static readonly Lazy<MainViewModel> _sharedViewModel = new(() => new MainViewModel());
+        public static MainViewModel SharedViewModel => _sharedViewModel.Value;
+
+        // 是否为主实例：决定 OnExit 是否要冲刷保存（第二实例不碰数据文件）
+        private static bool _isPrimaryInstance;
 
         // 单实例互斥（强制行为，非设置项）：双开会让热键注册冲突、QQ watcher 双份。
         // 后启动者只负责唤醒已有实例（RestoreFromTray）然后退出。
@@ -65,6 +71,7 @@ namespace OICQStickerManager
             }
 
             _activateEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ActivateEventName);
+            _isPrimaryInstance = true;
             // 后台线程等唤醒信号：第二实例启动时把托盘里/后台的主窗口带回前台
             var wakeListener = new Thread(() =>
             {
@@ -158,8 +165,8 @@ namespace OICQStickerManager
         protected override void OnExit(ExitEventArgs e)
         {
             // 冲刷退出瞬间仍在途的配置保存（快速开关应用时最后一步不落地会导致
-            // 绑定/设置回滚——2026-10-01 用户实测），最多等 2 秒
-            SharedViewModel.FlushPendingConfigSave(2000);
+            // 绑定/设置回滚——2026-10-01 用户实测），最多等 2 秒；第二实例没建过 VM，别把它拉出来
+            if (_isPrimaryInstance) SharedViewModel.FlushPendingConfigSave(2000);
             _activateEvent?.Dispose();
             _singleInstanceMutex?.Dispose();
             base.OnExit(e);

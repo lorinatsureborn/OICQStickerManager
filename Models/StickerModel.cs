@@ -32,7 +32,15 @@ public class StickerModel : ViewModelBase // 💡 继承基类
     public List<string> Tags
     {
         get => _tags;
-        set { _tags = value; OnPropertyChanged(); }
+        set
+        {
+            // 同引用或同内容都不发通知：启动装载/镜像对账会批量重建列表，无差别通知是全列表绑定刷新
+            if (ReferenceEquals(_tags, value)) return;
+            if (value is List<string> incoming && _tags.SequenceEqual(incoming)) { _tags = incoming; return; }
+            _tags = value!;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(DisplayName));
+        }
     }
 
     /// <summary>页脚悬浮等展示场景用的有效标签：图库条目=自身 Tags；
@@ -47,6 +55,7 @@ public class StickerModel : ViewModelBase // 💡 继承基类
         get => _lastUsedTime;
         set
         {
+            if (_lastUsedTime == value) return; // 批量赋值（镜像对账/装载）同值不刷
             _lastUsedTime = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(RankScore));
@@ -60,6 +69,7 @@ public class StickerModel : ViewModelBase // 💡 继承基类
         get => _useCount;
         set
         {
+            if (_useCount == value) return;
             _useCount = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(RankScore));

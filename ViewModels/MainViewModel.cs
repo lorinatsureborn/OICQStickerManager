@@ -114,7 +114,8 @@ public class MainViewModel : ViewModelBase
         }
     }
 
-    /// <summary>视图过滤结果或集合本身变化时，刷新页脚计数</summary>
+    /// <summary>视图过滤结果或集合本身变化时，刷新页脚计数（防抖合并：启动装载的 Clear+N×Add
+    /// 只落一次全视图遍历，而不是每次集合变更两遍 O(n)）。</summary>
     private void UpdateCounts()
     {
         // QQ 页展示的是独立镜像集合，不走图库视图
@@ -122,6 +123,18 @@ public class MainViewModel : ViewModelBase
             ? CurrentQqService?.Mirror.Count ?? 0
             : _stickersView.OfType<object>().Count();
         OnPropertyChanged(nameof(StickerCountText));
+    }
+
+    private int _countsRefreshPending; // 0/1：Background 优先级的合并刷新在途
+
+    private void ScheduleUpdateCounts()
+    {
+        if (Interlocked.Exchange(ref _countsRefreshPending, 1) == 1) return;
+        _uiDispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        {
+            Interlocked.Exchange(ref _countsRefreshPending, 0);
+            UpdateCounts();
+        });
     }
 
     private readonly WindowService _windowService = new();
@@ -210,9 +223,10 @@ public class MainViewModel : ViewModelBase
             return o is not QqStickerModel && ((StickerModel)o).Tags.Contains(_panelSelectedTab);
         };
 
-        // 页脚计数：过滤结果变化（搜索/切标签/增删表情）都走这里实时刷新
-        ((INotifyCollectionChanged)_stickersView).CollectionChanged += (_, _) => UpdateCounts();
-        Stickers.CollectionChanged += (_, _) => UpdateCounts();
+        // 页脚计数：过滤结果变化（搜索/切标签/增删表情）都走这里实时刷新；
+        // 视图与源集合的变更会各发一次通知，经 ScheduleUpdateCounts 合并成一次
+        ((INotifyCollectionChanged)_stickersView).CollectionChanged += (_, _) => ScheduleUpdateCounts();
+        Stickers.CollectionChanged += (_, _) => ScheduleUpdateCounts();
 
         // 💡 启动时自动加载
         _ = LoadConfigAsync();
@@ -598,6 +612,7 @@ public class MainViewModel : ViewModelBase
         try
         {
             var count = await RunDeepSyncAsync();
+            if (count == -2) return; // 已有对账在跑（watcher 回填并发触发），它会自己更新状态行
             if (count >= 0)
             {
                 StatusText = count > 0
@@ -648,6 +663,9 @@ public class MainViewModel : ViewModelBase
         _keyTcs = null;
         NotifyQqDeepSyncStatus(); // 设置页状态行即时反映"密钥获取成功"
         _ = SaveConfigAsync();
+        // watcher 静默抓到密钥（「下次自动」路径）→ 立刻对账出角标，不等下次重启；
+        // 打开开关的引导流唤醒后自己会跑一次，由 _reconcileBusy 护栏去重
+        if (key != null && _qqDeepSyncEnabled) _ = RunStartupReconcileIfDueAsync();
     }
 
     public event EventHandler? KeyAcquisitionRequested;
@@ -696,35 +714,57 @@ public class MainViewModel : ViewModelBase
     }
 
     /// <summary>
-    /// 执行一次对账：返回发现的孤儿数；-1 = 失败（密钥失效/QQ 结构变化）。
+    /// 执行一次对账：返回发现的孤儿数；-1 = 失败（密钥失效/QQ 结构变化）；-2 = 已有对账在跑（本次跳过）。
     /// 结果写入 _deepSyncSummary 反映到设置页状态行（2026-09-30 用户反馈"开了却没标记也没说法"）。
     /// </summary>
+    private int _reconcileBusy; // 0/1 护栏：引导流唤醒与 watcher 回填可能并发触发对账
     public async Task<int> RunDeepSyncAsync()
     {
-        var deep = await GetOrCreateDeepSyncAsync();
-        if (deep == null)
+        if (Interlocked.CompareExchange(ref _reconcileBusy, 1, 0) != 0) return -2;
+        try
         {
-            _deepSyncSummary = "上次对账未执行：未获取到数据库密钥";
+            var deep = await GetOrCreateDeepSyncAsync();
+            if (deep == null)
+            {
+                _deepSyncSummary = "上次对账未执行：未获取到数据库密钥";
+                NotifyQqDeepSyncStatus();
+                return -1;
+            }
+            var count = await deep.ReconcileAllAsync(
+                _qqBindings.Select(b => b.Uin).ToList(),
+                (QqSyncStrategy)QqSyncStrategy);
+            if (count < 0)
+            {
+                _deepSync = null; // 失败降级：下次重试（可能要重取密钥）
+                _deepSyncSummary = "上次对账失败：密钥可能已失效，重新读取后可再对账";
+            }
+            else
+            {
+                _deepSyncSummary = count > 0
+                    ? $"上次对账完成：发现 {count} 个缓存残留（QQ 页已打角标）"
+                    : "上次对账完成：没有发现缓存残留";
+            }
             NotifyQqDeepSyncStatus();
-            return -1;
+            return count;
         }
-        var count = await deep.ReconcileAllAsync(
-            _qqBindings.Select(b => b.Uin).ToList(),
-            (QqSyncStrategy)QqSyncStrategy);
-        if (count < 0)
+        finally
         {
-            _deepSync = null; // 失败降级：下次重试（可能要重取密钥）
-            _deepSyncSummary = "上次对账失败：密钥可能已失效，正在引导重新读取…";
+            Interlocked.Exchange(ref _reconcileBusy, 0);
         }
-        else
-        {
-            _deepSyncSummary = count > 0
-                ? $"上次对账完成：发现 {count} 个缓存残留（QQ 页已打角标）"
-                : "上次对账完成：没有发现缓存残留";
-        }
-        NotifyQqDeepSyncStatus();
-        return count;
     }
+
+    /// <summary>启动/watcher 拿到密钥后的静默对账：绝不弹密钥引导（不打扰），
+    /// 失败只落状态行，用户可用「立即对账」走完整引导。2026-10-02 用户实测：
+    /// 对账此前只在打开开关那一刻执行，重启后 38 个真实残留零角标。</summary>
+    public async Task RunStartupReconcileIfDueAsync()
+    {
+        if (!_qqDeepSyncEnabled || string.IsNullOrEmpty(_qqDbKey)) return;
+        if (_qqBindings.Count > 0 && _qqServices.Count == 0) return; // 加载竞态：绑定服务还没建，等下次触发
+        try { await RunDeepSyncAsync(); } catch { /* 良性：状态行如实记录 */ }
+    }
+
+    /// <summary>设置页「立即对账」入口：与打开开关同一条链路（失败会引导重读密钥）。</summary>
+    public Task ReconcileNowAsync() => InitializeDeepSyncAsync();
 
     /// <summary>
     /// 启动询问候选：猜出的当前账号若未绑定且没被"不再询问"过，返回它（弹一次询问）。
@@ -742,9 +782,16 @@ public class MainViewModel : ViewModelBase
 
     private void UpdateImportedFlags(QqEmojiService service)
     {
+        // 图库按 Md5 建一次索引：镜像逐条 FirstOrDefault 是 O(镜像×图库)，在 UI 线程上放大明显
+        var twinsByMd5 = new Dictionary<string, StickerModel>(StringComparer.Ordinal);
+        foreach (var s in Stickers)
+        {
+            if (!string.IsNullOrEmpty(s.Md5) && !twinsByMd5.ContainsKey(s.Md5))
+                twinsByMd5[s.Md5] = s; // 首条优先，与 FirstOrDefault 一致
+        }
         foreach (var item in service.Mirror)
         {
-            var twin = Stickers.FirstOrDefault(s => s.Md5 == item.Md5);
+            twinsByMd5.TryGetValue(item.Md5 ?? "", out var twin);
             item.IsImported = twin != null;
             // 借入标签：图库同款副本的标签供 QQ 页悬浮页脚显示（自身标签优先，见 EffectiveTags）
             item.BorrowedTags = twin?.Tags;
@@ -1073,12 +1120,15 @@ public class MainViewModel : ViewModelBase
             catch { /* 极端情况下仍以物理文件为准 */ }
         }
 
-        // 3. 构建最终集合 (以物理文件为 ID)
+        // 3. 构建最终集合 (以物理文件为 ID)；JSON 记录按路径建索引，避免文件循环里逐条 FirstOrDefault（O(n²)）
+        var recordsByPath = new Dictionary<string, StickerModel>(StringComparer.Ordinal);
+        foreach (var r in savedRecords)
+            if (!recordsByPath.ContainsKey(r.FullPath)) recordsByPath[r.FullPath] = r; // 重复路径取首条，与 FirstOrDefault 一致
         var finalStickers = new List<StickerModel>();
         foreach (var file in physicalFiles)
         {
             // 查找 JSON 中是否有对应路径的标签记录
-            var record = savedRecords.FirstOrDefault(r => r.FullPath == file.FullPath);
+            if (recordsByPath.TryGetValue(file.FullPath, out var record))
             if (record != null)
             {
                 file.Tags = record.Tags ?? new List<string>();
@@ -1233,8 +1283,10 @@ public class MainViewModel : ViewModelBase
             // 2. 序列化配置：写得漂亮一点（带缩进）
             var options = new JsonSerializerOptions { WriteIndented = true };
 
-            // 3. 执行“脱水”过程：将内存对象转为文本
-            string jsonString = JsonSerializer.Serialize(Stickers, options);
+            // 3. 执行“脱水”过程：UI 线程只做快照（集合只许 UI 线程碰），
+            //    序列化进后台——它是整库 O(n) 纯 CPU，图库大了以后在 UI 线程上是每次发送一笔可观开销
+            var snapshot = Stickers.ToList();
+            string jsonString = await Task.Run(() => JsonSerializer.Serialize(snapshot, options));
 
             // 4. 写入文件（原子 + 备份 + 写锁串行，防止截断 JSON 丢标签、并发保存互抢 tmp）
             await WriteJsonWithBackupAsync(DbPath, jsonString, _dbWriteLock);
@@ -1330,8 +1382,12 @@ public class MainViewModel : ViewModelBase
         {
             var tmp = path + ".tmp";
             await File.WriteAllTextAsync(tmp, json);
-            try { if (File.Exists(path)) File.Copy(path, path + ".bak", overwrite: true); } catch { /* 备份尽力 */ }
-            File.Move(tmp, path, overwrite: true);
+            // 备份与改名是同步文件 IO，也放到线程池：调用方多是 UI 线程上的 await 链
+            await Task.Run(() =>
+            {
+                try { if (File.Exists(path)) File.Copy(path, path + ".bak", overwrite: true); } catch { /* 备份尽力 */ }
+                File.Move(tmp, path, overwrite: true);
+            });
         }
         finally
         {

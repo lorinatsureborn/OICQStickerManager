@@ -45,6 +45,17 @@ public static class StickerRanking
     }
 
     /// <summary>热度总分，图库/标签/快捷面板共用的唯一排序键。</summary>
+    /// now 缺省时按分钟取底：Score 被 ListCollectionView.CustomSort 在一次排序里对每对元素
+    /// 反复调用，直接读时钟的话，排序期间恰好有元素跨过分桶阶跃边界会让比较器前后不自洽
+    ///（顺序抖动，ListCollectionView 可能直接抛"无法比较两个元素"）。分钟粒度对排序是
+    /// 恒定时间源，对新近度分桶（最细 1 小时）无感。</summary>
     public static double Score(int useCount, DateTime lastActive, DateTime? now = null)
-        => FrequencyFactor(useCount) * RecencyWeight(lastActive, now ?? DateTime.Now);
+    {
+        var t = now ?? DateTime.Now;
+        if (now == null)
+        {
+            t = t.AddTicks(-(t.Ticks % TimeSpan.TicksPerMinute));
+        }
+        return FrequencyFactor(useCount) * RecencyWeight(lastActive, t);
+    }
 }

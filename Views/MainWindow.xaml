@@ -858,6 +858,19 @@
                                                     </MultiBinding>
                                                 </TextBlock.Text>
                                             </TextBlock>
+                                            <!-- 角标只在打开开关那一刻对账生成，重启后靠这里/启动对账补 -->
+                                            <Button Style="{StaticResource TextButtonStyle}"
+                                                    HorizontalAlignment="Left" Margin="0,7,0,0"
+                                                    Visibility="{Binding QqDeepSyncEnabled, Converter={StaticResource BoolToVis}}"
+                                                    Click="ReconcileNow_Click"
+                                                    AutomationProperties.Name="立即执行一次 QQ 收藏对账">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE72C;"
+                                                               FontSize="12" VerticalAlignment="Center"/>
+                                                    <TextBlock Text="立即对账" FontSize="12"
+                                                               Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                                </StackPanel>
+                                            </Button>
                                         </StackPanel>
                                         <CheckBox Grid.Column="1" Style="{StaticResource SwitchStyle}"
                                                   IsChecked="{Binding QqDeepSyncEnabled}"
