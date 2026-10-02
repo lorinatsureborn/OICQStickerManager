@@ -65,7 +65,7 @@ public static class FeedbackService
     }
 
     /// <summary>当前运行的 QQ 版本号（如 9.9.36-53644）；取不到给明确说法。</summary>
-    private static string GetQqVersion()
+    internal static string GetQqVersion()
     {
         try
         {

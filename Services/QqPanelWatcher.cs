@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
@@ -159,7 +160,10 @@ public class QqPanelWatcher : IDisposable
         if (Running) return;
         _qqPids = CollectQqPids();
         Running = true;
-        Log("watcher started");
+        // 环境上下文随日志落盘：裸日志脱离反馈表单也能对上号（Issue #2 的反馈附了裸日志，
+        // 应用版本错报、Win11 与 Win10 的 UIA 差异都得靠 issue 正文才拼得出来）
+        var asmVer = Assembly.GetEntryAssembly()?.GetName().Version;
+        Log($"watcher started (Asuka v{asmVer?.ToString(3) ?? "未知"}, {OsTag()}, QQ {FeedbackService.GetQqVersion()})");
 
         // 低级鼠标钩子装在专用消息泵线程上：LL 钩子对响应超时零容忍，
         // 装在 UI 线程会因预热等卡顿被 Windows 静默摘除（实测发生过），专用线程永不超时。
@@ -871,6 +875,14 @@ public class QqPanelWatcher : IDisposable
                 $"[{DateTime.Now:HH:mm:ss.fff}] {message}\r\n");
         }
         catch { }
+    }
+
+    /// <summary>OS 友好名 + 版本：NT 内核在 Win11 上仍报 10.0，须按 build 号（≥22000）区分。</summary>
+    private static string OsTag()
+    {
+        var v = Environment.OSVersion.Version;
+        var name = v.Build >= 22000 ? "Windows 11" : "Windows 10";
+        return $"{name} {v.Major}.{v.Minor}.{v.Build}";
     }
 
     // --- 名称/类名/矩形安全读取（Chromium 树里部分元素属性不可读） ---
