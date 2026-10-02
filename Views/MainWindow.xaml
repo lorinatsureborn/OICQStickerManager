@@ -1074,8 +1074,18 @@
                                         </StackPanel>
                                     </Button>
                                     <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
+                                    <Button Style="{StaticResource RowButtonStyle}" Click="DumpQqDiag_Click"
+                                            AutomationProperties.Name="转储 QQ 界面诊断到日志">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE9F9;"
+                                                       FontSize="14" Foreground="{DynamicResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="转储 QQ 界面诊断" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="12,0"/>
                                     <Grid Margin="16,11">
-                                        <TextBlock Text="预填正文已自动附带精选日志；如需完整日志，打开上面的文件夹把 asuka-watcher.log 拖进 GitHub 提交页的附件区即可"
+                                        <TextBlock Text="预填正文已自动附带精选日志；如需完整日志，打开上面的文件夹把 asuka-watcher.log 拖进 GitHub 提交页的附件区即可。转储诊断建议在 QQ 聊天窗口和表情面板打开时点击，信息最全"
                                                    Style="{StaticResource FootnoteTextStyle}" TextWrapping="Wrap"/>
                                     </Grid>
                                 </StackPanel>

@@ -444,7 +444,7 @@ public class QqPanelWatcher : IDisposable
             // 用户明确点了表情按钮却始终检测不到面板 → 高概率是本机 QQ 版本的类名失配
             // （如旧版 9.9.x 面板不叫 sticker-panel）。dump 一次 QQ 窗口树概要进日志，
             // 反馈者把 %TEMP%\asuka-watcher.log 发回来即可定位该版本的真实标识。
-            DumpQqTreeDiagnostics("panel never detected after emoji button click");
+            _ = DumpQqTreeDiagnosticsCoreAsync("panel never detected after emoji button click");
         }
     }
 
@@ -452,32 +452,65 @@ public class QqPanelWatcher : IDisposable
 
     private long _lastDumpTicks;
 
+    /// <summary>设置页手动转储入口：豁免 90 秒限频（用户点了就要有产出）。
+    /// 共存监听没开也能转储——诊断对象是本机 QQ 的 UIA 树，与监听是否在跑无关。
+    /// 自动 dump 的唯一入口在"点击信号已产生"之后；点击信号本身失配不产生时
+    /// （旧版 QQ 焦点/类名双双对不上，Issue #2 实证），这个手动入口是死区里唯一的诊断出口。</summary>
+    public static Task DumpDiagnosticsNowAsync()
+    {
+        var w = _active;
+        if (w != null) return w.DumpQqTreeDiagnosticsCoreAsync("manual dump from settings", force: true);
+        return DumpQqTreeWalkAsync("manual dump from settings (watcher off)", cancelled: null);
+    }
+
+    private Task DumpQqTreeDiagnosticsCoreAsync(string reason, bool force = false)
+    {
+        var now = Environment.TickCount64;
+        if (!force && now - _lastDumpTicks < 90_000) return Task.CompletedTask;
+        _lastDumpTicks = now;
+        return DumpQqTreeWalkAsync(reason, cancelled: () => _disposed);
+    }
+
     /// <summary>
     /// 把 QQ 可见窗口的 UIA 树概要（顶层窗口类名 + 前 N 层含面板/表情关键词的类名）写进
     /// asuka-watcher.log。跨版本适配的地雷是写死的类名，这份日志直接暴露本机 QQ 的真实标识。
     /// 限频 90 秒，遍历限深 3 层、命中上限 40 条，避免 Chromium 大树拖慢后台线程。
     /// </summary>
-    private void DumpQqTreeDiagnostics(string reason)
+    private static Task DumpQqTreeWalkAsync(string reason, Func<bool>? cancelled)
     {
-        var now = Environment.TickCount64;
-        if (now - _lastDumpTicks < 90_000) return;
-        _lastDumpTicks = now;
-
-        Task.Run(() =>
+        return Task.Run(() =>
         {
             try
             {
                 var pids = CollectQqPids();
                 if (pids.Count == 0) { Log($"diag ({reason}): no QQ process found"); return; }
                 Log($"diag ({reason}): QQ pids=[{string.Join(',', pids)}], dumping window tree summary");
+                // 焦点现场：焦点路径的前提是"点表情按钮瞬间焦点落按钮上"。转储前把焦点放聊天输入框
+                // 或表情按钮，这条直接暴露本机的焦点元素长什么样（名字对不上/焦点压根不进 QQ 一眼定位）
+                try
+                {
+                    var focused = AutomationElement.FocusedElement;
+                    if (focused != null)
+                    {
+                        var fpid = focused.Current.ProcessId;
+                        Log($"diag   focused pid={fpid} ({(pids.Contains(fpid) ? "QQ" : "other")}) class=\"{SafeClass(focused)}\" name=\"{TruncateForLog(SafeName(focused))}\"");
+                    }
+                }
+                catch (Exception ex) { Log($"diag   focused element read failed: {ex.Message}"); }
                 foreach (var hwnd in GetVisibleWindowsOf(pids))
                 {
+                    if (cancelled?.Invoke() == true) return;
                     try
                     {
                         var root = AutomationElement.FromHandle(hwnd);
                         Log($"diag window hwnd={hwnd} class=\"{SafeClass(root)}\" name=\"{SafeName(root)}\"");
                         var visited = 0;
-                        DumpCandidateClasses(root, depth: 0, maxDepth: 3, hits: new List<string>(), ref visited);
+                        var skeletonLines = 0;
+                        DumpCandidateClasses(root, depth: 0, maxDepth: 3, hits: new List<string>(), ref visited, ref skeletonLines, cancelled);
+                        // visited = UIA 在这棵树里能看见多少节点：个位数 ≈ QQ 的无障碍树根本没暴露
+                        // （Chromium a11y 未激活，适配类名无从谈起），数百 ≈ 树在但标识对不上。
+                        // 两种失配的修法完全不同，必须能区分。
+                        Log($"diag   window walk done: visited={visited}");
                     }
                     catch (Exception ex)
                     {
@@ -495,15 +528,18 @@ public class QqPanelWatcher : IDisposable
 
     /// <summary>限深收集类名/名称含关键词的元素（面板候选）与全部子窗口类名，逐条落日志。
     /// 访问节点总数单独封顶：hits 只限命中数，不封遍历量的话一棵不匹配的 Chromium 大树
-    /// 会被完整走完（实测 300+ 节点、上千次跨进程往返、后台线程 3–10 秒）。</summary>
-    private void DumpCandidateClasses(AutomationElement element, int depth, int maxDepth, List<string> hits, ref int visited)
+    /// 会被完整走完（实测 300+ 节点、上千次跨进程往返、后台线程 3–10 秒）。
+    /// 前 2 层额外记骨架（逐类名，限量）：树长什么样比命中与否更能定位失配发生在哪一层。</summary>
+    private static void DumpCandidateClasses(AutomationElement element, int depth, int maxDepth,
+        List<string> hits, ref int visited, ref int skeletonLines, Func<bool>? cancelled)
     {
-        if (_disposed || depth > maxDepth || hits.Count > 40 || visited > 400) return;
+        if (cancelled?.Invoke() == true || depth > maxDepth || hits.Count > 40 || visited > 400) return;
         try
         {
             var children = element.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
             foreach (AutomationElement child in children)
             {
+                if (cancelled?.Invoke() == true) return;
                 visited++; // 限的是跨进程成本（FindAll 遍历 + 每个子元素 2 次属性读），不是命中数
                 var cls = SafeClass(child);
                 var name = SafeName(child);
@@ -518,12 +554,19 @@ public class QqPanelWatcher : IDisposable
                         hits.Add($"class=\"{cls}\" name=\"{name}\"");
                         Log($"diag   depth={depth} CANDIDATE class=\"{cls}\" name=\"{name}\"");
                     }
+                    else if (depth <= 2 && skeletonLines < 24) // 骨架只记浅层，限量防日志爆炸
+                    {
+                        skeletonLines++;
+                        Log($"diag   depth={depth} child class=\"{cls}\" name=\"{TruncateForLog(name)}\"");
+                    }
                 }
-                DumpCandidateClasses(child, depth + 1, maxDepth, hits, ref visited);
+                DumpCandidateClasses(child, depth + 1, maxDepth, hits, ref visited, ref skeletonLines, cancelled);
             }
         }
         catch { /* 元素中途失效即止 */ }
     }
+
+    private static string TruncateForLog(string s) => s.Length <= 12 ? s : s[..12] + "…";
 
     // --- 点击后补验尾迹 ---
 

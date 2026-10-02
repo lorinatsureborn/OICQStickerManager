@@ -2433,6 +2433,27 @@ namespace OICQStickerManager.Views
             }
         }
 
+        // 手动转储 QQ UIA 树诊断进 asuka-watcher.log：共存触发器在个别 QQ 版本上可能"毫无反应"——
+        // 焦点/类名双双失配时点击信号根本不产生，自动 dump 的入口也就永远不触发（Issue #2 实证），
+        // 这个按钮是死区里唯一的诊断出口。转储在后台线程执行，豁免自动路径的 90 秒限频。
+        private async void DumpQqDiag_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                await Services.QqPanelWatcher.DumpDiagnosticsNowAsync();
+                if (_trayIcon != null)
+                {
+                    _trayIcon.BalloonTipTitle = "QQ 界面诊断已写入";
+                    _trayIcon.BalloonTipText = "已追加到 %TEMP%\\asuka-watcher.log，可用「打开诊断日志文件夹」查看后附到反馈里。";
+                    _trayIcon.ShowBalloonTip(6000);
+                }
+            }
+            catch (Exception ex)
+            {
+                _ = ShowAlertAsync("诊断转储失败", ex.Message, "知道了", showCancel: false);
+            }
+        }
+
         // 打开日志所在文件夹并选中主日志（asuka-watcher.log）：GitHub issue 附件区支持拖拽，
         // 用户从这里把日志拖进浏览器即可；日志还不存在时退化为打开 %TEMP%
         private void OpenLogs_Click(object sender, RoutedEventArgs e)
