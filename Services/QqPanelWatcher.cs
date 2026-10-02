@@ -91,18 +91,36 @@ public class QqPanelWatcher : IDisposable
     // 当前活动实例：快捷面板共存发送后"同步关闭 QQ 原生面板"经此转发（2026-10-01 用户定案）
     private static QqPanelWatcher? _active;
 
+    // 用户表情按钮激活代数：每次按下 QQ 表情按钮自增（鼠标钩子乐观路径 + 焦点命中兜底路径）。
+    // 共存发送的"延迟关 QQ 面板"凭发送时刻的代数守卫——用户已开始新一轮操作就放弃关闭，
+    // 否则 800ms 延迟的 close-q 会把用户刚重新打开的面板 toggle 掉（2026-10-02 日志实锤）
+    private static long _userActionGen;
+    internal static long UserActionGen => Interlocked.Read(ref _userActionGen);
+    private static void BumpUserAction() => Interlocked.Increment(ref _userActionGen);
+
     /// <summary>尽力同步关闭 QQ 原生表情面板：在缓存的表情按钮矩形中心取 UIA 元素，
     /// 名称/类名对得上才 Invoke——面板开着时点表情按钮即关闭（NTQQ toggle 语义）。
     /// 面板已被认为关闭、按钮找不到/对不上（窗口移动、树懒加载）都静默放弃，
-    /// 由既有的关闭跟随兜底。UIA 调用在后台线程执行，不占 UI。</summary>
-    public static void TryCloseQqPanel()
+    /// 由既有的关闭跟随兜底。UIA 调用在后台线程执行，不占 UI。
+    /// expectedGen = 发送时刻的 UserActionGen；此后用户若又按过表情按钮则放弃关闭。</summary>
+    public static void TryCloseQqPanel(long expectedGen)
     {
         var w = _active;
         if (w == null || !w._panelOpen) return; // 面板已关就别点按钮了——toggle 会把它重新打开
+        if (Interlocked.Read(ref _userActionGen) != expectedGen)
+        {
+            Log("close-q skipped: newer user interaction since send");
+            return;
+        }
         Task.Run(() =>
         {
             try
             {
+                if (Interlocked.Read(ref _userActionGen) != expectedGen)
+                {
+                    Log("close-q skipped in-flight: newer user interaction since send");
+                    return;
+                }
                 var rect = w._emojiBtnRect;
                 if (rect.Width <= 0 || rect.Height <= 0) { Log("close-q: no cached button rect"); return; }
                 var pt = new System.Windows.Point(rect.Left + rect.Width / 2.0, rect.Top + rect.Height / 2.0);
@@ -336,6 +354,7 @@ public class QqPanelWatcher : IDisposable
                         var cachedRect = hostHwnd == _lastPanelRectHwnd ? _lastPanelRect : Rect.Empty;
                         _optimisticPending = true;
                         ArmTailVerify();
+                        BumpUserAction();
                         Log($"emoji button clicked via focus event (optimistic, cachedRect={cachedRect})");
                         EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hostHwnd, cachedRect, _emojiBtnRect));
                     }
@@ -868,6 +887,7 @@ public class QqPanelWatcher : IDisposable
                     var crect = _lastPanelRectHwnd == hwnd ? _lastPanelRect : Rect.Empty;
                     _optimisticPending = true;
                     ArmTailVerify();
+                    BumpUserAction();
                     Log($"mouse hook: emoji button clicked (optimistic, cachedRect={crect})");
                     Task.Run(() =>
                     {

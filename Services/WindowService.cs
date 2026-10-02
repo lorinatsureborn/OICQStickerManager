@@ -104,11 +104,13 @@ public class WindowService
             SimulateCtrlV();
 
             // 3. 尽力关 QQ 原生表情面板：点击编辑框通常已让它光灭，但 watcher 需 ~0.5s 确认关闭状态，
-            //    立刻 invoke 会在 _panelOpen 还是 true 时把面板 toggle 重开——延迟到确认窗之后，还开着才点
+            //    立刻 invoke 会在 _panelOpen 还是 true 时把面板 toggle 重开——延迟到确认窗之后，还开着才点。
+            //    generation 守卫：若这 800ms 内用户又按了表情按钮（新一轮操作），绝不能把人家刚打开的面板关掉
+            long closeGen = QqPanelWatcher.UserActionGen;
             _ = Task.Run(async () =>
             {
                 await Task.Delay(800);
-                QqPanelWatcher.TryCloseQqPanel();
+                QqPanelWatcher.TryCloseQqPanel(closeGen);
             });
 
             await RestoreClipboardAfterDelayAsync(backup);
@@ -189,7 +191,14 @@ public class WindowService
             ScreenToClient(qqHwnd, ref clientPt);
             IntPtr target = ChildWindowFromPointEx(qqHwnd, clientPt, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
             if (target == IntPtr.Zero) target = qqHwnd;
-            if (target != qqHwnd) ScreenToClient(target, ref clientPt);
+            if (target != qqHwnd)
+            {
+                // 客户区→客户区换算只能用 MapWindowPoints：ScreenToClient 把入参当屏幕坐标，
+                // 拿 qqHwnd 客户区坐标"再转一次"会叠加 -qqHwnd客户区原点 的偏移——窗口不在屏幕
+                // 原点时落点成千像素跑偏，投出的点击全部落空（2026-10-02 事故：发送全挂）
+                MapWindowPoints(qqHwnd, target, ref clientPt, 1);
+                QqPanelWatcher.Log($"focus: message-click target child class={WindowClassOf(target)} client=({clientPt.X},{clientPt.Y})");
+            }
             IntPtr lp = MakeLParam(clientPt.X, clientPt.Y);
 
             PostMessage(target, WM_MOUSEMOVE, IntPtr.Zero, lp);
@@ -200,12 +209,16 @@ public class WindowService
 
             bool verified = PollFocusVerified(qqHwnd, out bool focusInQq);
             GetCursorPos(out var after);
-            QqPanelWatcher.Log(verified
-                ? $"focus: message-click verified after {waitedLog}ms, cursor {before.X},{before.Y}→{after.X},{after.Y} (untouched)"
-                : focusInQq
-                    ? "focus: message-click sent, UIA read lagged but keyboard focus in QQ — trusting"
-                    : "focus: message-click did not take effect, falling back to real click");
-            return verified || focusInQq;
+            if (verified)
+            {
+                QqPanelWatcher.Log($"focus: message-click verified after {waitedLog}ms, cursor {before.X},{before.Y}→{after.X},{after.Y} (untouched)");
+                return true;
+            }
+            // 不凭"键盘焦点在 QQ 窗口内"信任点击：焦点在表情按钮上也成立，此时盲粘贴粘空
+            // （2026-10-02 事故）。未确认到编辑器就退回真实点击——真实点击本就是 IME 安全的
+            // 金标准（毒化搜狗锚定的是 UIA SetFocus，不是真实点击），代价只是光标瞬移回弹。
+            QqPanelWatcher.Log($"focus: message-click not verified after {waitedLog}ms (focusInQq={focusInQq}), falling back to real click");
+            return false;
         }
         catch { return false; }
     }
@@ -458,6 +471,22 @@ public class WindowService
 
     [DllImport("user32.dll")]
     private static extern bool ScreenToClient(IntPtr hWnd, ref NativePoint pt);
+
+    [DllImport("user32.dll")]
+    private static extern int MapWindowPoints(IntPtr hWndFrom, IntPtr hWndTo, ref NativePoint pt, uint cPoints);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder sb, int maxCount);
+
+    private static string WindowClassOf(IntPtr hwnd)
+    {
+        try
+        {
+            var sb = new System.Text.StringBuilder(256);
+            return GetClassName(hwnd, sb, 256) > 0 ? sb.ToString() : "?";
+        }
+        catch { return "?"; }
+    }
 
     [DllImport("user32.dll")]
     private static extern IntPtr ChildWindowFromPointEx(IntPtr parent, NativePoint pt, uint flags);
