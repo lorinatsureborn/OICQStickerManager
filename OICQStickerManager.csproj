@@ -43,6 +43,16 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- probes/ 是独立小工具（各自有 csproj），主工程在仓库根目录会默认通配到它们，
+         显式剔除，防止探针的 App/MainWindow 混进主工程编译 -->
+    <Compile Remove="probes\**" />
+    <Page Remove="probes\**" />
+    <ApplicationDefinition Remove="probes\**" />
+    <Content Remove="probes\**" />
+    <None Remove="probes\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="VirtualizingWrapPanel" Version="2.5.4" />
     <PackageReference Include="WpfAnimatedGif" Version="2.0.2" />

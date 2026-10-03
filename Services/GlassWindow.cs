@@ -8,12 +8,14 @@ namespace OICQStickerManager.Services;
 
 /// <summary>
 /// 玻璃窗口基类：分层窗口（AllowsTransparency）+ XAML 内圆角 Border + OS 级磨砂。
-/// 真模糊由三块原生拼片（BlurTile）垫在本窗口正下方，拼成"十字"：
-/// 中带横贯全宽，上下边带与圆弧相切——四条直边的模糊直达窗口边缘，
-/// 且模糊严格不越出圆角轮廓（DWM 的 accent 模糊剪影恒为窗口矩形且无视区域，
-/// 单窗口无法让模糊认圆角，已实验穷尽证实）。代价：四个 r×r 角方块无模糊，
-/// 只隔着材质层透出清晰背幕——角部暗影/边缘遮罩/阶梯拼片都试过，均被否决
-/// （暗影白底太显眼、遮罩有拼接感、多拼片拖动性能爆炸）。
+/// 真模糊由原生拼片（BlurTile）垫在本窗口正下方，按系统版本分两条路线：
+/// Win11（build≥22000）：**单片全幅 tile + DWMWA_WINDOW_CORNER_PREFERENCE=ROUND**——
+/// 系统圆角连 accent 模糊一起圆剪，四角透镜消失，拼片 3→1（2026-10-03 PoC 实测，
+/// probes/GlassPoC + 交接文档附录）；内容圆角对齐系统半径（8 DIP，随 DPI 缩放）。
+/// Win10：CORNER_PREFERENCE 静默失败，模糊剪影恒为窗口矩形，维持三拼片"十字"：
+/// 中带横贯全宽，上下边带与圆弧相切——四条直边的模糊直达窗口边缘，模糊不越出轮廓。
+/// 代价：四个 r×r 角方块无模糊，只隔着材质层透出清晰背幕——角部暗影/边缘遮罩/
+/// 阶梯拼片都试过，均被否决（暗影白底太显眼、遮罩有拼接感、多拼片拖动性能爆炸）。
 /// 本窗口自身不能挂 accent/玻璃帧（否则漏方角），只做圆角 alpha + 半透明材质。
 /// 圆角由像素 alpha 呈现（WPF 抗锯齿）。缩放用 WM_NCHITTEST 手工实现；无边框窗口仍需
 /// WM_GETMINMAXINFO 修复最大化盖住任务栏的问题。
@@ -25,8 +27,17 @@ public class GlassWindow : Window
     private BlurTile?[] _tiles = Array.Empty<BlurTile?>();
     private bool _tilesReady;
 
-    /// <summary>窗口级圆角（DIP）。主窗口与快捷面板共用同一参数。</summary>
+    /// <summary>窗口级圆角（DIP）。仅 Win10 三拼片路线使用；Win11 用系统半径。</summary>
     public double WindowCornerRadiusDip { get; set; } = 16;
+
+    /// <summary>Win11 22000+：单片圆角 tile 路线（DWM 圆剪连模糊一起走）；否则三拼片。</summary>
+    internal static readonly bool RoundedTiles = Environment.OSVersion.Version.Build >= 22000;
+
+    /// <summary>Win11 系统圆角半径（DWM 固定 8px@96DPI，DIP 表述随缩放等比）。</summary>
+    private const double SystemRoundRadiusDip = 8;
+
+    /// <summary>内容圆角：Win11 对齐系统半径，Win10 维持设计半径。</summary>
+    private double ContentCornerRadiusDip => RoundedTiles ? SystemRoundRadiusDip : WindowCornerRadiusDip;
 
     /// <summary>是否提供缩放热区（快捷面板 NoResize 时返回 false）。</summary>
     protected virtual bool Resizable => true;
@@ -83,7 +94,7 @@ public class GlassWindow : Window
     private void ApplyCornerClip(Size size)
     {
         if (Content is not UIElement content) return;
-        var radius = WindowState == WindowState.Maximized ? 0 : WindowCornerRadiusDip;
+        var radius = WindowState == WindowState.Maximized ? 0 : ContentCornerRadiusDip;
         content.Clip = new RectangleGeometry(new Rect(0, 0, size.Width, size.Height), radius, radius);
     }
 
@@ -101,11 +112,12 @@ public class GlassWindow : Window
         // 拼片以隐藏窗口创建在屏幕外；显示走 SyncTileVisibility 的原子路径
         // （单次 SetWindowPos 同时完成 显示+钉位+摆位，两步走会有层顶黑闪竞态）
         _tilesReady = true;
-        _tiles = new BlurTile?[3]; // 中带 + 上下边带。拼片数直接决定拖动时的 SetWindowPos/DWM 重模糊开销，禁止再扩
+        // 拼片数直接决定拖动时的 SetWindowPos/DWM 重模糊开销：Win11 单片，Win10 三片，禁止再扩
+        _tiles = new BlurTile?[RoundedTiles ? 1 : 3];
         for (int i = 0; i < _tiles.Length; i++)
         {
             // 先建在屏幕外，RepositionTiles 会立刻摆到位
-            _tiles[i] = BlurTile.Create(-20000, -20000, 1, 1, BlurTilesTopmost);
+            _tiles[i] = BlurTile.Create(-20000, -20000, 1, 1, BlurTilesTopmost, round: RoundedTiles);
         }
         RepositionTiles();
         SyncTileVisibility();
@@ -125,6 +137,13 @@ public class GlassWindow : Window
     private void LayoutTiles(bool showAndPin)
     {
         if (!ComputeTileRects(out var left, out var top, out var w, out var h, out var r)) return;
+        if (RoundedTiles)
+        {
+            // 单片全幅：模糊剪影由 DWM 按系统圆角圆剪，无需拼十字（r 不参与几何）
+            if (showAndPin) _tiles[0]?.ShowPinnedBelow(_hwnd, left, top, w, h);
+            else _tiles[0]?.Layout(left, top, w, h);
+            return;
+        }
         int sw = Math.Max(0, w - 2 * r);
         // 0:横贯全宽的中带 1:上边带 2:下边带。
         // 下边带比上边带高 1px（与中带重叠一行，均为磨砂无接缝）：三块拼片尺寸彼此唯一，
