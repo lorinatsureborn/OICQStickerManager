@@ -37,7 +37,8 @@ public class GlassWindow : Window
     private const double SystemRoundRadiusDip = 8;
 
     /// <summary>内容圆角：Win11 对齐系统半径，Win10 维持设计半径。</summary>
-    private double ContentCornerRadiusDip => RoundedTiles ? SystemRoundRadiusDip : WindowCornerRadiusDip;
+    /// <summary>内容圆角：Win11 对齐系统半径，Win10 维持设计半径。public 供 XAML 根 Border 绑定（f07172e 曾硬编码 16，与 DWM 圆剪 8px 错位成月牙缝）。</summary>
+    public double ContentCornerRadiusDip => RoundedTiles ? SystemRoundRadiusDip : WindowCornerRadiusDip;
 
     /// <summary>是否提供缩放热区（快捷面板 NoResize 时返回 false）。</summary>
     protected virtual bool Resizable => true;
