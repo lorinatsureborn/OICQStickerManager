@@ -16,7 +16,7 @@ internal sealed class BlurTile : IDisposable
 
     private BlurTile() { }
 
-    public static BlurTile? Create(int x, int y, int w, int h, bool topmost)
+    public static BlurTile? Create(int x, int y, int w, int h, bool topmost, bool round = false)
     {
         EnsureClass();
         var hwnd = CreateWindowExW(
@@ -28,6 +28,8 @@ internal sealed class BlurTile : IDisposable
         var tile = new BlurTile { _hwnd = hwnd };
         var margins = new MARGINS { cxLeftWidth = -1, cxRightWidth = -1, cyTopHeight = -1, cyBottomHeight = -1 };
         DwmExtendFrameIntoClientArea(hwnd, ref margins);
+        tile._rounded = round;
+        if (round) tile.ApplyRounding();
         tile.ApplyAccent();
         return tile;
     }
@@ -48,6 +50,7 @@ internal sealed class BlurTile : IDisposable
 
     private bool _shown;
     private bool _accentOn;
+    private bool _rounded;
 
     public void Show(bool visible)
     {
@@ -122,11 +125,21 @@ internal sealed class BlurTile : IDisposable
             };
             SetWindowCompositionAttribute(_hwnd, ref data);
             _accentOn = true;
+            if (_rounded) ApplyRounding(); // 圆角偏好理论上随窗口存续，重涂一次防各处 SW 重置
         }
         finally
         {
             Marshal.FreeHGlobal(ptr);
         }
+    }
+
+    /// <summary>Win11：DWM 系统圆角连 accent 模糊一起圆剪（PoC 实测，见交接文档附录）；
+    /// Win10 上该属性静默失败，tile 保持矩形——调用方按版本走三拼片。</summary>
+    private void ApplyRounding()
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        var pref = DWMWCP_ROUND;
+        DwmSetWindowAttribute(_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref pref, sizeof(int));
     }
 
     /// <summary>拆掉 accent（隐藏时调用）：下次显示时 BLURBEHIND 构成状态变化，DWM 必须重算模糊，
@@ -251,6 +264,12 @@ internal sealed class BlurTile : IDisposable
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS margins);
+
+    private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+    private const int DWMWCP_ROUND = 2;
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
     [DllImport("gdi32.dll")]
     private static extern IntPtr CreateSolidBrush(uint color);

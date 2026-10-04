@@ -232,7 +232,7 @@
         </EventTrigger>
     </Window.Triggers>
 
-    <Border CornerRadius="16" Background="{DynamicResource GlassOverlayBrush}"
+    <Border CornerRadius="{Binding ContentCornerRadiusDip, RelativeSource={RelativeSource AncestorType=services:GlassWindow}}" Background="{DynamicResource GlassOverlayBrush}"
             BorderBrush="{DynamicResource MaterialBorderBrush}" BorderThickness="1">
     <Grid x:Name="RootGrid">
         <Grid.RenderTransform>
