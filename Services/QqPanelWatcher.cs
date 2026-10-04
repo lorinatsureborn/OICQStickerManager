@@ -76,6 +76,17 @@ public class QqPanelWatcher : IDisposable
     // 打开证据是物理点击，误开代价小；误关（面板开着却被收起）才是最伤体验的一侧。
     private const int LegacyOpenEvidenceTtlMs = 10_000;
     private const int LegacyCloseEvidenceTtlMs = 250; // 面板开着时焦点落回按钮 = toggle 关闭证据：短 TTL + 尾迹，关闭 ~0.4s 内被确认（原 600ms 用户反馈关闭拖沓；误关自愈路径不变：下一次按钮/标签命中重开）
+
+    // 开面板焦点编排保护窗：QQ 打开面板的过程本身会把焦点送到表情按钮上（9.9.19 a11y 激活后
+    // 实测 +290ms/+442ms 两连发，全程零 TAB 命中）——窗口内的按钮焦点命中是"打开回声"，
+    // 不是 toggle 关闭证据。照关闭证据处理会把锚 TTL 砍到 250ms，开面板 ~0.75s 后被时间确认
+    // 关闭（快捷面板"弹出后 ~1s 消失"，2026-10-04 日志实锤）。与编辑框光灭的同名保护窗同值。
+    internal const int OpenChoreographyGuardMs = 1500;
+
+    /// <summary>「面板开着 + 焦点命中表情按钮」的语义分级：距面板 APPEARED 超过保护窗才算
+    /// toggle 关闭证据（QQ 真关闭面板后焦点落回按钮）；窗口内是开面板的焦点编排回声。</summary>
+    internal static bool IsLegacyButtonCloseEvidence(bool panelOpen, long appearedTicks, long nowTicks) =>
+        panelOpen && nowTicks - appearedTicks > OpenChoreographyGuardMs;
     private AutomationElement? _legacyTabElement;    // 最近一次焦点命中的按钮/标签
     private IntPtr _legacyTabHwnd;
     private long _legacyTabShownTicks;
@@ -672,17 +683,17 @@ public class QqPanelWatcher : IDisposable
                 {
                     _legacyOpenTtlMs = LegacyTabHitTtlMs;
                 }
-                else if (_panelOpen)
+                else if (IsLegacyButtonCloseEvidence(_panelOpen, _lastPanelAppearedTicks, Environment.TickCount64))
                 {
-                    // 面板开着时焦点落回按钮 = toggle 关闭证据：短 TTL 并启动尾迹验证，
-                    // 否则无轮询/无事件时过期永不被发现（实测"关了以后再点没反应"的成因之一）。
+                    // 面板开着且已过开面板编排保护窗时焦点落回按钮 = toggle 关闭证据：短 TTL 并启动
+                    // 尾迹验证，否则无轮询/无事件时过期永不被发现（实测"关了以后再点没反应"的成因之一）。
                     _legacyOpenTtlMs = LegacyCloseEvidenceTtlMs;
                     ArmTailVerify();
                 }
                 else
                 {
-                    // 焦点落到按钮（面板关着）= 用户刚点了按钮、面板正在打开：与钩子打开同级的
-                    // 打开证据，用长 TTL 等 TAB 续期（短 TTL 会在 TAB 迟到时误判关闭→闪烁重开）
+                    // 焦点落到按钮（面板关着，或开面板保护窗内的编排回声）= 打开证据：长 TTL 等 TAB
+                    // 续期（短 TTL 会在 TAB 迟到时误判关闭→闪烁重开）
                     _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
                 }
                 // 锚矩形：BUTTON 命中直接用按钮矩形（精确、确定性；光标在合成点击/焦点事件
@@ -788,7 +799,7 @@ public class QqPanelWatcher : IDisposable
                         // 光灭乐观关闭：面板开着时焦点进编辑区 = 用户点了输入框、QQ 已收面板。
                         // 距面板打开 <1.5s 内不判：QQ 开面板的焦点编排也会路过编辑区形态的
                         // 空 cls 元素（18:23 实测 667ms 处假关闭→闪烁重开），窗口期内交给锚 TTL。
-                        if (_panelOpen && Environment.TickCount64 - _lastPanelAppearedTicks > 1500)
+                        if (_panelOpen && Environment.TickCount64 - _lastPanelAppearedTicks > OpenChoreographyGuardMs)
                         {
                             OptimisticClosePanel("focus hit chat editor (light-dismiss)");
                         }
