@@ -218,6 +218,75 @@ public class QqPanelWatcher : IDisposable
         {
             EnsureSubscribed(hwnd);
         }
+
+        // QQ 晚于本程序启动的兜底（重启电脑后自启动序不保证）：Start 时 QQ 不在，
+        // 订阅与 warmup 全部落空，而懒订阅/焦点 warmup 都以"焦点事件携带有效 QQ 元素"
+        // 为前提——a11y 壳层状态下点击信号永远不产生，链路死锁且零报错（2026-10-04 实证）。
+        StartQqMonitorLoop();
+    }
+
+    private CancellationTokenSource? _qqMonitorCts;
+    private Task? _qqMonitorLoop;
+
+    /// <summary>轮询 QQ 进程与可见窗口：新进程出现或已知名冒出新窗口时补订阅（幂等，内置 warmup）。
+    /// 同时覆盖 QQ 运行中重启（全新 pid）与主窗从托盘恢复等场景；已订阅窗口在 EnsureSubscribed
+    /// 里立即返回，成本只是每轮一次进程枚举 + 窗口遍历。</summary>
+    private void StartQqMonitorLoop()
+    {
+        _qqMonitorCts = new CancellationTokenSource();
+        var ct = _qqMonitorCts.Token;
+        var knownPids = new HashSet<int>(_qqPids);
+        _qqMonitorLoop = Task.Run(async () =>
+        {
+            var firstScan = true;
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(5000, ct);
+                    if (_disposed) break;
+                    var pids = CollectQqPids();
+                    var fresh = pids.Where(p => !knownPids.Contains(p)).ToList();
+                    if (fresh.Count > 0)
+                        Log($"qq monitor: process appeared (pid={string.Join(',', fresh)})");
+                    var windows = GetVisibleWindowsOf(pids).ToList();
+                    var unsubscribed = new List<IntPtr>();
+                    lock (_gate)
+                    {
+                        foreach (var hwnd in windows)
+                            if (!_subscribed.ContainsKey(hwnd)) unsubscribed.Add(hwnd);
+                    }
+                    if (unsubscribed.Count > 0)
+                        Log($"qq monitor: {unsubscribed.Count} visible window(s) not subscribed, resubscribing");
+                    foreach (var hwnd in unsubscribed)
+                        EnsureSubscribed(hwnd);
+                    if (firstScan)
+                    {
+                        firstScan = false;
+                        Log($"qq monitor active (pid=[{string.Join(',', pids)}], windows={windows.Count}, scan every 5s)");
+                    }
+                    if (fresh.Count > 0 || unsubscribed.Count > 0)
+                        PruneSubscriptions();
+                    knownPids = pids;
+                    if (pids.Count > 0) _qqPids = pids;
+                }
+                catch (OperationCanceledException) { break; }
+                catch { /* 轮询兜底自身不许抛 */ }
+            }
+        }, ct);
+    }
+
+    private void StopQqMonitorLoop()
+    {
+        try
+        {
+            _qqMonitorCts?.Cancel();
+            try { _qqMonitorLoop?.Wait(1500); } catch { }
+            _qqMonitorCts?.Dispose();
+        }
+        catch { }
+        _qqMonitorCts = null;
+        _qqMonitorLoop = null;
     }
 
     public void Dispose()
@@ -226,6 +295,7 @@ public class QqPanelWatcher : IDisposable
         Running = false;
         _disposed = true;
         if (_active == this) _active = null;
+        StopQqMonitorLoop();
         StopPollLoop();
         if (_mouseHook != IntPtr.Zero)
         {
