@@ -82,7 +82,7 @@ public class WindowService
     /// （光标会动一下，仅此兜底）。点击顺带让 QQ 原生面板光灭（light-dismiss），无需 invoke 表情按钮
     /// （toggle 时序有重开风险）。两级落点失败时只粘贴不抢焦点并记日志。
     /// </summary>
-    public async Task CoexistPasteAsync(IntPtr qqHwnd, string imagePath, bool restoreClipboard = true)
+    public async Task<bool> CoexistPasteAsync(IntPtr qqHwnd, string imagePath, bool restoreClipboard = true)
     {
         ClipboardCapture.Suppress = true;
         try
@@ -93,13 +93,46 @@ public class WindowService
             SetForegroundWindow(qqHwnd);
             await Task.Delay(150);
 
+            // 1.5 旧版先收起 QQ 原生面板再点编辑框：这代 QQ 的面板光灭回收会把焦点从编辑框
+            // 抢回表情按钮（2026-10-04 实测：编辑框点击后 35ms 焦点即被抢回，Ctrl+V 落空）——
+            // 先关面板就没有光灭，编辑框焦点稳。新版 QQ 光灭不抢焦点，保持原时序。
+            if (QqPanelWatcher.LegacyScanMode)
+            {
+                bool invoked = QqPanelWatcher.TryCloseQqPanelNow();
+                QqPanelWatcher.Log(invoked ? "coexist: qq panel closed before editor focus" : "coexist: qq panel not open/closable, continue");
+                // 等 QQ 收面板的焦点编排平息：QQ 会在 ~0.8s 内连续回摆焦点（按钮→标签→编辑框→
+                // 按钮，实测 18:23），过早点编辑框会被随后的回摆覆盖——表情不落框的根因。
+                // 以"QQ 焦点事件静默 300ms"为准，上限 1.5s，之后留 120ms 余量。
+                var waitStart = Environment.TickCount64;
+                while (Environment.TickCount64 - waitStart < 1500 && !QqPanelWatcher.QqFocusQuiescent(300))
+                    await Task.Delay(60);
+                await Task.Delay(120);
+                QqPanelWatcher.Log($"coexist: focus choreography settled in {Environment.TickCount64 - waitStart} ms");
+            }
+
             // 2. 焦点还给聊天输入框：只允许真实鼠标点击（IME 安全）。定位串失配时退化为窗口相对启发点，
             //    仍然是真实点击——绝不退回 UIA SetFocus（会毒化搜狗候选框锚定且不可自愈）
             bool clicked = await Task.Run(() => TryClickFocusEditor(qqHwnd));
-            QqPanelWatcher.Log(clicked ? "focus: editor clicked (IME-safe)" : "focus: click paths exhausted, pasting anyway");
+            QqPanelWatcher.Log(clicked ? "focus: editor clicked (IME-safe)" : "focus: click paths exhausted (gate on pre-paste focus check)");
+            if (!clicked && QqPanelWatcher.LegacyScanMode)
+            {
+                // legacy：编辑框焦点找回失败 = 插入符没回到输入框（粘贴必落空或错位）。
+                // 宁可取消并提示，不静默粘到按钮/面板上（用户实测"焦点不回输入框，表情没上屏"）
+                QqPanelWatcher.Log("send aborted: editor focus not restored (no caret)");
+                return false;
+            }
             await Task.Delay(250);
 
-            if (!await TryCopyFileToClipboardAsync(imagePath)) return;
+            // 2.5 粘贴前最后闸门：Ctrl+V 永远落在本时刻的键盘焦点窗口上。前面校验+等待的秒级空档里
+            // 用户切走窗口的话，粘贴会打进别的应用（2026-10-04 实测：发送卡顿期间切窗，表情进了其他软件）。
+            // 此时剪贴板尚未写入，取消发送零副作用——错发到别的应用比不发严重得多。
+            if (!FocusRootIsQq(qqHwnd))
+            {
+                QqPanelWatcher.Log("send aborted before paste: keyboard focus left QQ");
+                return false;
+            }
+
+            if (!await TryCopyFileToClipboardAsync(imagePath)) return true; // 复制失败：未粘贴，无错发风险
 
             SimulateCtrlV();
 
@@ -114,6 +147,7 @@ public class WindowService
             });
 
             await RestoreClipboardAfterDelayAsync(backup);
+            return true;
         }
         finally { ClipboardCapture.Suppress = false; }
     }
@@ -129,8 +163,25 @@ public class WindowService
     /// </summary>
     private static bool TryClickFocusEditor(IntPtr qqHwnd)
     {
-        // ① UIA 精确定位
-        var editor = FindEditorElement(qqHwnd);
+        // ⓪ legacy：优先用焦点事件缓存的输入框矩形（免费且精确——用户点过/编辑过输入框即有缓存）。
+        //    剪枝树上 UIA 定位全树扫 ~0.8s、窗口几何启发点随布局可能落偏，都是"焦点不回输入框"的祸源。
+        if (QqPanelWatcher.LegacyScanMode && QqPanelWatcher.TryGetCachedEditorRect(qqHwnd, out var cachedEditor))
+        {
+            try
+            {
+                var editorPt = new NativePoint
+                {
+                    X = (int)(cachedEditor.Left + cachedEditor.Width / 2),
+                    Y = (int)(cachedEditor.Bottom - Math.Min(25, cachedEditor.Height / 4))
+                };
+                if (IsPointOnQq(editorPt, qqHwnd) && SendClickAndVerify(editorPt, qqHwnd)) return true;
+            }
+            catch { /* 缓存矩形失效（窗口变动/元素重建），走下面的通用路径 */ }
+        }
+
+        // ① UIA 精确定位。旧版剪枝树跳过：全树扫描实测 ~0.8s（2026-10-04 发送卡顿主项之一），
+        //    且剪枝树上元素矩形本身不可靠——直接走窗口几何启发点（输入区恒在窗口右下）。
+        var editor = QqPanelWatcher.LegacyScanMode ? null : FindEditorElement(qqHwnd);
         if (editor != null)
         {
             try
@@ -156,7 +207,11 @@ public class WindowService
             catch { /* 编辑器元素中途失效，走启发点 */ }
         }
 
-        // ② 窗口相对启发点（NTQQ 输入区恒在窗口右下，且多显示器/缩放下 UIA 物理矩形本身可靠）
+        // ② 窗口相对启发点（NTQQ 输入区恒在窗口右下，且多显示器/缩放下 UIA 物理矩形本身可靠）。
+        // 旧版剪枝树直接用真实点击（跳过隐形消息点击）：投递的鼠标消息在这代 Chromium 上不迁移
+        // 键盘焦点、也不触发 QQ 面板光灭（2026-10-04 实测：焦点根窗口校验通过但焦点仍停在面板
+        // 标签上，Ctrl+V 落空）——真实点击是 IME 安全的金标准，物理点击必然迁移焦点+放置插入符，
+        // 顺带光灭 QQ 原生面板，代价只是光标瞬移一下（现有兜底本就接受）。
         if (GetWindowRect(qqHwnd, out var wr) && wr.R - wr.L > 200)
         {
             var pt = new NativePoint
@@ -166,8 +221,15 @@ public class WindowService
             };
             if (IsPointOnQq(pt, qqHwnd))
             {
-                if (MessageClickAndVerify(pt, qqHwnd)) return true;
-                if (SendClickAndVerify(pt, qqHwnd)) return true;
+                if (QqPanelWatcher.LegacyScanMode)
+                {
+                    if (SendClickAndVerify(pt, qqHwnd)) return true;
+                }
+                else
+                {
+                    if (MessageClickAndVerify(pt, qqHwnd)) return true;
+                    if (SendClickAndVerify(pt, qqHwnd)) return true;
+                }
             }
         }
 
@@ -201,13 +263,14 @@ public class WindowService
             }
             IntPtr lp = MakeLParam(clientPt.X, clientPt.Y);
 
+            long clickAt = Environment.TickCount64;
             PostMessage(target, WM_MOUSEMOVE, IntPtr.Zero, lp);
             Thread.Sleep(30);
             PostMessage(target, WM_LBUTTONDOWN, new IntPtr(MK_LBUTTON), lp);
             Thread.Sleep(40);
             PostMessage(target, WM_LBUTTONUP, IntPtr.Zero, lp);
 
-            bool verified = PollFocusVerified(qqHwnd, out bool focusInQq);
+            bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, clickAt);
             GetCursorPos(out var after);
             if (verified)
             {
@@ -227,17 +290,20 @@ public class WindowService
     private static bool SendClickAndVerify(NativePoint pt, IntPtr qqHwnd)
     {
         GetCursorPos(out var saved);
+        long clickAt = Environment.TickCount64;
         SendClickAt(pt);
         SetCursorPos(saved.X, saved.Y);
-        bool verified = PollFocusVerified(qqHwnd, out bool focusInQq);
-        return verified || focusInQq;
+        bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, clickAt);
+        // legacy：焦点根==QQ 不再单独作为通过条件——焦点停在表情按钮/面板标签上时同样成立，
+        // 正是"表情没上屏"的形态。必须有"晚于本次点击"的编辑框回声（PollFocusVerified legacy 分支）。
+        return QqPanelWatcher.LegacyScanMode ? verified : (verified || focusInQq);
     }
 
     // 轮询焦点校验：确认到编辑器即成功；没确认到但键盘焦点已在 QQ 窗口内也信任点击
     // （插入符在点击瞬间已由 Chromium 放置，UIA 读数只是滞后）；焦点彻底不在 QQ 才判失败
     private static int waitedLog;
 
-    private static bool PollFocusVerified(IntPtr qqHwnd, out bool focusInQq)
+    private static bool PollFocusVerified(IntPtr qqHwnd, out bool focusInQq, long echoAfterTicks = 0)
     {
         focusInQq = false;
         for (int waited = 0; waited < 600; waited += 100)
@@ -253,12 +319,32 @@ public class WindowService
                 }
             }
             catch { }
+            // 旧版剪枝树：FocusedElement 类名不可读（实测只回窗口根）、系统 caret 恒为零值
+            // （Chromium 这代不维护），两者都做不了正向证据。有效信号是 watcher 的"编辑框焦点
+            // 回声"：必须晚于本次点击的派发时刻——QQ 收面板编排也会产生编辑框形态的焦点事件，
+            // 不加此时效会把陈旧回声错当本次点击的成果（实测 18:23 假通过→粘贴落空）。
+            if (QqPanelWatcher.LegacyScanMode && FocusRootIsQq(qqHwnd)
+                && QqPanelWatcher.EditorFocusEchoTicks() > echoAfterTicks)
+            {
+                waitedLog = waited + 100;
+                return true;
+            }
         }
         waitedLog = 600;
-        var gui = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
-        GetGUIThreadInfo(0, ref gui);
-        focusInQq = gui.hwndFocus != IntPtr.Zero && GetAncestor(gui.hwndFocus, GA_ROOT) == qqHwnd;
+        focusInQq = FocusRootIsQq(qqHwnd);
         return false;
+    }
+
+    /// <summary>键盘焦点所在的根窗口是否为 qqHwnd（GUITHREADINFO，本地调用零跨进程成本）。</summary>
+    private static bool FocusRootIsQq(IntPtr qqHwnd)
+    {
+        try
+        {
+            var gui = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+            GetGUIThreadInfo(0, ref gui);
+            return gui.hwndFocus != IntPtr.Zero && GetAncestor(gui.hwndFocus, GA_ROOT) == qqHwnd;
+        }
+        catch { return false; }
     }
 
     // 点击点是否落在 QQ 自己的顶层窗口上（被别的窗挡住就点不得）

@@ -2151,9 +2151,17 @@ public class MainViewModel : ViewModelBase
         // 面板会滞留秒级（2026-10-01 用户实测）
         QuickPanelSendInitiated?.Invoke(this, EventArgs.Empty);
         var coexistTarget = _coexistTargetHwnd;
-        await ExecuteSendCoreAsync(s, path => coexistTarget != IntPtr.Zero
-            ? _windowService.CoexistPasteAsync(coexistTarget, path, RestoreClipboardAfterSend)
-            : _windowService.QuickPasteToForegroundAsync(path, RestoreClipboardAfterSend));
+        await ExecuteSendCoreAsync(s, async path =>
+        {
+            if (coexistTarget == IntPtr.Zero)
+            {
+                await _windowService.QuickPasteToForegroundAsync(path, RestoreClipboardAfterSend);
+                return;
+            }
+            // CoexistPasteAsync 返回 false = 粘贴前焦点已离开 QQ 被闸门拦下（宁可不发也不错发）
+            bool sent = await _windowService.CoexistPasteAsync(coexistTarget, path, RestoreClipboardAfterSend);
+            if (!sent) StatusText = "发送已取消：粘贴前焦点已切离 QQ（防止表情误发到其他窗口）";
+        });
     }
 
     private async Task ExecuteSendCoreAsync(StickerModel s, Func<string, Task> send)
