@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Windows.Threading;
 
 namespace OICQStickerManager.Services;
 
@@ -30,7 +31,6 @@ internal sealed class BlurTile : IDisposable
         DwmExtendFrameIntoClientArea(hwnd, ref margins);
         tile._rounded = round;
         if (round) tile.ApplyRounding();
-        tile.ApplyAccent();
         return tile;
     }
 
@@ -51,6 +51,8 @@ internal sealed class BlurTile : IDisposable
     private bool _shown;
     private bool _accentOn;
     private bool _rounded;
+    private bool _firstShowPending = true;
+    private DispatcherTimer? _firstShowTimer;
 
     public void Show(bool visible)
     {
@@ -63,6 +65,7 @@ internal sealed class BlurTile : IDisposable
             // 显示与重涂同一次调度内完成，赶在 DWM 合成下一帧之前，不留黑帧
             ShowWindow(_hwnd, SW_SHOWNA);
             ApplyAccent();
+            ArmFirstShowReassert();
         }
         else
         {
@@ -94,7 +97,32 @@ internal sealed class BlurTile : IDisposable
         {
             _shown = true;
             ApplyAccent(); // 同上：SWP_SHOWWINDOW 会重置 accent，必须显示后立即重涂
+            ArmFirstShowReassert();
         }
+    }
+
+    /// <summary>
+    /// 首次显示后补一轮 Clear→Apply（等价于事后跑一遍「最小化/恢复」周期）。
+    /// 症状：第一次唤出窗口常「有透明无模糊」，最小化再恢复即愈，此后不再犯——
+    /// 拼片是全新窗口时，显示帧同拍涂的 accent 对 DWM 不构成状态变化，且窗口尚无
+    /// 合成表面，模糊管线不建图；hide(Clear)→show(Apply) 的状态翻转才强制重算。
+    /// 100ms 后 DWM 必已完成数帧合成，届时翻一轮状态必出模糊；若首轮 accent 已生效，
+    /// Clear 与 Apply 同调度背靠背，DWM 合成不到中间态，无可见闪变。
+    /// </summary>
+    private void ArmFirstShowReassert()
+    {
+        if (!_firstShowPending) return;
+        _firstShowPending = false;
+        _firstShowTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+        _firstShowTimer.Tick += (_, _) =>
+        {
+            _firstShowTimer?.Stop();
+            _firstShowTimer = null;
+            if (!_shown) return; // 已被藏起：隐藏路径本就 Clear 过，下轮显示自然重涂
+            ClearAccent();
+            ApplyAccent();
+        };
+        _firstShowTimer.Start();
     }
 
     /// <summary>
@@ -169,6 +197,8 @@ internal sealed class BlurTile : IDisposable
 
     public void Dispose()
     {
+        _firstShowTimer?.Stop();
+        _firstShowTimer = null;
         if (_hwnd != IntPtr.Zero)
         {
             DestroyWindow(_hwnd);
