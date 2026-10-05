@@ -1280,6 +1280,11 @@ public class QqPanelWatcher : IDisposable
     private static long _lastMouseDownTicks;     // 钩子记录的全局最近一次左键按下时刻：焦点兜底路径把焦点信号和真实点击对上号
     private static POINT _lastMouseDownPt;
     private static long _lastHookFireTicks;      // 钩子最近一次乐观开/关触发时刻：焦点路径据此识别"本次点击钩子已处理"，不重复发事件
+    // 快捷面板「共存模式可见」镜像（QuickPanelWindow 在 UI 线程经 IsVisibleChanged 维护，钩子线程只读）：
+    // 钩子判断开/关不能只看 _panelOpen——QQ 面板出现要等 mouse-up 后 UIA 扫描确认（几十~几百 ms），
+    // 快速双击的第二下常落在确认之前，_panelOpen 仍为 false，会误走乐观打开分支把面板又"开"一遍；
+    // 此时共存面板明明已经显示着，物理点击就是 toggle 关闭（2026-10-05 用户实测"双击后面板很久不收"）。
+    internal static int CoexistPanelShowing; // 0/1，经 Volatile.Read/Write 跨线程访问
     private IntPtr _mouseHook;
     private readonly LowLevelMouseProc _mouseHookProc; // 必须持有委托强引用，否则 GC 回收后钩子回调访问已释放 thunk → 闪退
     private Thread? _hookThread;
@@ -1596,13 +1601,16 @@ public class QqPanelWatcher : IDisposable
                         _emojiBtnRect = rectNow; // 跟随窗口当前位置刷新：合成锚点/close-q 点按不再陈旧
                         if (_legacyMode)
                         {
-                            if (_panelOpen)
+                            if (_panelOpen || Volatile.Read(ref CoexistPanelShowing) == 1)
                             {
                                 // 旧版语义：面板开着时点按钮 = toggle 关闭。锚 TTL 砍到关闭证据级并保持尾迹，
                                 // 让"开着"状态尽快解除（否则无轮询/无事件时过期永不被发现，状态卡死，
                                 // 后续点击全部被乐观路径的 !_panelOpen 挡住——实测正是"再点没反应"的成因）。
                                 // mouseup 也落在按钮内（完整点击）→ 乐观关闭立即收起快捷面板（不等 TTL）；
                                 // 回声抑制窗防止这次 mousedown 的焦点事件把状态翻回"开"。
+                                // 判据并上 CoexistPanelShowing：快速双击的第二下常落在 _panelOpen 的 UIA
+                                // 确认之前，此时共存面板已显示，物理点击就是 toggle，再走乐观打开会
+                                // 把面板重新锚定、随后又无人关闭（2026-10-05 "双击后面板很久不收"）。
                                 _legacyOpenTtlMs = LegacyCloseEvidenceTtlMs;
                                 _legacyTabShownTicks = Environment.TickCount64;
                                 _legacyAnchorRect = new Rect(s.pt.X - 16, s.pt.Y - 16, 32, 32);
@@ -1637,11 +1645,13 @@ public class QqPanelWatcher : IDisposable
                                 _ = VerifyWithOpenRetriesAsync();
                             }
                         }
-                        else if (_panelOpen)
+                        else if (_panelOpen || Volatile.Read(ref CoexistPanelShowing) == 1)
                         {
                             // 新版 toggle 关闭：QQ 在 mouse-up 才动作，先记 pending 等 mouseup 也落在
                             // 按钮上（完整点击）再乐观关闭——按住拖走（aborted click）QQ 不 toggle。
                             // 按下即武装尾迹：拖走导致的真实关闭、或乐观关闭误判，都在 ~100ms 内被校正。
+                            // 判据并上 CoexistPanelShowing：快速双击的第二下常落在 _panelOpen 的 UIA
+                            // 确认之前，共存面板已显示时物理点击就是 toggle（同旧版分支注释）。
                             _closePending = true;
                             Volatile.Write(ref _lastHookFireTicks, Environment.TickCount64);
                             BumpUserAction();

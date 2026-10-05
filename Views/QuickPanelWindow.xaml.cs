@@ -46,7 +46,15 @@ namespace OICQStickerManager.Views
             DataContext = viewModel;
 
             // 面板隐藏/关闭时停掉格子内 GIF 动画（Hide 不触发 Unloaded，动画会在幕后空转耗 CPU）
-            IsVisibleChanged += (_, e) => { if (!(bool)e.NewValue) StopPanelGifAnimation(); };
+            // 可见性同时镜像给 QqPanelWatcher.CoexistPanelShowing：鼠标钩子在后台线程判断
+            // 表情按钮点击是开是关，只读这个 int（依赖属性不能跨线程读）。CoexistMode 的赋值
+            // 都发生在 Show 之前（OpenForCoexist/OpenNearCursorCore），镜像不会漏记模式。
+            IsVisibleChanged += (_, e) =>
+            {
+                Volatile.Write(ref QqPanelWatcher.CoexistPanelShowing,
+                    (bool)e.NewValue && _coexistMode ? 1 : 0);
+                if (!(bool)e.NewValue) StopPanelGifAnimation();
+            };
 
             _closeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(CloseGraceMs) };
             _closeTimer.Tick += CloseTimer_Tick;
@@ -334,6 +342,7 @@ namespace OICQStickerManager.Views
             _coexistMode = false;
             _pinned = pinned;
             _viewModel.SetQuickPanelCoexistTarget(IntPtr.Zero);
+            if (IsVisible) Volatile.Write(ref QqPanelWatcher.CoexistPanelShowing, 0);
 
             GetCursorPos(out var pt);
             IntPtr monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -351,6 +360,8 @@ namespace OICQStickerManager.Views
         {
             _coexistMode = true;
             _viewModel.SetQuickPanelCoexistTarget(qqHwnd);
+            // 已可见路径不触发 IsVisibleChanged（如热键面板转共存），镜像在此补记
+            if (IsVisible) Volatile.Write(ref QqPanelWatcher.CoexistPanelShowing, 1);
 
             IntPtr monitor = MonitorFromPoint(
                 new POINT { X = (int)(qqPanelRect.Left + qqPanelRect.Width / 2), Y = (int)(qqPanelRect.Top + qqPanelRect.Height / 2) },
