@@ -424,6 +424,8 @@ public class QqPanelWatcher : IDisposable
                         firstScan = false;
                         Log($"qq monitor active (pid=[{string.Join(',', pids)}], windows={windows.Count}, scan every 5s)");
                     }
+                    if (_legacyMode && windows.Count > 0)
+                        ProbeTreeLiveness();
                     if (fresh.Count > 0 || unsubscribed.Count > 0)
                         PruneSubscriptions();
                     knownPids = pids;
@@ -446,6 +448,65 @@ public class QqPanelWatcher : IDisposable
         catch { }
         _qqMonitorCts = null;
         _qqMonitorLoop = null;
+    }
+
+    // --- a11y 树休眠判定（剪枝树代专属兜底，基于触发链信号源的证据，零 UIA 调用）---
+
+    private const int LivenessActivityWindowMs = 60_000; // 活动窗：最近 60s 内有 QQ 焦点活动才参与判定（空闲不说话防误报）
+    private const int DormantLatchAfter = 2;             // 连续探测到无信号的次数：防单次抖动误报
+    private int _a11yDormantStreak;
+    private bool _a11yDormantAnnounced;
+    private long _lastLiveSignalTicks;                   // 最近一次「触发链信号源在场」时刻：按钮/标签命中或编辑框锚点 rectOk=True
+    private int _focusQualitySamples;                    // 焦点质量诊断采样计数（每实例前 3 条）
+
+    /// <summary>每 5s 基于"触发链信号源是否在场"判定 QQ 无障碍树是否休眠。判据与两侧实测对齐：
+    /// 激活树上表情按钮/面板标签的焦点命中与编辑框矩形（rectOk=True）都会出现；休眠树上焦点事件
+    /// 照常到达、窗口标题栏按钮（name=关闭等，无边框窗口的 HTML 标题栏）甚至也有名字有几何，
+    /// 但触发链依赖的 web 内容元素一个都不出现（2026-10-05 重启后冷启动 QQ 实测：矩形缓存
+    /// rectOk 恒 false、按钮命中为零，共存触发链死且零报错；WM_GETOBJECT warmup 在此状态
+    /// 不再能激活树）。活动窗内有焦点活动却无任何触发链信号 = 休眠：提示用户并绕过 60s 节流
+    /// 持续重发 warmup（SMTO_ABORTIFHUNG 500ms 封顶）；信号重现 = 恢复，自动解除提示。
+    /// 刻意不做任何 UIA 枚举：app 内跨进程 UIA 扫描在剪枝树激活态可阻塞数十秒并饿死
+    /// 焦点管线（版本闸门的成因），监控循环绝不能重蹈。</summary>
+    private void ProbeTreeLiveness()
+    {
+        var now = Environment.TickCount64;
+        var anyFocus = Volatile.Read(ref _lastQqFocusTicks);
+        var lastLive = Volatile.Read(ref _lastLiveSignalTicks);
+        if (anyFocus == 0 || now - anyFocus > LivenessActivityWindowMs)
+        {
+            _a11yDormantStreak = 0; // 活动窗内无 QQ 焦点活动：无法判定，保持沉默
+            return;
+        }
+        if (lastLive > 0 && now - lastLive <= LivenessActivityWindowMs)
+        {
+            if (_a11yDormantAnnounced)
+            {
+                Log("a11y tree recovered (trigger-chain signals present), coexist trigger re-enabled");
+                _status("QQ 表情面板联动已恢复");
+            }
+            _a11yDormantAnnounced = false;
+            _a11yDormantStreak = 0;
+            return;
+        }
+        // 有焦点活动、但活动窗内触发链信号源零出现 = 休眠证据
+        _a11yDormantStreak++;
+        List<IntPtr> targets;
+        lock (_gate) { targets = _subscribed.Keys.ToList(); }
+        foreach (var hwnd in targets) ForceWarmUp(hwnd);
+        if (_a11yDormantStreak >= DormantLatchAfter && !_a11yDormantAnnounced)
+        {
+            _a11yDormantAnnounced = true;
+            Log("a11y tree DORMANT (QQ focus events present but no trigger-chain signals): coexist trigger disabled until tree activates");
+            _status("QQ 无障碍树未激活：表情面板联动暂不可用（快捷键不受影响），恢复后会自动重新启用");
+        }
+    }
+
+    /// <summary>绕过 WarmUpAccessibility 的 60s 节流强制重发一次激活查询（仅休眠重试路径使用）。</summary>
+    private void ForceWarmUp(IntPtr hwnd)
+    {
+        lock (_gate) { _warmupTicks[hwnd] = 0; }
+        WarmUpAccessibility(hwnd);
     }
 
     /// <summary>QQ 版本早于 9.9.30 视为剪枝树代（9.9.19/9.9.21 实测剪枝；9.9.36 实测完整树）。</summary>
@@ -581,6 +642,11 @@ public class QqPanelWatcher : IDisposable
 
             Volatile.Write(ref _lastQqFocusTicks, Environment.TickCount64);
 
+            // 树活性证据（ProbeTreeLiveness 判据）由两处写入：按钮/标签命中（本分支顶部）与
+            // 编辑框锚点 rectOk=True（下方 editorConfirmed 块）。二者都要求真实 web 内容元素
+            // 在场——窗口标题栏按钮（name=关闭等，无边框窗口的 HTML 标题栏）在休眠树上同样
+            // 有名字有几何，不能当活性证据（2026-10-05 采样实证）。
+
             // 懒订阅：正在使用的 QQ 窗口补订结构变化事件（新开聊天窗口也由此覆盖）
             try
             {
@@ -594,9 +660,22 @@ public class QqPanelWatcher : IDisposable
 
             string name = SafeName(el);
             string cls = SafeClass(el);
+
+            // 诊断采样：每实例记录前 3 条 QQ 焦点事件的元素质量（名字/类名/是否带 HWND/矩形宽度）。
+            // 树休眠与激活的分辨现场就在这几条里（2026-10-05 树休眠事故的定位经验）。
+            if (_focusQualitySamples < 3)
+            {
+                _focusQualitySamples++;
+                int nhwnd = 0; double rw = -1;
+                try { nhwnd = el.Current.NativeWindowHandle; } catch { }
+                try { rw = el.Current.BoundingRectangle.Width; } catch { }
+                Log($"focus quality sample #{_focusQualitySamples}: name=\"{TruncateForLog(name)}\" cls=\"{TruncateForLog(cls)}\" hwndOwned={(nhwnd != 0)} rectW={rw:F0}");
+            }
+
             bool legacyTab = LegacyPanelTabNames.Contains(name.Trim());
             if (LooksLikeEmojiButton(name, cls) || legacyTab)
             {
+                Volatile.Write(ref _lastLiveSignalTicks, Environment.TickCount64); // 树活性证据：按钮/标签是真实 web 内容元素
                 Log($"focus hit emoji button (name={name}, class={cls}{(legacyTab ? ", legacy" : "")})");
 
                 // 缓存按钮矩形与宿主窗口：鼠标钩子的校验目标 + 乐观打开的合成锚点。
@@ -792,6 +871,8 @@ public class QqPanelWatcher : IDisposable
                         {
                             OptimisticClosePanel("focus hit chat editor (light-dismiss)");
                         }
+
+                        if (rectOk) Volatile.Write(ref _lastLiveSignalTicks, Environment.TickCount64); // 树活性证据：编辑框元素矩形可读 = web 内容在场
 
                         _editorHwnd = eroot;
                         _editorPid = pid;
