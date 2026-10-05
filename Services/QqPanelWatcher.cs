@@ -799,9 +799,19 @@ public class QqPanelWatcher : IDisposable
                         // 光灭乐观关闭：面板开着时焦点进编辑区 = 用户点了输入框、QQ 已收面板。
                         // 距面板打开 <1.5s 内不判：QQ 开面板的焦点编排也会路过编辑区形态的
                         // 空 cls 元素（18:23 实测 667ms 处假关闭→闪烁重开），窗口期内交给锚 TTL。
+                        // 但"交给锚 TTL"依赖后续 UIA 事件驱动时间窗确认——保护窗内点输入框后焦点
+                        // 不再变化、结构事件也可能断供，面板要等锚 TTL 过期才收（2026-10-05 实测
+                        // 可滞留数十秒，用户报"点输入框快捷面板不收"）。回声与真实点击可区分：
+                        // 回声没有物理点击，或点击还落在表情按钮上；真实编辑框点击就发生在此时
+                        // （≤400ms）且落在按钮下方的编辑区——钩子全局记录了每次 mousedown，
+                        // 判据成立立即乐观关闭，不依赖任何后续事件，防闪烁价值不丢。
                         if (_panelOpen && Environment.TickCount64 - _lastPanelAppearedTicks > OpenChoreographyGuardMs)
                         {
                             OptimisticClosePanel("focus hit chat editor (light-dismiss)");
+                        }
+                        else if (_panelOpen && EditorClickJustNow(eroot))
+                        {
+                            OptimisticClosePanel("focus hit chat editor (light-dismiss within guard, editor clicked)");
                         }
 
                         _editorHwnd = eroot;
@@ -876,6 +886,24 @@ public class QqPanelWatcher : IDisposable
     {
         Interlocked.Exchange(ref _lastVerifyRanTicks, Environment.TickCount64);
         CheckNow();
+    }
+
+    /// <summary>
+    /// 刚刚（≤400ms）发生过落在编辑区的物理点击？用于保护窗内编辑区光灭的判别：
+    /// 开面板编排回声要么没有伴随点击，要么点击还在表情按钮上（那是开面板动作）；
+    /// 只有真实点击输入框才会在焦点事件前一刻留下按钮下方编辑区里的 mousedown。
+    /// 几何判据与编辑区证据同款（底半区 + 表情按钮下方 +10px 容差）。
+    /// </summary>
+    private bool EditorClickJustNow(IntPtr editorRoot)
+    {
+        var downTicks = Volatile.Read(ref _lastMouseDownTicks);
+        var age = downTicks == 0 ? long.MaxValue : Environment.TickCount64 - downTicks;
+        if (editorRoot == IntPtr.Zero || !GetWindowRect(editorRoot, out var gwr)) return false;
+        var pt = _lastMouseDownPt;
+        bool inWin = pt.X >= gwr.Left && pt.X < gwr.Right && pt.Y >= gwr.Top && pt.Y < gwr.Bottom;
+        bool bottomHalf = pt.Y > gwr.Top + (gwr.Bottom - gwr.Top) * 0.55;
+        bool belowBtn = !(_emojiBtnRect.Width > 0 && pt.Y <= _emojiBtnRect.Bottom + 10);
+        return age <= 400 && inWin && bottomHalf && belowBtn;
     }
 
     private async Task VerifyWithOpenRetriesAsync()
