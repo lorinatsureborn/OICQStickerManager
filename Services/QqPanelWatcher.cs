@@ -132,6 +132,7 @@ public class QqPanelWatcher : IDisposable
     {
         _status = status;
         _mouseHookProc = MouseHookProc; // 提前物化并终身持有，防止钩子委托被 GC 回收
+        EmojiButtonTemplate.LogSink = Log; // 像素回退的采集/匹配诊断汇入同一份 asuka-watcher.log
         _active = this;
     }
 
@@ -455,7 +456,7 @@ public class QqPanelWatcher : IDisposable
     private const int LivenessActivityWindowMs = 60_000; // 活动窗：最近 60s 内有 QQ 焦点活动才参与判定（空闲不说话防误报）
     private const int DormantLatchAfter = 2;             // 连续探测到无信号的次数：防单次抖动误报
     private int _a11yDormantStreak;
-    private bool _a11yDormantAnnounced;
+    private volatile bool _a11yDormantAnnounced; // monitor 线程写、钩子线程读（像素回退的资格审查）
     private long _lastLiveSignalTicks;                   // 最近一次「触发链信号源在场」时刻：按钮/标签命中或编辑框锚点 rectOk=True
     private int _focusQualitySamples;                    // 焦点质量诊断采样计数（每实例前 3 条）
 
@@ -705,6 +706,9 @@ public class QqPanelWatcher : IDisposable
                             _emojiBtnPid = pid;
                             _emojiBtnRectRel = ToWindowRelative(topHwnd, br);
                             Log($"button rect cached {br} rel={_emojiBtnRectRel} hwnd={topHwnd}");
+                            // 顺带采集像素模板（休眠回退弹药，后台、每 DPI 缩放只存一份）：
+                            // 下一次 QQ 冷启动若树休眠（外部无法激活，讲述人都无效），钩子靠它识别按钮
+                            _ = Task.Run(() => EmojiButtonTemplate.CaptureFromScreen(topHwnd, br, FeedbackService.GetQqVersion()));
                         }
                     }
                     catch { }
@@ -1747,6 +1751,14 @@ public class QqPanelWatcher : IDisposable
                             _ = VerifyWithOpenRetriesAsync();
                         }
                     }
+                    else if (PixelFallbackEligible(s.pt))
+                    {
+                        // a11y 树休眠回退（2026-10-05 冷启动实证：QQ 9.9.21 的渲染器树外部无法激活，
+                        // 焦点命中永不出现、按钮矩形缓存永远建不起来）。钩子线程只做廉价资格审查，
+                        // 截屏 + 模板匹配放后台——LL 钩子回调里任何慢操作都会拖累全系统鼠标。
+                        var ptPx = s.pt;
+                        Task.Run(() => PixelFallbackOpen(ptPx));
+                    }
                 }
                 else if (msg == WM_LBUTTONUP && _closePending)
                 {
@@ -1761,6 +1773,82 @@ public class QqPanelWatcher : IDisposable
             catch { }
         }
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+    }
+
+    // --- a11y 树休眠回退：像素模板识别表情按钮（配套 Services/EmojiButtonTemplate.cs）---
+
+    private int _pixelWorker;        // 防重入：上一次匹配未完成时丢弃新触发（点击间隔远大于匹配耗时）
+    private bool _pixelFallbackOpenedLogged;
+    private long _pixelMissLogTicks; // 未命中日志节流：休眠期用户在 QQ 里每一下点击都会跑匹配，不能刷屏
+
+    /// <summary>钩子线程的廉价资格审查（零 UIA 零 GDI）：剪枝树代 + 常规几何缓存接不住 + 点击落在 QQ 窗口。
+    /// 不等休眠闩（那要焦点事件+2 轮探测 ~10s，冷启动第一击会落空）——模板匹配本身就是
+    /// "点了表情按钮"的充分证据（--pixel-selftest 校准：按钮 ±6px 全 0 差，相邻图标 17+ 拒绝），
+    /// 与焦点兜底路径的并发由 HookCoveredLastMouseDown 现有守卫吸收。
+    /// 模板缺失/缩放不符时 Available=false，行为与无回退时完全一致。</summary>
+    private bool PixelFallbackEligible(POINT pt)
+    {
+        if (!_legacyMode) return false;
+        if (!EmojiButtonTemplate.Available) return false;
+        if (_emojiBtnHwnd != IntPtr.Zero && TryResolveEmojiButtonRect(out _)) return false; // 树恢复或上次像素匹配已重建缓存：常规三重校验路径接住
+        if (_qqPids.Count == 0) return false;
+        var root = RootWindowFromPoint(pt);
+        if (root == IntPtr.Zero) return false;
+        GetWindowThreadProcessId(root, out var pid);
+        return _qqPids.Contains((int)pid);
+    }
+
+    /// <summary>休眠回退的打开路径（后台线程）：点击点邻域模板匹配 → 重建按钮几何缓存（与焦点命中
+    /// 路径同一组字段、同一写序）→ 复用钩子旧版乐观打开链路（锚/尾迹/验证/事件逐行同构）。
+    /// 不进 UIA：一次 GDI 屏幕读取（模板+2×半径 见方）+ 有早退的 SAD 搜索，毫秒级。</summary>
+    private void PixelFallbackOpen(POINT pt)
+    {
+        if (Interlocked.Exchange(ref _pixelWorker, 1) == 1) return;
+        try
+        {
+            var root = RootWindowFromPoint(pt); // 重新解析：距 mousedown 已流逝数十毫秒，窗口可能已变
+            if (root == IntPtr.Zero) return;
+            GetWindowThreadProcessId(root, out var pid);
+            if (!_qqPids.Contains((int)pid)) return;
+            if (!EmojiButtonTemplate.TryMatch(pt.X, pt.Y, root, out var rect))
+            {
+                var now = Environment.TickCount64;
+                if (now - Volatile.Read(ref _pixelMissLogTicks) > 5000)
+                {
+                    Volatile.Write(ref _pixelMissLogTicks, now);
+                    Log($"pixel fallback: no template match near ({pt.X},{pt.Y})");
+                }
+                return;
+            }
+            _emojiBtnRect = rect;
+            _emojiBtnHwnd = root;
+            _emojiBtnPid = (int)pid;
+            _emojiBtnRectRel = ToWindowRelative(root, rect);
+            // —— 以下与 MouseHookProc 旧版乐观打开分支逐行同构 ——
+            _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
+            _legacyTabShownTicks = Environment.TickCount64;
+            _legacyTabHwnd = root;
+            _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
+            var crect = _lastPanelRectHwnd == root ? _lastPanelRect : Rect.Empty;
+            _optimisticPending = true;
+            ArmTailVerify();
+            BumpUserAction();
+            Volatile.Write(ref _lastHookFireTicks, Environment.TickCount64);
+            Log($"pixel fallback: emoji button matched rect={rect}, optimistic open (pixel anchor, a11y-independent)");
+            Task.Run(() =>
+            {
+                try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(root, crect, rect)); }
+                catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
+            });
+            _ = VerifyWithOpenRetriesAsync();
+            if (!_pixelFallbackOpenedLogged)
+            {
+                _pixelFallbackOpenedLogged = true;
+                _status("QQ 无障碍树未激活：已启用像素识别维持表情面板联动");
+            }
+        }
+        catch (Exception ex) { Log("pixel fallback error: " + ex.Message); }
+        finally { Volatile.Write(ref _pixelWorker, 0); }
     }
 
     [DllImport("user32.dll", SetLastError = true)]
