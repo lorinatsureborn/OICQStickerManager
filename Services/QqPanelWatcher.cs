@@ -741,45 +741,45 @@ public class QqPanelWatcher : IDisposable
                     return;
                 }
 
-                // 旧版 NTQQ 兜底锚：命中即刷新锚 + 按证据强度分级 TTL（见各分支注释）。
+                // 旧版 NTQQ 兜底锚：按证据强度分级 TTL（见各分支注释）。
                 // TAB 命中=面板确实开着（长 TTL）；BUTTON 命中=开/关动作（关闭证据=短 TTL，
                 // 打开证据=长 TTL 等 TAB 续期，防状态卡死/闪烁重开）。
+                // 打开证据必须由真实点击造成：窗口从最小化恢复/切回时 Chromium 会把旧焦点
+                // 原样送回表情按钮（2026-10-05 实测：restore 即弹面板，日志无任何钩子点击），
+                // 这种非点击命中若刷新锚/时间戳，轮询与验证会立即把面板报出来——故面板关着
+                // 且无点击证据的按钮命中只记元素引用，不碰任何锚状态。
                 _legacyTabElement = el;
                 _legacyTabHwnd = GetTopWindowHwnd(el);
-                _legacyTabShownTicks = Environment.TickCount64;
                 if (legacyTab)
                 {
+                    _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyTabHitTtlMs;
+                    // TAB 在面板内部，其矩形会把快捷面板带进面板里，锚保留光标近似。
+                    TrySetLegacyAnchorFromCursor();
                 }
                 else if (_panelOpen)
                 {
                     // 面板开着时焦点落回按钮 = toggle 关闭证据：短 TTL 并启动尾迹验证，
                     // 否则无轮询/无事件时过期永不被发现（实测"关了以后再点没反应"的成因之一）。
+                    _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyCloseEvidenceTtlMs;
+                    if (_emojiBtnRect.Width > 0) _legacyAnchorRect = _emojiBtnRect;
+                    else TrySetLegacyAnchorFromCursor();
                     ArmTailVerify();
                 }
-                else
+                else if (FocusPathClickIsOnButton())
                 {
-                    // 焦点落到按钮（面板关着）= 用户刚点了按钮、面板正在打开：与钩子打开同级的
-                    // 打开证据，用长 TTL 等 TAB 续期（短 TTL 会在 TAB 迟到时误判关闭→闪烁重开）
+                    // 焦点落到按钮（面板关着）且确由点击造成（≤250ms 内落在重算后按钮矩形上的
+                    // mousedown，与下方焦点兜底开面板同源）= 用户刚点了按钮、面板正在打开：
+                    // 与钩子打开同级的打开证据，用长 TTL 等 TAB 续期（短 TTL 会在 TAB 迟到时
+                    // 误判关闭→闪烁重开）。锚直接用按钮矩形（精确、确定性；光标在合成点击/
+                    // 焦点事件异步处理时可能错位——实测 18:52 锚跑到 800px 外）。
+                    _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
+                    if (_emojiBtnRect.Width > 0) _legacyAnchorRect = _emojiBtnRect;
+                    else TrySetLegacyAnchorFromCursor();
                 }
-                // 锚矩形：BUTTON 命中直接用按钮矩形（精确、确定性；光标在合成点击/焦点事件
-                // 异步处理时可能错位——实测 18:52 锚跑到 800px 外）；TAB 命中在面板内部，
-                // 其矩形会把快捷面板带进面板里，保留光标近似。
-                if (!legacyTab && _emojiBtnRect.Width > 0)
-                {
-                    _legacyAnchorRect = _emojiBtnRect;
-                }
-                else
-                {
-                    try
-                    {
-                        if (GetCursorPos(out var pt))
-                            _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
-                    }
-                    catch { }
-                }
+                // else：非点击性按钮焦点（窗口恢复/切回/程序性聚焦）——不刷锚、不刷时间戳。
 
                 // 焦点事件是异步投递的——乐观打开主要由鼠标钩子在 mousedown 瞬间完成。这里只兜
                 // 钩子没覆盖住的点击：钩子已为本次 mousedown 触发过则跳过（重复事件只会让面板重定位）；
@@ -1574,6 +1574,17 @@ public class QqPanelWatcher : IDisposable
         if (!GetWindowRect(hwnd, out var wr)) return false;
         rect = new Rect(wr.Left + rel.Left, wr.Top + rel.Top, rel.Width, rel.Height);
         return true;
+    }
+
+    /// <summary>兜底锚退化为光标近似（按钮/TAB 矩形不可用时）：32x32 光标中心块。</summary>
+    private void TrySetLegacyAnchorFromCursor()
+    {
+        try
+        {
+            if (GetCursorPos(out var pt))
+                _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
+        }
+        catch { }
     }
 
     /// <summary>点击点是否真的落在（当前位置重算后的）表情按钮上：矩形包含 + 命中点的根窗口
