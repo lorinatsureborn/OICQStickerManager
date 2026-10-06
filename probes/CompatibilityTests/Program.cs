@@ -31,6 +31,11 @@ internal static class Program
         }
         if (args.Length == 3 && args[0] == "--exercise-qq-send" && long.TryParse(args[1], out var sendHost))
             return QqSendProbe.Run(new IntPtr(sendHost), args[2]);
+        if (args.Length == 2 && args[0] == "--benchmark-qq-queries" && long.TryParse(args[1], out var queryHost))
+        {
+            RunAsync(UiaIsolationTests.Benchmark(new IntPtr(queryHost)), 20000);
+            return 0;
+        }
         if (args.Length == 2 && args[0] == "--inspect-qq-database")
             return QqDatabaseProbe.Run(args[1]);
         if (args.Length == 2 && args[0] == "--inspect-qq-structure" && long.TryParse(args[1], out var hwnd))
@@ -144,6 +149,7 @@ internal static class Program
         if (args.Contains("--ai-only")) tests = AiTagTests.Cases.Concat(AiSecurityTests.Cases).Concat(AiUiTests.Cases).ToArray();
         if (args.Contains("--ai-security-only")) tests = AiSecurityTests.Cases.ToArray();
         if (args.Contains("--capability-only")) tests = CapabilityTests.Cases.ToArray();
+        if (args.Contains("--uia-only")) tests = UiaIsolationTests.Cases.ToArray();
         if (args.Contains("--qq-core-only")) tests = CoexistTests.Cases.Concat(SendTests.Cases).Concat(FocusSettlementTests.Cases).Concat(LifecycleTests.Cases).Concat(LegacyPanelTests.Cases).ToArray();
         if (args.Contains("--skip-key-bootstrap")) tests = tests.Where(t => t.Name != "Key helper bootstrap bypasses registry detection and quotes paths safely").ToArray();
         int failed = 0;

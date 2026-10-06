@@ -11,6 +11,8 @@ internal static class UiaIsolationTests
         ("A throwing status observer cannot stop UIA reclamation", () => Program.RunAsync(ThrowingStatusStillReclaims())),
         ("Worker responses publish state before completing correlated requests", () => Program.RunAsync(ResponsesPublishFirst())),
         ("A timed out UIA request reaps its worker", () => Program.RunAsync(RequestTimeoutReapsWorker())),
+        ("Editor and focus queries reuse the live isolated worker", () => Program.RunAsync(SendQueriesReuseWorker())),
+        ("A timed out send query reclaims its worker without starting another query", () => Program.RunAsync(SendQueryTimeoutReapsWorker())),
     ];
 
     internal static int Fixture(string mode)
@@ -24,6 +26,8 @@ internal static class UiaIsolationTests
                 Console.WriteLine(JsonSerializer.Serialize(new QqWorkerFrame
                 {
                     Kind = "response", Id = request.Id, Text = request.Command,
+                    Hwnd = request.Hwnd, Rect = request.Command == "editor" ? new(10, 20, 300, 80) : null,
+                    Value = request.Command == "focus",
                     State = new() { Generation = request.Generation }
                 }));
             }
@@ -121,6 +125,66 @@ internal static class UiaIsolationTests
         var stop = Stopwatch.StartNew();
         while (Alive(pid) && stop.ElapsedMilliseconds < 2000) await Task.Delay(10);
         Program.Require(response == null && !Alive(pid), "request timed out without reaping its worker");
+    }
+
+    private static async Task SendQueriesReuseWorker()
+    {
+        int launches = 0;
+        using var client = new QqUiaWorkerClient(() => { launches++; return Info("reply"); }, _ => { }, _ => { });
+        client.Start();
+        int pid = await StartedPid(client);
+        using var watcher = Attach(client);
+        var editor = await QqUiaWorker.QueryAsync("editor", new IntPtr(42));
+        var focus = await QqUiaWorker.QueryAsync("focus", new IntPtr(42));
+        Program.Require(editor?.Rect?.ToRect() == new System.Windows.Rect(10, 20, 300, 80)
+            && editor.Hwnd == 42 && focus?.Value == true && focus.Hwnd == 42,
+            "send queries did not use the correlated responses from the existing worker");
+        Program.Require(launches == 1 && client.ProcessId == pid && Alive(pid),
+            "send queries restarted the live worker");
+    }
+
+    private static async Task SendQueryTimeoutReapsWorker()
+    {
+        using var client = new QqUiaWorkerClient(() => Info("healthy"), _ => { }, _ => { });
+        client.Start();
+        int pid = await StartedPid(client);
+        using var watcher = Attach(client);
+        var response = await QqUiaWorker.QueryAsync("focus", new IntPtr(42), TimeSpan.FromMilliseconds(150));
+        var stop = Stopwatch.StartNew();
+        while (Alive(pid) && stop.ElapsedMilliseconds < 2000) await Task.Delay(10);
+        Program.Require(response == null && !Alive(pid),
+            "a send query bypassed the hung worker or started an unprotected fallback query");
+    }
+
+    private static QqPanelWatcher Attach(QqUiaWorkerClient client)
+    {
+        var watcher = new QqPanelWatcher(_ => { });
+        typeof(QqPanelWatcher).GetField("_worker", System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.NonPublic)!.SetValue(watcher, client);
+        return watcher;
+    }
+
+    internal static async Task Benchmark(IntPtr hwnd)
+    {
+        async Task Measure(string mode, string command)
+        {
+            var timer = Stopwatch.StartNew();
+            var result = await QqUiaWorker.QueryAsync(command, hwnd);
+            Console.WriteLine($"{mode} {command}: {timer.ElapsedMilliseconds}ms, response={result != null}, "
+                + $"editorRect={result?.Rect != null}, editorFocused={result?.Value == true}");
+            Program.Require(result != null && (command != "editor" || result.Rect != null), "QQ query did not return valid data");
+        }
+        foreach (var command in new[] { "editor", "focus", "editor", "focus" }) await Measure("one-shot", command);
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var client = new QqUiaWorkerClient(
+            () => QqUiaWorker.StartInfo("--qq-uia-worker", "False", Environment.ProcessId.ToString()),
+            line => { if (JsonSerializer.Deserialize<QqWorkerFrame>(line)?.Kind == "ready") ready.TrySetResult(); },
+            Console.WriteLine);
+        client.Start();
+        await ready.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        using var watcher = Attach(client);
+        await Measure("worker-first", "editor");
+        foreach (var command in new[] { "editor", "focus", "editor", "focus" }) await Measure("worker-warm", command);
     }
 
     private static async Task<int> StartedPid(QqUiaWorkerClient client)

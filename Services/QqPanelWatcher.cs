@@ -202,6 +202,8 @@ public class QqPanelWatcher : IDisposable
     // 当前活动实例：快捷面板共存发送后"同步关闭 QQ 原生面板"经此转发（2026-10-01 用户定案）
     private static QqPanelWatcher? _active;
 
+    internal static QqUiaWorkerClient? ActiveWorker => _active is { _disposed: false } watcher ? watcher._worker : null;
+
     internal static bool IsLegacyWindow(IntPtr hwnd)
     {
         GetWindowThreadProcessId(hwnd, out var pid);

@@ -8,7 +8,7 @@
 
 [English](README.en.md) | 简体中文
 
-`WPF` `.NET 10` `Windows 10/11` `v1.3.3`
+`WPF` `.NET 10` `Windows 10/11` `v1.3.4`
 
 </div>
 

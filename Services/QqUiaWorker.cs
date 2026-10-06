@@ -50,7 +50,7 @@ internal static class QqUiaWorker
                 QqWorkerFrame? request;
                 try { request = JsonSerializer.Deserialize<QqWorkerFrame>(line); } catch (JsonException) { continue; }
                 if (request == null) continue;
-                var response = new QqWorkerFrame { Kind = "response", Id = request.Id };
+                var response = new QqWorkerFrame { Kind = "response", Id = request.Id, Hwnd = request.Hwnd };
                 using (Lease(5000))
                 {
                     switch (request.Command)
@@ -65,6 +65,11 @@ internal static class QqUiaWorker
                             response.Value = true;
                             break;
                         case "verify": QqPanelWatcher.VerifyCoexist(new IntPtr(request.Hwnd)); response.Value = true; break;
+                        case "editor":
+                        case "focus":
+                            try { QueryEditorOrFocus(response, request.Command, new IntPtr(request.Hwnd)); }
+                            catch (Exception ex) { QqPanelWatcher.Log("worker UIA query failed: " + ex.GetType().Name); }
+                            break;
                         case "dump": await QqPanelWatcher.DumpDiagnosticsNowAsync().ConfigureAwait(false); response.Value = true; break;
                     }
                 }
@@ -89,6 +94,18 @@ internal static class QqUiaWorker
         QqWorkerFrame? result = null;
         try
         {
+            // Sending already has a recyclable UIA worker. Reuse it instead of
+            // paying .NET/WPF process startup for every editor/focus lookup.
+            // A timed-out worker is reclaimed by the client; do not start a
+            // second query while its UIA call may still be hung.
+            if (command is "editor" or "focus" && QqPanelWatcher.ActiveWorker is { } worker)
+            {
+                var response = await worker.RequestAsync(new()
+                {
+                    Kind = "request", Command = command, Hwnd = hwnd.ToInt64()
+                }, timeout ?? TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+                return response == null ? null : JsonSerializer.Deserialize<QqWorkerFrame>(response);
+            }
             var outcome = await ChildProcessRunner.RunAsync(StartInfo("--qq-uia-query", command, hwnd.ToInt64().ToString()),
                 timeout ?? TimeSpan.FromSeconds(command == "dump" ? 6 : 2), line =>
                 {
@@ -103,17 +120,26 @@ internal static class QqUiaWorker
     internal static async Task RunQueryAsync(string command, IntPtr hwnd)
     {
         Initialize(Environment.ProcessId);
-        var response = new QqWorkerFrame { Kind = "response" };
+        var response = new QqWorkerFrame { Kind = "response", Hwnd = hwnd.ToInt64() };
         switch (command)
         {
-            case "editor": response.Rect = PixelRect.From(FindEditorRect(hwnd)); break;
+            case "editor":
             case "focus":
-                var focused = AutomationElement.FocusedElement;
-                response.Value = focused != null && (focused.Current.ClassName ?? "").Contains("ExEditor-qq-msg-editor");
+                QueryEditorOrFocus(response, command, hwnd);
                 break;
             case "dump": await QqPanelWatcher.DumpDiagnosticsNowAsync().ConfigureAwait(false); response.Value = true; break;
         }
         Write(response);
+    }
+
+    private static void QueryEditorOrFocus(QqWorkerFrame response, string command, IntPtr hwnd)
+    {
+        if (command == "editor") response.Rect = PixelRect.From(FindEditorRect(hwnd));
+        else
+        {
+            var focused = AutomationElement.FocusedElement;
+            response.Value = focused != null && (focused.Current.ClassName ?? "").Contains("ExEditor-qq-msg-editor");
+        }
     }
 
     private static Rect FindEditorRect(IntPtr hwnd)
