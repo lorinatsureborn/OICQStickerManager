@@ -38,6 +38,21 @@ namespace OICQStickerManager
         {
             base.OnStartup(e);
 
+            // The same deployed executable hosts reclaimable, non-UI probe processes.
+            if (e.Args.Length == 3 && e.Args[0] == "--qq-uia-worker"
+                && bool.TryParse(e.Args[1], out var polling) && int.TryParse(e.Args[2], out var ownerPid))
+            {
+                QqUiaWorker.RunAsync(polling, ownerPid).GetAwaiter().GetResult();
+                Shutdown();
+                return;
+            }
+            if (e.Args.Length == 3 && e.Args[0] == "--qq-uia-query" && long.TryParse(e.Args[2], out var hwnd))
+            {
+                QqUiaWorker.RunQueryAsync(e.Args[1], new IntPtr(hwnd)).GetAwaiter().GetResult();
+                Shutdown();
+                return;
+            }
+
             // 诊断自检：--decrypt-selftest <emoji.db路径> <密钥> → C# SQLCipher 解密验证（Phase B）
             if (e.Args.Length == 3 && e.Args[0] == "--decrypt-selftest")
             {
@@ -170,7 +185,7 @@ namespace OICQStickerManager
             try
             {
                 var key = Services.QqKeyExtractor.RunScriptAndExtractAsync().GetAwaiter().GetResult();
-                var line = key == null ? "EXTRACT FAILED (null)" : $"EXTRACTED: {key}";
+                var line = key == null ? "EXTRACT FAILED (null)" : "EXTRACTED: protected recovery key saved";
                 File.WriteAllText(Path.Combine(Path.GetTempPath(), "asuka-extract-out.txt"), line);
                 if (key == null) Environment.ExitCode = 1;
             }
@@ -201,7 +216,11 @@ namespace OICQStickerManager
         {
             // 冲刷退出瞬间仍在途的配置保存（快速开关应用时最后一步不落地会导致
             // 绑定/设置回滚——2026-10-01 用户实测），最多等 2 秒；第二实例没建过 VM，别把它拉出来
-            if (_isPrimaryInstance) SharedViewModel.FlushPendingConfigSave(2000);
+            if (_isPrimaryInstance)
+            {
+                SharedViewModel.Dispose();
+                SharedViewModel.FlushPendingConfigSave(2000);
+            }
             _activateEvent?.Dispose();
             _singleInstanceMutex?.Dispose();
             base.OnExit(e);

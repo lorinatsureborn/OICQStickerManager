@@ -57,7 +57,7 @@ internal static class EmojiButtonTemplate
     private static int _capturing;
 
     private static string StorePath() =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "OICQStickerManager", FileName);
+        Path.Combine(AppDataDirectory.Root, FileName);
 
     /// <summary>磁盘上是否存在可用模板（懒加载一次；钩子线程每击调用，必须零 IO）。</summary>
     public static bool Available
@@ -133,7 +133,7 @@ internal static class EmojiButtonTemplate
     {
         matched = Rect.Empty;
         if (!Available) return false;
-        Data disk;
+        Data? disk;
         lock (Gate) { disk = _disk; }
         if (disk?.PngBase64 == null) return false;
         var scale = GetWindowScale(rootHwnd);
@@ -150,15 +150,13 @@ internal static class EmojiButtonTemplate
 
         SearchBest(tpl, buf, region, stride, out var best, out var bx, out var by);
         if (bx < 0 || best > XorThreshold) return false;
-        int cx = rx + region / 2 - s / 2 + bx + s / 2;
-        int cy = ry + region / 2 - s / 2 + by + s / 2;
-        matched = new Rect(cx - s / 2.0, cy - s / 2.0, s, s);
+        matched = new Rect(rx + bx, ry + by, s, s);
         return true;
     }
 
     /// <summary>二值形状全搜（±SearchRadius）：模板与候选各自相对背景中位色二值化，输出最小异或距离
-    /// 与模板左上偏移（可为负）。哨兵用 bestX&lt;0 且仅在未找到时设置（匹配位置常在点击点左侧，
-    /// 拿负 offset 当"未找到"会把正确命中当失败丢弃——实测教训）。剪枝：距离只增不减，已超
+    /// 与模板在采样区域内的左上坐标（非负）。bestX&lt;0 仅表示未找到。
+    /// 剪枝：距离只增不减，已超
     /// 当前最优的部分候选可放弃。</summary>
     private static void SearchBest(Scaled tpl, byte[] region, int regionSize, int stride, out double bestScore, out int bestX, out int bestY)
     {
@@ -197,7 +195,7 @@ internal static class EmojiButtonTemplate
                 if (complete && mismatch < bestMismatch)
                 {
                     bestMismatch = mismatch;
-                    bestX = dx; bestY = dy;
+                    bestX = rxc; bestY = ry;
                     found = true;
                 }
             }
@@ -215,7 +213,7 @@ internal static class EmojiButtonTemplate
         var img = new byte[w * h * 4];
         frame.CopyPixels(img, w * 4, 0);
         var _ = Available; // 确保磁盘模板已加载
-        Data disk;
+        Data? disk;
         lock (Gate) { disk = _disk; }
         if (disk?.PngBase64 == null) return "NO TEMPLATE (load " + StorePath() + " first)";
         // 目标缩放取模板自身：自测的是匹配核心（1:1），不是跨 DPI 缩放
@@ -235,14 +233,15 @@ internal static class EmojiButtonTemplate
                 int sy = cy - region / 2 + y;
                 if (sy < 0 || sy >= h) continue;
                 int sx = cx - region / 2;
-                int copyW = Math.Min(region, w - Math.Max(0, sx));
-                if (copyW <= 0) continue;
                 int srcX = Math.Max(0, sx);
                 int dstX = srcX - sx;
+                int copyW = Math.Min(region - dstX, w - srcX);
+                if (copyW <= 0) continue;
                 Buffer.BlockCopy(img, (sy * w + srcX) * 4, buf, (y * region + dstX) * 4, copyW * 4);
             }
             SearchBest(tpl, buf, region, region * 4, out var score, out var bx, out var by);
-            sb.AppendLine($"click=({cx},{cy}) xor={score:F3} offset=({bx},{by}) => {(score <= XorThreshold ? "HIT" : "miss")}");
+            int centerOffset = region / 2 - s / 2;
+            sb.AppendLine($"click=({cx},{cy}) xor={score:F3} offset=({bx - centerOffset},{by - centerOffset}) => {(score <= XorThreshold ? "HIT" : "miss")}");
         }
         return sb.ToString();
     }

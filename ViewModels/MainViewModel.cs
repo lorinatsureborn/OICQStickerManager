@@ -59,15 +59,14 @@ public class ThemeOption : ViewModelBase
 }
 
 
-public class MainViewModel : ViewModelBase
+public class MainViewModel : ViewModelBase, IDisposable
 {
 
-    private readonly string _configPath = GetConfigPath();
+    private readonly string _dataRoot = AppDataDirectory.Root;
+    private readonly string _configPath;
 
     /// <summary>config.json 的位置；App 在创建主窗口前要抢先读一次静默启动标志。</summary>
-    public static string GetConfigPath() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-        "OICQStickerManager", "config.json");
+    public static string GetConfigPath() => Path.Combine(AppDataDirectory.Root, "config.json");
 
     private readonly ImageService _imageService = new();
 
@@ -174,14 +173,16 @@ public class MainViewModel : ViewModelBase
 
     public MainViewModel()
     {
+        _configPath = Path.Combine(_dataRoot, "config.json");
         // 初始化命令（get-only 属性，避免每次绑定求值都创建新实例）
-        OpenLibraryCommand = new RelayCommand(OpenLibraryAsync);
-        HandleStickerClickCommand = new RelayCommand<StickerModel>(HandleStickerClickAsync);
-        HandleStickerDoubleClickCommand = new RelayCommand<StickerModel>(HandleStickerDoubleClickAsync);
-        PanelStickerClickCommand = new RelayCommand<StickerModel>(PanelStickerClickAsync);
-        PanelStickerDoubleClickCommand = new RelayCommand<StickerModel>(PanelStickerDoubleClickAsync);
-        ImportQqStickerCommand = new RelayCommand<QqStickerModel>(ImportQqStickerAsync);
-        ImportAllQqCommand = new RelayCommand(ImportAllQqAsync);
+        void ReportCommandFailure(Exception ex) => StatusText = "操作失败: " + ex.Message;
+        OpenLibraryCommand = new RelayCommand(OpenLibraryAsync, onError: ReportCommandFailure);
+        HandleStickerClickCommand = new RelayCommand<StickerModel>(HandleStickerClickAsync, allowConcurrent: true, onError: ReportCommandFailure);
+        HandleStickerDoubleClickCommand = new RelayCommand<StickerModel>(HandleStickerDoubleClickAsync, allowConcurrent: true, onError: ReportCommandFailure);
+        PanelStickerClickCommand = new RelayCommand<StickerModel>(PanelStickerClickAsync, allowConcurrent: true, onError: ReportCommandFailure);
+        PanelStickerDoubleClickCommand = new RelayCommand<StickerModel>(PanelStickerDoubleClickAsync, allowConcurrent: true, onError: ReportCommandFailure);
+        ImportQqStickerCommand = new RelayCommand<QqStickerModel>(ImportQqStickerAsync, onError: ReportCommandFailure);
+        ImportAllQqCommand = new RelayCommand(ImportAllQqAsync, onError: ReportCommandFailure);
 
         // 初始化视图
         _stickersView = (ListCollectionView)CollectionViewSource.GetDefaultView(Stickers);
@@ -229,10 +230,63 @@ public class MainViewModel : ViewModelBase
         Stickers.CollectionChanged += (_, _) => ScheduleUpdateCounts();
 
         // 💡 启动时自动加载
-        _ = LoadConfigAsync();
-        _ = LoadStickersAsync();
-        _ = LoadQqStatsAsync();
-        _ = LoadTagStatsAsync();
+        Initialization = InitializeAsync();
+    }
+
+    public Task Initialization { get; }
+    private bool _disposed;
+    private bool _dataLoaded;
+    private readonly SemaphoreSlim _libraryMutationGate = new(1, 1);
+    private DispatcherTimer? _syncTimer;
+
+    private async Task InitializeAsync()
+    {
+        await LoadQqStatsAsync();
+        await LoadTagStatsAsync();
+        if (_disposed) return;
+        await LoadConfigAsync();
+        if (_disposed) return;
+        await LoadStickersAsync();
+        if (_disposed) return;
+        var recovered = QqKeyExtractor.ReadRecoveredKey(_dataRoot);
+        if (!string.IsNullOrEmpty(recovered))
+        {
+            _qqDbKey = recovered;
+            NotifyQqDeepSyncStatus();
+            await SaveConfigAsync();
+        }
+        _dataLoaded = true;
+        await RunStartupReconcileIfDueAsync();
+        if (_disposed) return;
+        _syncTimer = new DispatcherTimer(DispatcherPriority.Background, _uiDispatcher) { Interval = TimeSpan.FromSeconds(15) };
+        _syncTimer.Tick += async (_, _) => { if (!_disposed) await RunStartupReconcileIfDueAsync(); };
+        _syncTimer.Start();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _syncTimer?.Stop();
+        _pendingRetryTimer?.Stop();
+        StopKeyWatcher();
+        _keyTcs?.TrySetResult(null);
+        foreach (var service in _qqServices.Values) service.Dispose();
+        _qqServices.Clear();
+        _qqMirrorViews.Clear();
+    }
+
+    private async Task<T> MutateLibraryAsync<T>(Func<Task<T>> operation, bool waitForInitialization = true)
+    {
+        if (waitForInitialization && !_dataLoaded) await Initialization;
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _libraryMutationGate.WaitAsync();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return await operation();
+        }
+        finally { _libraryMutationGate.Release(); }
     }
 
     public void UpdateTabTags()
@@ -351,29 +405,33 @@ public class MainViewModel : ViewModelBase
 
     private QqEmojiService CreateQqService(QqBindingInfo binding)
     {
-        var oriDir = Path.Combine(QqEmojiService.TencentFilesRoot, binding.Uin,
+        var accountDirectory = string.IsNullOrWhiteSpace(binding.AccountDirectory)
+            ? Path.Combine(QqEmojiService.TencentFilesRoot, binding.Uin) : Path.GetFullPath(binding.AccountDirectory);
+        var oriDir = Path.Combine(accountDirectory,
             "nt_qq", "nt_data", "Emoji", "personal_emoji", "Ori");
         var service = new QqEmojiService(binding.Uin, oriDir, action => _uiDispatcher.Invoke(action));
         service.MirrorChanged += (_, _) =>
         {
+            if (_disposed) return;
             ApplyQqSearchBuckets(); // 新收藏条目也参与搜索分桶（搜索中新增的置顶条目需判命中）
             ApplyQqStats(service);
             UpdateImportedFlags(service);
             UpdateCounts();
+            if (Initialization?.IsCompleted == true && _reconcileBusy == 0) _ = RunStartupReconcileIfDueAsync();
         };
         // M4 联动：用户在 QQ 里点「添加到表情」→ 新文件落盘 → 按开关自动复制进图库
         // （静默导入：不开标签编辑器、不弹提示；图库里自动带「QQ」标签，可后续整理）
         service.NewFavoriteDetected += model =>
         {
-            if (_qqFavoriteAutoImport) _ = ImportQqCoreAsync(new[] { model }, raiseCompleted: false);
+            if (!_disposed && _qqFavoriteAutoImport) _ = ImportQqCoreAsync(new[] { model }, raiseCompleted: false);
         };
-        _ = service.StartAsync();
         return service;
     }
 
     /// <summary>按 config 建立全部绑定（启动时调用；重绑前先 Dispose 旧服务）。</summary>
-    private void InitializeQqBindings(List<QqBindingInfo> bindings, List<string> dismissed)
+    private async Task InitializeQqBindingsAsync(List<QqBindingInfo> bindings, List<string> dismissed)
     {
+        if (_disposed) return;
         foreach (var service in _qqServices.Values) service.Dispose();
         _qqServices.Clear();
         _qqMirrorViews.Clear();
@@ -382,22 +440,42 @@ public class MainViewModel : ViewModelBase
         _qqPromptDismissedUins = dismissed;
         foreach (var binding in _qqBindings) _qqServices[binding.Uin] = CreateQqService(binding);
         UpdateTabTags();
+        foreach (var service in _qqServices.Values.ToArray()) await service.StartAsync();
     }
 
-    public async Task BindQqAccountsAsync(IEnumerable<string> uins)
+    public async Task BindQqAccountsAsync(IEnumerable<string> uins, IReadOnlyDictionary<string, string>? accountDirectories = null)
     {
         bool changed = false;
         foreach (var uin in uins)
         {
-            if (_qqServices.ContainsKey(uin)) continue;
-            var binding = new QqBindingInfo { Uin = uin, Alias = DefaultQqAlias(uin), BoundAt = DateTime.Now };
-            _qqBindings.Add(binding);
-            _qqServices[uin] = CreateQqService(binding);
+            var binding = _qqBindings.FirstOrDefault(b => b.Uin == uin);
+            var directory = accountDirectories != null && accountDirectories.TryGetValue(uin, out var custom) ? Path.GetFullPath(custom) : null;
+            if (binding != null && (directory == null || string.Equals(binding.AccountDirectory, directory, StringComparison.OrdinalIgnoreCase))) continue;
+            if (binding == null)
+            {
+                binding = new QqBindingInfo { Uin = uin, Alias = DefaultQqAlias(uin), BoundAt = DateTime.Now };
+                _qqBindings.Add(binding);
+            }
+            if (directory != null) binding.AccountDirectory = directory;
+            if (_qqServices.Remove(uin, out var old)) old.Dispose();
+            _qqMirrorViews.Remove(uin);
+            var service = CreateQqService(binding);
+            _qqServices[uin] = service;
+            await service.StartAsync();
             changed = true;
         }
         if (!changed) return;
         UpdateTabTags();
         await SaveConfigAsync();
+    }
+
+    public Task BindCustomQqAccountAsync(string accountDirectory)
+    {
+        var directory = new DirectoryInfo(accountDirectory);
+        if (directory.Name.Length == 0 || !directory.Name.All(char.IsAsciiDigit)
+            || !Directory.Exists(Path.Combine(directory.FullName, "nt_qq")))
+            throw new ArgumentException("请选择含 nt_qq 子目录的数字账号文件夹");
+        return BindQqAccountsAsync(new[] { directory.Name }, new Dictionary<string, string> { [directory.Name] = directory.FullName });
     }
 
     /// <summary>解绑：只摘镜像与选项卡，Library 已导入的副本不动（导入即出库原则）。</summary>
@@ -477,6 +555,9 @@ public class MainViewModel : ViewModelBase
             else
             {
                 StopKeyWatcher();
+                _keyTcs?.TrySetResult(null);
+                _keyTcs = null;
+                SetKeyFlowStatus(null);
             }
         }
     }
@@ -553,17 +634,20 @@ public class MainViewModel : ViewModelBase
     /// <returns>(实际新增数, 已在图库被跳过数)</returns>
     public async Task<(int Adopted, int AlreadyInLibrary)> AdoptAllOrphansAsync()
     {
-        int adopted = 0, skipped = 0;
+        int adopted = 0, skipped = 0, failed = 0;
         foreach (var service in _qqServices.Values.ToList())
         {
             // 快照：收编会修改 Mirror
             foreach (var orphan in service.Mirror.Where(m => m.IsOrphaned).ToList())
             {
-                if (await CopyQqStickerToLibraryAsync(orphan)) adopted++;
+                var result = await AdoptQqStickerToLibraryAsync(orphan);
+                if (result == QqAdoptionResult.Failed) { failed++; continue; }
+                if (result == QqAdoptionResult.Added) adopted++;
                 else skipped++;
-                service.Mirror.Remove(orphan); // 无论新增还是重复，孤儿都完成使命出镜像
+                service.Mirror.Remove(orphan);
             }
         }
+        if (failed > 0) StatusText = $"{failed} 个缓存残留收编失败，已保留在 QQ 镜像中";
         return (adopted, skipped);
     }
 
@@ -574,6 +658,12 @@ public class MainViewModel : ViewModelBase
         if (sticker == null || !sticker.IsOrphaned) return false;
         try
         {
+            var deep = await GetOrCreateDeepSyncAsync();
+            if (deep == null || !await deep.ConfirmOrphanAsync(sticker))
+            {
+                StatusText = "未能确认这是已移除的收藏，未删除 QQ 缓存";
+                return false;
+            }
             if (File.Exists(sticker.FullPath)) await Task.Run(() => File.Delete(sticker.FullPath));
             if (_qqServices.TryGetValue(sticker.Uin, out var service)) service.Mirror.Remove(sticker);
             return true;
@@ -583,17 +673,24 @@ public class MainViewModel : ViewModelBase
 
     /// <summary>通用复制到图库（QQ 页右键）：与 QQ 导入同链路但不带「QQ」标签；MD5 命中即静默跳过。</summary>
     public async Task<bool> CopyQqStickerToLibraryAsync(QqStickerModel sticker)
+        => await AdoptQqStickerToLibraryAsync(sticker) == QqAdoptionResult.Added;
+
+    private Task<QqAdoptionResult> AdoptQqStickerToLibraryAsync(QqStickerModel sticker)
+        => MutateLibraryAsync(() => AdoptQqStickerCoreAsync(sticker));
+
+    private async Task<QqAdoptionResult> AdoptQqStickerCoreAsync(QqStickerModel sticker)
     {
-        if (sticker == null || string.IsNullOrEmpty(sticker.Md5) || !File.Exists(sticker.FullPath)) return false;
+        if (sticker == null || string.IsNullOrEmpty(sticker.Md5) || !File.Exists(sticker.FullPath)) return QqAdoptionResult.Failed;
         var knownMd5 = Stickers.Where(s => !string.IsNullOrEmpty(s.Md5)).Select(s => s.Md5!).ToHashSet(StringComparer.Ordinal);
-        if (knownMd5.Contains(sticker.Md5)) return false; // 已在图库：静默跳过（语义定案）
+        if (knownMd5.Contains(sticker.Md5)) { sticker.IsImported = true; return QqAdoptionResult.AlreadyExists; }
 
+        try
+        {
         string library = EnsureLibraryFolder();
-        if (!ImageSniffer.TryGetImportExtension(sticker.FullPath, out var ext, out var kind)) return false;
+        if (!ImageSniffer.TryGetImportExtension(sticker.FullPath, out var ext, out var kind)) return QqAdoptionResult.Failed;
         var destination = Path.Combine(library, sticker.Md5 + ext);
-        if (File.Exists(destination)) { CancelPendingDelete(destination); return false; } // 命中待删旧文件=用户重新入库，销单放行
-
-        destination = await ImageSniffer.MaterializeAsync(sticker.FullPath, library, sticker.Md5, kind);
+        if (File.Exists(destination)) CancelPendingDelete(destination);
+        else destination = await ImageSniffer.MaterializeAsync(sticker.FullPath, library, sticker.Md5, kind);
         var copy = new StickerModel
         {
             FullPath = destination,
@@ -604,7 +701,13 @@ public class MainViewModel : ViewModelBase
         Stickers.Add(copy);
         await SaveDatabaseAsync();
         sticker.IsImported = true;
-        return true;
+        return QqAdoptionResult.Added;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            StatusText = "QQ 表情收编失败，原缓存已保留";
+            return QqAdoptionResult.Failed;
+        }
     }
 
     private async Task InitializeDeepSyncAsync()
@@ -613,6 +716,16 @@ public class MainViewModel : ViewModelBase
         {
             var count = await RunDeepSyncAsync();
             if (count == -2) return; // 已有对账在跑（watcher 回填并发触发），它会自己更新状态行
+            if (count == QqDeepSyncService.Deferred)
+            {
+                StatusText = "QQ 收藏索引仍在写入：本次对账暂缓，镜像和密钥已保留";
+                return;
+            }
+            if (count == QqDeepSyncService.AdoptionFailed)
+            {
+                StatusText = "部分收编失败，未收编的缓存和数据库密钥已保留";
+                return;
+            }
             if (count >= 0)
             {
                 StatusText = count > 0
@@ -621,20 +734,25 @@ public class MainViewModel : ViewModelBase
                 return;
             }
 
-            // 对账失败 → 旧密钥作废，走一次完整的读取引导（用户可取消=自动关深度同步）。
-            // 2026-09-30 用户定案：有密钥但对不上账时，不能"已有密钥"一句话堵死重读的路。
+            if (count != QqDeepSyncService.AuthenticationFailed)
+            {
+                StatusText = "QQ 收藏索引无法读取：请检查数据目录、文件权限和 QQ 版本，密钥已保留";
+                return;
+            }
+            // Authentication failure can also mean damaged pages. Keep the old key until a replacement is captured.
             _deepSync = null;
-            _qqDbKey = "";
             _keyTcs = null;
             NotifyQqDeepSyncStatus();
             StatusText = "QQ 收藏对账失败：密钥可能已失效，请重新读取";
-            var key = await AcquireDbKeyAsync(); // 弹三选引导并等待结果
+            var key = await AcquireDbKeyAsync(force: true);
             if (!string.IsNullOrEmpty(key))
             {
                 count = await RunDeepSyncAsync();
                 StatusText = count > 0
                     ? $"QQ 收藏对账完成：发现 {count} 个缓存残留"
-                    : count == 0 ? "QQ 收藏对账完成：没有缓存残留" : "QQ 收藏对账仍失败：QQ 版本结构可能已变化";
+                    : count == 0 ? "QQ 收藏对账完成：没有缓存残留"
+                    : count == QqDeepSyncService.Deferred ? "QQ 收藏索引仍在写入：本次对账暂缓，镜像和密钥已保留"
+                    : "QQ 收藏对账仍失败：QQ 版本结构可能已变化";
             }
         }
         catch { /* 降级已在 DeepSync 内处理 */ }
@@ -645,9 +763,10 @@ public class MainViewModel : ViewModelBase
     private QqKeyWatchService? _keyWatcher;
 
     /// <summary>取密钥：已有就用；没有则触发 UI 引导（三选：立即读 / 下次自动 / 取消）。</summary>
-    private async Task<string?> AcquireDbKeyAsync()
+    private async Task<string?> AcquireDbKeyAsync(bool force = false)
     {
-        if (!string.IsNullOrEmpty(_qqDbKey)) return _qqDbKey;
+        if (_disposed) return null;
+        if (!force && !string.IsNullOrEmpty(_qqDbKey)) return _qqDbKey;
         _keyTcs ??= new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         KeyAcquisitionRequested?.Invoke(this, EventArgs.Empty);
         return await _keyTcs.Task;
@@ -657,7 +776,9 @@ public class MainViewModel : ViewModelBase
     public void CompleteKeyAcquisition(string? key)
     {
         _keyFlowStatus = null; // 清瞬态状态（下面的 Notify 会刷新状态行到终态）
-        _qqDbKey = key ?? "";
+        if (key != null) _qqDbKey = key;
+        _deepSync = null;
+        if (key != null) StopKeyWatcher();
         if (key != null) _keyTcs?.TrySetResult(key);
         else _keyTcs?.TrySetResult(null);
         _keyTcs = null;
@@ -671,15 +792,20 @@ public class MainViewModel : ViewModelBase
     public event EventHandler? KeyAcquisitionRequested;
 
     /// <summary>静默抓取：监视 QQ 进程启动，附加调试器在登录瞬间抓密钥（QQ 无感）。</summary>
-    public void StartKeyWatcher()
+    public void StartKeyWatcher(bool replaceExisting = false)
     {
-        if (string.IsNullOrEmpty(_qqDbKey) == false) return;
+        if (_disposed || (!replaceExisting && !string.IsNullOrEmpty(_qqDbKey))) return;
         _keyWatcher ??= new QqKeyWatchService(
-            key => _uiDispatcher.Invoke(() =>
+            key =>
             {
-                CompleteKeyAcquisition(key);
-                StatusText = "QQ 收藏索引密钥已自动获取，深度同步已就绪";
-            }),
+                if (key != null) try { QqKeyExtractor.SaveRecoveryKey(_dataRoot, key); } catch { }
+                _uiDispatcher.BeginInvoke(() =>
+                {
+                    if (_disposed || !_qqDeepSyncEnabled) return;
+                    CompleteKeyAcquisition(key);
+                    StatusText = "QQ 收藏索引密钥已自动获取，深度同步已就绪";
+                });
+            },
             msg => QqPanelWatcher.Log("keywatch: " + msg));
         _keyWatcher.Start();
         NotifyQqDeepSyncStatus(); // "正在等待下一次 QQ 登录"
@@ -704,12 +830,13 @@ public class MainViewModel : ViewModelBase
 
     private async Task<QqDeepSyncService?> GetOrCreateDeepSyncAsync()
     {
+        if (_disposed) return null;
         if (_deepSync != null) return _deepSync;
         var key = await AcquireDbKeyAsync();
         if (string.IsNullOrEmpty(key)) return null;
         _deepSync = new QqDeepSyncService(key,
             uin => _qqServices.TryGetValue(uin, out var s) ? s : null,
-            async sticker => await CopyQqStickerToLibraryAsync(sticker));
+            AdoptQqStickerToLibraryAsync);
         return _deepSync;
     }
 
@@ -1111,7 +1238,7 @@ public class MainViewModel : ViewModelBase
 
 
     /// <summary>
-    /// 执行一次对账：返回发现的孤儿数；-1 = 失败（密钥失效/QQ 结构变化）；-2 = 已有对账在跑（本次跳过）。
+    /// 返回孤儿数；-1 = 读取失败；-2 = 对账已在运行；Deferred = 快照不稳定，本次暂缓。
     /// 结果写入 _deepSyncSummary 反映到设置页状态行（2026-09-30 用户反馈"开了却没标记也没说法"）。
     /// </summary>
     private int _reconcileBusy; // 0/1 护栏：引导流唤醒与 watcher 回填可能并发触发对账
@@ -1130,10 +1257,20 @@ public class MainViewModel : ViewModelBase
             var count = await deep.ReconcileAllAsync(
                 _qqBindings.Select(b => b.Uin).ToList(),
                 (QqSyncStrategy)QqSyncStrategy);
-            if (count < 0)
+            if (count == QqDeepSyncService.Deferred)
+            {
+                _deepSyncSummary = "上次对账暂缓：QQ 收藏索引仍在写入，镜像和密钥已保留";
+            }
+            else if (count == QqDeepSyncService.AdoptionFailed)
+            {
+                _deepSyncSummary = "上次对账部分收编失败：未收编的缓存和密钥已保留";
+            }
+            else if (count < 0)
             {
                 _deepSync = null; // 失败降级：下次重试（可能要重取密钥）
-                _deepSyncSummary = "上次对账失败：密钥可能已失效，重新读取后可再对账";
+                _deepSyncSummary = count == QqDeepSyncService.AuthenticationFailed
+                    ? "上次对账认证失败：密钥或数据库页可能已变化，可重新读取密钥"
+                    : "上次对账无法读取索引：请检查数据目录、权限和版本，密钥已保留";
             }
             else
             {
@@ -1155,7 +1292,7 @@ public class MainViewModel : ViewModelBase
     /// 对账此前只在打开开关那一刻执行，重启后 38 个真实残留零角标。</summary>
     public async Task RunStartupReconcileIfDueAsync()
     {
-        if (!_qqDeepSyncEnabled || string.IsNullOrEmpty(_qqDbKey)) return;
+        if (_disposed || !_qqDeepSyncEnabled || string.IsNullOrEmpty(_qqDbKey)) return;
         if (_qqBindings.Count > 0 && _qqServices.Count == 0) return; // 加载竞态：绑定服务还没建，等下次触发
         try { await RunDeepSyncAsync(); } catch { /* 良性：状态行如实记录 */ }
     }
@@ -1275,9 +1412,7 @@ public class MainViewModel : ViewModelBase
     private Dictionary<string, QqUsageStat> _qqStats = new(StringComparer.OrdinalIgnoreCase);
     private static readonly SemaphoreSlim _qqStatsWriteLock = new(1, 1);
 
-    private static string QqStatsPath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-        "OICQStickerManager", "qq-stats.json");
+    private string QqStatsPath => Path.Combine(_dataRoot, "qq-stats.json");
 
     private async Task LoadQqStatsAsync()
     {
@@ -1313,8 +1448,8 @@ public class MainViewModel : ViewModelBase
         {
             var directory = Path.GetDirectoryName(QqStatsPath)!;
             if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
-            var json = JsonSerializer.Serialize(_qqStats);
-            await WriteJsonWithBackupAsync(QqStatsPath, json, _qqStatsWriteLock);
+            var snapshot = _qqStats.ToDictionary(p => p.Key, p => new QqUsageStat { N = p.Value.N, T = p.Value.T });
+            await _qqStatsWriter.SaveAsync(snapshot, json => WriteJsonWithBackupAsync(QqStatsPath, json, _qqStatsWriteLock)).ConfigureAwait(false);
         }
         catch { /* 统计落盘失败不拖累发送链路，下次发送再写 */ }
     }
@@ -1339,7 +1474,13 @@ public class MainViewModel : ViewModelBase
         QqImportCompleted?.Invoke(report.Added, report.Duplicates, report.Unsupported);
     }
 
-    private async Task<ImportReport> ImportQqCoreAsync(IEnumerable<QqStickerModel> stickers, bool raiseCompleted = true)
+    private Task<ImportReport> ImportQqCoreAsync(IEnumerable<QqStickerModel> stickers, bool raiseCompleted = true)
+    {
+        var snapshot = stickers.ToArray();
+        return MutateLibraryAsync(() => ImportQqSerializedAsync(snapshot, raiseCompleted));
+    }
+
+    private async Task<ImportReport> ImportQqSerializedAsync(IEnumerable<QqStickerModel> stickers, bool raiseCompleted)
     {
         var report = new ImportReport();
         string library = EnsureLibraryFolder();
@@ -1356,9 +1497,8 @@ public class MainViewModel : ViewModelBase
                 if (!ImageSniffer.TryGetImportExtension(item.FullPath, out var ext, out var kind)) { report.Unsupported++; continue; }
 
                 var destination = Path.Combine(library, item.Md5 + ext);
-                if (File.Exists(destination)) { CancelPendingDelete(destination); item.IsImported = true; report.Duplicates++; continue; } // 命中待删旧文件=用户重新入库，销单放行
-
-                destination = await ImageSniffer.MaterializeAsync(item.FullPath, library, item.Md5, kind);
+                if (File.Exists(destination)) CancelPendingDelete(destination);
+                else destination = await ImageSniffer.MaterializeAsync(item.FullPath, library, item.Md5, kind);
 
                 knownMd5.Add(item.Md5);
                 item.IsImported = true;
@@ -1400,9 +1540,7 @@ public class MainViewModel : ViewModelBase
     private static readonly SemaphoreSlim _pendingDeleteWriteLock = new(1, 1);
     private DispatcherTimer? _pendingRetryTimer;
 
-    private static string PendingDeletesPath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-        "OICQStickerManager", "pending-deletes.json");
+    private string PendingDeletesPath => Path.Combine(_dataRoot, "pending-deletes.json");
 
     private void LoadPendingDeletes()
     {
@@ -1421,16 +1559,15 @@ public class MainViewModel : ViewModelBase
         {
             var directory = Path.GetDirectoryName(PendingDeletesPath)!;
             if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
-            var json = JsonSerializer.Serialize(_pendingDeletes);
-            await WriteJsonWithBackupAsync(PendingDeletesPath, json, _pendingDeleteWriteLock);
+            await _pendingWriter.SaveAsync(_pendingDeletes.ToArray(), json => WriteJsonWithBackupAsync(PendingDeletesPath, json, _pendingDeleteWriteLock)).ConfigureAwait(false);
         }
-        catch { /* 落盘失败不拖累删除链路，下次入队再写 */ }
+        catch { _ = _uiDispatcher.BeginInvoke(() => StatusText = "待删除记录保存失败，退出后可能需要再次清理被占用文件"); }
     }
 
     /// <summary>删除时文件被占用：记入待删队列并安排一轮延迟重试（启动时还有一轮）。</summary>
     public void QueuePendingDelete(string path, string? md5)
     {
-        if (string.IsNullOrEmpty(path)) return;
+        if (!IsLibraryPath(path)) return;
         if (_pendingDeletes.Any(p => string.Equals(p.Path, path, StringComparison.OrdinalIgnoreCase))) return;
         _pendingDeletes.Add(new PendingDelete(path, md5, DateTime.Now));
         _ = SavePendingDeletesAsync();
@@ -1448,6 +1585,51 @@ public class MainViewModel : ViewModelBase
         _pendingRetryTimer.Start(); // 无论入队几张，只安排一轮延迟重试
     }
 
+    private bool IsLibraryPath(string path)
+    {
+        try
+        {
+            return !string.IsNullOrWhiteSpace(path) && string.Equals(
+                Path.GetDirectoryName(Path.GetFullPath(path)), Path.GetFullPath(EnsureLibraryFolder()), StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    public Task<int> DeleteStickersAsync(IEnumerable<StickerModel> stickers)
+    {
+        var snapshot = stickers.ToArray();
+        return MutateLibraryAsync(() => DeleteStickersCoreAsync(snapshot));
+    }
+
+    private async Task<int> DeleteStickersCoreAsync(IEnumerable<StickerModel> stickers)
+    {
+        var targets = stickers.Distinct().Where(s => Stickers.Contains(s) && IsLibraryPath(s.FullPath)).ToArray();
+        foreach (var item in targets) Stickers.Remove(item);
+        await SaveDatabaseAsync();
+        int pending = 0;
+        foreach (var item in targets)
+        {
+            bool deleted = false;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (Stickers.Any(s => string.Equals(s.FullPath, item.FullPath, StringComparison.OrdinalIgnoreCase))) { deleted = true; break; }
+                deleted = await Task.Run(() =>
+                {
+                    try { if (File.Exists(item.FullPath)) File.Delete(item.FullPath); return true; }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
+                });
+                if (deleted) break;
+                if (attempt < 2) await Task.Delay(200);
+            }
+            if (!deleted) { QueuePendingDelete(item.FullPath, item.Md5); pending++; }
+        }
+        if (pending > 0) await SavePendingDeletesAsync();
+        UpdateTabTags();
+        RefreshQqMirrorFlags();
+        StatusText = pending > 0 ? $"已从图库移除；{pending} 个被占用文件已排队重试删除" : $"已删除 {targets.Length} 个表情";
+        return pending;
+    }
+
     /// <summary>用户重新入库占用了待删路径（导入落盘命中旧文件）：销单放行。</summary>
     public void CancelPendingDelete(string path)
     {
@@ -1460,27 +1642,29 @@ public class MainViewModel : ViewModelBase
     /// 重试待删队列：删除成功销单；路径已被新记录占用（用户重新入库）销单放行；
     /// 仍被占用则保留，留给下次启动。返回是否仍有残留。
     /// </summary>
-    private async Task<bool> RetryPendingDeletesAsync()
+    private Task<bool> RetryPendingDeletesAsync(IEnumerable<string>? protectedPaths = null)
+        => MutateLibraryAsync(() => RetryPendingDeletesCoreAsync(protectedPaths), waitForInitialization: false);
+
+    private async Task<bool> RetryPendingDeletesCoreAsync(IEnumerable<string>? protectedPaths)
     {
         if (_pendingDeletes.Count == 0) return false;
 
         // 在库路径：待删文件只可能是“已不在图库”的孤儿，被重新入库占用的路径直接销单
         var alivePaths = new HashSet<string>(
             Stickers.Select(s => s.FullPath), StringComparer.OrdinalIgnoreCase);
+        if (protectedPaths != null) alivePaths.UnionWith(protectedPaths);
 
-        var remaining = new List<PendingDelete>();
         foreach (var item in _pendingDeletes.ToList())
         {
-            if (alivePaths.Contains(item.Path)) continue; // 销单：文件已归新记录
+            if (!IsLibraryPath(item.Path) || alivePaths.Contains(item.Path)) { _pendingDeletes.Remove(item); continue; }
             var deleted = await Task.Run(() =>
             {
                 try { if (File.Exists(item.Path)) File.Delete(item.Path); return true; }
                 catch { return false; } // 仍被占用：保留，下次启动再试
             });
-            if (!deleted) remaining.Add(item);
+            if (deleted) _pendingDeletes.Remove(item);
         }
 
-        _pendingDeletes = remaining;
         await SavePendingDeletesAsync();
         return _pendingDeletes.Count > 0;
     }
@@ -1490,18 +1674,6 @@ public class MainViewModel : ViewModelBase
         StatusText = "正在自动同步图库文件...";
 
         string libraryPath = EnsureLibraryFolder();
-
-        // 0. 待删队列：启动先重试一轮（此时 Stickers 尚未载入，在库保护集为空=全删）；
-        //    仍删不掉的文件在下面收编时跳过，防止“半删除复活成无标签表情”
-        LoadPendingDeletes();
-        await RetryPendingDeletesAsync();
-
-        // 1. 获取物理文件列表（待删队列中的被占用文件不参与收编）
-        var pendingPaths = new HashSet<string>(
-            _pendingDeletes.Select(p => p.Path), StringComparer.OrdinalIgnoreCase);
-        var physicalFiles = (await _imageService.GetStickersAsync(libraryPath))
-            .Where(f => !pendingPaths.Contains(f.FullPath))
-            .ToList();
 
         // 2. 获取 JSON 记录（损坏时自愈：.bak 恢复 / .bad 留证——这里有全部标签，丢不起）
         List<StickerModel> savedRecords = new();
@@ -1517,18 +1689,32 @@ public class MainViewModel : ViewModelBase
             catch { /* 极端情况下仍以物理文件为准 */ }
         }
 
-        // 3. 构建最终集合 (以物理文件为 ID)；JSON 记录按路径建索引，避免文件循环里逐条 FirstOrDefault（O(n²)）
-        var recordsByPath = new Dictionary<string, StickerModel>(StringComparer.Ordinal);
+        LoadPendingDeletes();
+        await RetryPendingDeletesAsync(savedRecords.Select(r => r.FullPath)
+            .Concat(savedRecords.Select(r => Path.Combine(libraryPath, Path.GetFileName(r.FullPath)))));
+        var pendingPaths = new HashSet<string>(_pendingDeletes.Select(p => p.Path), StringComparer.OrdinalIgnoreCase);
+        var physicalFiles = (await _imageService.GetStickersAsync(libraryPath))
+            .Where(f => !pendingPaths.Contains(f.FullPath)).ToList();
+
+        var recordsByPath = new Dictionary<string, StickerModel>(StringComparer.OrdinalIgnoreCase);
+        var recordsByMd5 = new Dictionary<string, StickerModel>(StringComparer.OrdinalIgnoreCase);
         foreach (var r in savedRecords)
+        {
             if (!recordsByPath.ContainsKey(r.FullPath)) recordsByPath[r.FullPath] = r; // 重复路径取首条，与 FirstOrDefault 一致
+            if (!string.IsNullOrEmpty(r.Md5)) recordsByMd5.TryAdd(r.Md5, r);
+        }
         var finalStickers = new List<StickerModel>();
         foreach (var file in physicalFiles)
         {
             // 查找 JSON 中是否有对应路径的标签记录
-            if (recordsByPath.TryGetValue(file.FullPath, out var record))
+            var stem = Path.GetFileNameWithoutExtension(file.FullPath);
+            if (stem.Length == 32 && stem.All(char.IsAsciiHexDigit)) file.Md5 = stem.ToUpperInvariant();
+            recordsByPath.TryGetValue(file.FullPath, out var record);
+            if (record == null && file.Md5 != null) recordsByMd5.TryGetValue(file.Md5, out record);
             if (record != null)
             {
-                file.Tags = record.Tags ?? new List<string>();
+                file.Id = record.Id;
+                file.Tags = new List<string>(record.Tags);
                 file.UseCount = record.UseCount;
                 // 记录里有真实的"最近使用"才覆盖；从未使用的旧记录保留 mtime 兜底（见 ImageService），
                 // 否则 MinValue 会把老表情压到冷却兜底档
@@ -1539,7 +1725,6 @@ public class MainViewModel : ViewModelBase
             // MD5 命名规则（<md5>.<ext>）时代之前入库的文件：JSON 没有就从文件名恢复
             if (string.IsNullOrEmpty(file.Md5))
             {
-                var stem = Path.GetFileNameWithoutExtension(file.FullPath);
                 if (stem.Length == 32 && stem.All(char.IsAsciiHexDigit)) file.Md5 = stem.ToUpperInvariant();
             }
 
@@ -1582,11 +1767,9 @@ public class MainViewModel : ViewModelBase
         UpdateImportedFlagsAll();
     }
 
-    private static string EnsureLibraryFolder()
+    private string EnsureLibraryFolder()
     {
-        var path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-            "OICQStickerManager", "Library");
+        var path = Path.Combine(_dataRoot, "Library");
         if (!Directory.Exists(path)) Directory.CreateDirectory(path);
         return path;
     }
@@ -1602,7 +1785,10 @@ public class MainViewModel : ViewModelBase
 
     // 💡 拖放入库：魔数定真实格式 + MD5 内容去重 + 以 <md5>.<ext> 命名（设计 §5.1）。
     // 不自动打标签：文件夹名/文件名由窗口作为"第一备选建议"给到标签编辑器，用户点选才加
-    public async Task<ImportReport> AddStickersFromPathAsync(string sourcePath)
+    public Task<ImportReport> AddStickersFromPathAsync(string sourcePath)
+        => MutateLibraryAsync(() => AddStickersFromPathCoreAsync(sourcePath));
+
+    private async Task<ImportReport> AddStickersFromPathCoreAsync(string sourcePath)
     {
         var report = new ImportReport();
         string appDataFolder = EnsureLibraryFolder();
@@ -1637,9 +1823,8 @@ public class MainViewModel : ViewModelBase
                 if (!knownMd5.Add(md5)) { report.Duplicates++; continue; }
 
                 string destinationPath = Path.Combine(appDataFolder, md5 + ext);
-                if (File.Exists(destinationPath)) { CancelPendingDelete(destinationPath); report.Duplicates++; continue; } // 命中待删旧文件=用户重新入库，销单放行
-
-                destinationPath = await ImageSniffer.MaterializeAsync(file, appDataFolder, md5, kind);
+                if (File.Exists(destinationPath)) CancelPendingDelete(destinationPath);
+                else destinationPath = await ImageSniffer.MaterializeAsync(file, appDataFolder, md5, kind);
 
                 var sticker = new StickerModel
                 {
@@ -1665,9 +1850,7 @@ public class MainViewModel : ViewModelBase
         return report;
     }
 
-    private string DbPath => Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-    "OICQStickerManager", "stickers.json");
+    private string DbPath => Path.Combine(_dataRoot, "stickers.json");
 
     public async Task SaveDatabaseAsync()
     {
@@ -1677,16 +1860,8 @@ public class MainViewModel : ViewModelBase
             string directory = Path.GetDirectoryName(DbPath)!;
             if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
 
-            // 2. 序列化配置：写得漂亮一点（带缩进）
-            var options = new JsonSerializerOptions { WriteIndented = true };
-
-            // 3. 执行“脱水”过程：UI 线程只做快照（集合只许 UI 线程碰），
-            //    序列化进后台——它是整库 O(n) 纯 CPU，图库大了以后在 UI 线程上是每次发送一笔可观开销
-            var snapshot = Stickers.ToList();
-            string jsonString = await Task.Run(() => JsonSerializer.Serialize(snapshot, options));
-
-            // 4. 写入文件（原子 + 备份 + 写锁串行，防止截断 JSON 丢标签、并发保存互抢 tmp）
-            await WriteJsonWithBackupAsync(DbPath, jsonString, _dbWriteLock);
+            var snapshot = Stickers.Select(StickerRecord.Capture).ToArray();
+            await _databaseWriter.SaveAsync(snapshot, json => WriteJsonWithBackupAsync(DbPath, json, _dbWriteLock));
 
             StatusText = "数据已自动保存";
         }
@@ -1698,6 +1873,11 @@ public class MainViewModel : ViewModelBase
 
     // 最近一次配置保存任务（退出前 FlushPendingConfigSave 等它落地，防止快速开关丢最后一步）
     private Task? _lastConfigSaveTask;
+    private readonly OrderedJsonWriter _databaseWriter = new();
+    private readonly OrderedJsonWriter _configWriter = new();
+    private readonly OrderedJsonWriter _qqStatsWriter = new();
+    private readonly OrderedJsonWriter _tagStatsWriter = new();
+    private readonly OrderedJsonWriter _pendingWriter = new();
 
     public async Task SaveConfigAsync()
     {
@@ -1714,7 +1894,9 @@ public class MainViewModel : ViewModelBase
     /// <summary>退出前调用：等最后一次配置保存落盘（最多 timeout 毫秒）。</summary>
     public void FlushPendingConfigSave(int timeoutMs = 2000)
     {
-        try { _lastConfigSaveTask?.Wait(timeoutMs); } catch { /* 保存失败的警报链路另行提示 */ }
+        try { Task.WhenAll(_lastConfigSaveTask ?? Task.CompletedTask, _databaseWriter.Completion,
+            _qqStatsWriter.Completion, _tagStatsWriter.Completion, _pendingWriter.Completion, _configWriter.Completion).Wait(timeoutMs); }
+        catch { /* 保存失败的警报链路另行提示 */ }
     }
 
     private async Task SaveConfigCoreAsync()
@@ -1735,7 +1917,7 @@ public class MainViewModel : ViewModelBase
                 QqFavoriteAutoImport = this.QqFavoriteAutoImport,
                 QqDeepSyncEnabled = this.QqDeepSyncEnabled,
                 QqSyncStrategy = this.QqSyncStrategy,
-                QqDbKey = this._qqDbKey,
+                QqDbKey = ProtectedSecret.Protect(this._qqDbKey),
                 GallerySortMode = this.GallerySortMode,
                 QuickPanelSortMode = this.QuickPanelSortMode,
                 RecentPinnedCount = this.RecentPinnedCount,
@@ -1749,7 +1931,7 @@ public class MainViewModel : ViewModelBase
                 CloseBehaviorDecided = this._closeBehaviorDecided,
                 SilentStart = this.SilentStart,
                 EnableGifHoverPreview = this.EnableGifHoverPreview,
-                QqBindings = new List<QqBindingInfo>(this._qqBindings),
+                QqBindings = _qqBindings.Select(b => new QqBindingInfo { Uin = b.Uin, Alias = b.Alias, AccountDirectory = b.AccountDirectory, BoundAt = b.BoundAt }).ToList(),
                 QqPromptDismissedUins = new List<string>(this._qqPromptDismissedUins),
                 WebpNoticeDismissed = this._webpNoticeDismissed,
                 AiTagApiKey = this._aiTagApiKey,
@@ -1760,12 +1942,14 @@ public class MainViewModel : ViewModelBase
                 AiKeyProfiles = this.AiKeyProfiles.ToList(),
                 AiActiveProfileId = this._aiActiveProfileId
             };
-            var configJson = JsonSerializer.Serialize(config);
-            await WriteJsonWithBackupAsync(_configPath, configJson, _configWriteLock);
+            var savedKey = _qqDbKey;
+            await _configWriter.SaveAsync(config, json => WriteJsonWithBackupAsync(_configPath, json, _configWriteLock)).ConfigureAwait(false);
+            if (!string.IsNullOrEmpty(savedKey) && QqKeyExtractor.ReadRecoveredKey(_dataRoot) == savedKey)
+                try { File.Delete(Path.Combine(_dataRoot, "key-recovery.dpapi")); } catch { }
         }
         catch (Exception ex)
         {
-            StatusText = $"配置保存失败: {ex.Message}";
+            _ = _uiDispatcher.BeginInvoke(() => StatusText = $"配置保存失败: {ex.Message}");
         }
     }
 
@@ -1781,17 +1965,26 @@ public class MainViewModel : ViewModelBase
 
     private static async Task WriteJsonWithBackupAsync(string path, string json, SemaphoreSlim writeLock)
     {
-        await writeLock.WaitAsync();
+        await writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
             var tmp = path + ".tmp";
-            await File.WriteAllTextAsync(tmp, json);
+            await File.WriteAllTextAsync(tmp, json).ConfigureAwait(false);
             // 备份与改名是同步文件 IO，也放到线程池：调用方多是 UI 线程上的 await 链
             await Task.Run(() =>
             {
-                try { if (File.Exists(path)) File.Copy(path, path + ".bak", overwrite: true); } catch { /* 备份尽力 */ }
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        if (string.Equals(Path.GetFileName(path), "config.json", StringComparison.OrdinalIgnoreCase))
+                            File.WriteAllText(path + ".bak", ProtectedSecret.ProtectConfigKeys(File.ReadAllText(path)));
+                        else File.Copy(path, path + ".bak", overwrite: true);
+                    }
+                }
+                catch { /* 备份尽力 */ }
                 File.Move(tmp, path, overwrite: true);
-            });
+            }).ConfigureAwait(false);
         }
         finally
         {
@@ -2083,9 +2276,7 @@ public class MainViewModel : ViewModelBase
     private Dictionary<string, DateTime> _tagStats = new(StringComparer.Ordinal);
     private static readonly SemaphoreSlim _tagStatsWriteLock = new(1, 1);
 
-    private static string TagStatsPath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-        "OICQStickerManager", "tag-stats.json");
+    private string TagStatsPath => Path.Combine(_dataRoot, "tag-stats.json");
 
     private async Task LoadTagStatsAsync()
     {
@@ -2105,8 +2296,8 @@ public class MainViewModel : ViewModelBase
         {
             var directory = Path.GetDirectoryName(TagStatsPath)!;
             if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
-            var json = JsonSerializer.Serialize(_tagStats);
-            await WriteJsonWithBackupAsync(TagStatsPath, json, _tagStatsWriteLock);
+            var snapshot = new Dictionary<string, DateTime>(_tagStats, StringComparer.Ordinal);
+            await _tagStatsWriter.SaveAsync(snapshot, json => WriteJsonWithBackupAsync(TagStatsPath, json, _tagStatsWriteLock)).ConfigureAwait(false);
         }
         catch { /* 统计落盘失败不拖累保存链路 */ }
     }
@@ -2348,7 +2539,7 @@ public class MainViewModel : ViewModelBase
     // 用户在设置里动过这个开关，或回答过首次关闭询问，即视为已做过选择（CloseBehaviorDecided）；
     // LoadConfigAsync 的程序性赋值不算（_loadingConfig 守卫），否则老用户永远等不到首次询问
     private bool _closeToTray = false;
-    private bool _loadingConfig;
+    private bool _loadingConfig = true;
     private bool _closeBehaviorDecided = false;
     public bool CloseBehaviorDecided => _closeBehaviorDecided;
     public bool CloseToTray
@@ -2489,7 +2680,7 @@ public class MainViewModel : ViewModelBase
 
     private Task OpenLibraryAsync()
     {
-        string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "OICQStickerManager", "Library");
+        string path = EnsureLibraryFolder();
         if (Directory.Exists(path))
         {
             System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
@@ -2559,16 +2750,13 @@ public class MainViewModel : ViewModelBase
         {
             if (coexistTarget == IntPtr.Zero)
             {
-                await _windowService.QuickPasteToForegroundAsync(path, RestoreClipboardAfterSend);
-                return;
+                return await _windowService.QuickPasteToForegroundAsync(path, RestoreClipboardAfterSend);
             }
-            // CoexistPasteAsync 返回 false = 粘贴前焦点已离开 QQ 被闸门拦下（宁可不发也不错发）
-            bool sent = await _windowService.CoexistPasteAsync(coexistTarget, path, RestoreClipboardAfterSend);
-            if (!sent) StatusText = "发送已取消：粘贴前焦点已切离 QQ（防止表情误发到其他窗口）";
+            return await _windowService.CoexistPasteAsync(coexistTarget, path, RestoreClipboardAfterSend);
         });
     }
 
-    private async Task ExecuteSendCoreAsync(StickerModel s, Func<string, Task> send)
+    private async Task ExecuteSendCoreAsync(StickerModel s, Func<string, Task<SendResult>> send)
     {
         // 产品约定：无论单击还是双击模式，一次操作只发送一张。
         // 双击的第二、三次按下落在系统双击时限内，在此被拦下；
@@ -2580,6 +2768,14 @@ public class MainViewModel : ViewModelBase
             return;
         }
         _lastSendTimes[s.Id] = now;
+
+        var result = await send(s.FullPath);
+        if (!result.Succeeded)
+        {
+            _lastSendTimes.Remove(s.Id);
+            StatusText = result.Message;
+            return;
+        }
 
         // 使用统计：次数 +1（频次因子输入）+ 最近活跃时间刷新（新近度因子输入），发送后此表情升至列表顶部
         s.UseCount++;
@@ -2596,7 +2792,6 @@ public class MainViewModel : ViewModelBase
                 _ = SaveQqStatsAsync();
             }
         }
-        await send(s.FullPath);
         await SaveDatabaseAsync();
         RecalcRecentPinned();  // 刚发送的图进入"最近置顶"集
         _stickersView.Refresh();
@@ -2638,6 +2833,7 @@ public class MainViewModel : ViewModelBase
             {
                 var json = await ReadJsonRecoveringAsync(_configPath,
                     s => { try { return JsonSerializer.Deserialize<AppConfig>(s) != null; } catch { return false; } });
+                if (_disposed) return;
                 if (json == null) return; // 损坏且无备份：保持默认值（坏文件已留证，状态栏有提示）
                 var config = JsonSerializer.Deserialize<AppConfig>(json);
                 if (config != null)
@@ -2650,7 +2846,12 @@ public class MainViewModel : ViewModelBase
                     this._qqFavoriteAutoImport = config.QqFavoriteAutoImport;
                     this._qqDeepSyncEnabled = config.QqDeepSyncEnabled;
                     this._qqSyncStrategy = config.QqSyncStrategy;
-                    this._qqDbKey = config.QqDbKey ?? "";
+                    try { this._qqDbKey = ProtectedSecret.Unprotect(config.QqDbKey ?? ""); }
+                    catch (Exception ex) when (ex is CryptographicException or FormatException)
+                    {
+                        this._qqDbKey = "";
+                        StatusText = "数据库密钥无法在当前 Windows 用户下解锁，请重新读取";
+                    }
                     NotifyQqDeepSyncStatus();
                     this._gallerySortMode = Math.Clamp(config.GallerySortMode, 0, 2);
                     this._quickPanelSortMode = Math.Clamp(config.QuickPanelSortMode, 0, 2);
@@ -2668,7 +2869,7 @@ public class MainViewModel : ViewModelBase
                     // 主题已在启动时由 ThemeManager.ApplyInitial 同步应用；这里仅对齐 VM 状态
                     this.SelectedTheme = ThemeManager.Current.Id;
                     // QQ 绑定：按配置恢复（每绑定一个镜像服务），随后选项卡插入 QQ（账号）页
-                    InitializeQqBindings(config.QqBindings ?? new List<QqBindingInfo>(),
+                    await InitializeQqBindingsAsync(config.QqBindings ?? new List<QqBindingInfo>(),
                         config.QqPromptDismissedUins ?? new List<string>());
                     this._webpNoticeDismissed = config.WebpNoticeDismissed;
                     // AI 识别配置：按配置恢复（Key/服务商/模型/自定义地址/思考强度）
@@ -2695,6 +2896,17 @@ public class MainViewModel : ViewModelBase
                     }
                     this._aiActiveProfileId = this.AiKeyProfiles.Any(p => p.Id == config.AiActiveProfileId)
                         ? config.AiActiveProfileId : "";
+                    // 激活档案是事实源；旧的工作字段可能缺失或停留在上一次草稿。
+                    // 加载期间直写后备字段，避免 setter 触发脱钩和异步保存。
+                    if (this._activeProfile is { } activeProfile)
+                    {
+                        this._aiTagApiKey = activeProfile.ApiKey ?? "";
+                        this._aiTagProvider = string.IsNullOrEmpty(activeProfile.ProviderId) ? "auto" : activeProfile.ProviderId;
+                        this._aiTagModel = activeProfile.Model ?? "";
+                        this._aiTagBaseUrl = activeProfile.BaseUrl ?? "";
+                        this._aiTagEffort = activeProfile.Effort ?? "";
+                        this._aiDraftVerified = activeProfile.VerifiedAt != null;
+                    }
                     // 触发 UI 绑定更新
                     OnPropertyChanged(nameof(IsSingleClick));
                     OnPropertyChanged(nameof(IsDoubleClick));

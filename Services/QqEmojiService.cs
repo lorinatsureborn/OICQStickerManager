@@ -14,6 +14,17 @@ public class QqEmojiService : IDisposable
     public string Uin { get; }
 
     public string OriDir { get; }
+    public string DatabasePath
+    {
+        get
+        {
+            var directory = new DirectoryInfo(OriDir);
+            for (int i = 0; i < 4 && directory.Parent != null; i++) directory = directory.Parent;
+            return string.Equals(directory.Name, "nt_qq", StringComparison.OrdinalIgnoreCase)
+                ? Path.Combine(directory.FullName, "nt_db", "emoji.db")
+                : Path.Combine(TencentFilesRoot, Uin, "nt_qq", "nt_db", "emoji.db");
+        }
+    }
 
     private string ThumbDir => Path.Combine(Path.GetDirectoryName(OriDir)!, "Thumb");
 
@@ -31,7 +42,12 @@ public class QqEmojiService : IDisposable
     private readonly object _pendingLock = new();
     private readonly HashSet<string> _pending = new(StringComparer.OrdinalIgnoreCase);
     private System.Timers.Timer? _debounce;
-    private bool _disposed;
+    private System.Timers.Timer? _recovery;
+    private volatile bool _watcherFailed;
+    private int _recovering;
+    private long _lastRecoveryScan;
+    private volatile bool _disposed;
+    private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
     public QqEmojiService(string uin, string oriDir, Action<Action> marshal)
     {
@@ -50,12 +66,12 @@ public class QqEmojiService : IDisposable
     /// LastActive 取热文件（nt_msg.db-wal 等聊天库 WAL + mmkv + log）最新修改时间——
     /// 活跃账号持续写入、休眠账号冻结（实测本机：活跃账号当日、休眠账号停在两年前）。
     /// </summary>
-    public static Task<List<QqAccountScanResult>> ScanAccountsAsync()
+    public static Task<List<QqAccountScanResult>> ScanAccountsAsync(string? dataRoot = null)
     {
         return Task.Run(() =>
         {
             var results = new List<QqAccountScanResult>();
-            var root = TencentFilesRoot;
+            var root = dataRoot ?? TencentFilesRoot;
             if (!Directory.Exists(root)) return results;
 
             foreach (var dir in Directory.EnumerateDirectories(root))
@@ -69,7 +85,8 @@ public class QqEmojiService : IDisposable
                 var result = new QqAccountScanResult
                 {
                     Uin = uin,
-                    OriDir = Directory.Exists(ori) ? ori : "",
+                    AccountDirectory = dir,
+                    OriDir = ori,
                     StickerCount = Directory.Exists(ori)
                         ? Directory.EnumerateFiles(ori).Count()
                         : 0,
@@ -123,31 +140,80 @@ public class QqEmojiService : IDisposable
     /// <summary>全量扫描 + 启动目录监视。</summary>
     public async Task StartAsync()
     {
+        lock (_pendingLock)
+        {
+            if (_disposed) return;
+            StartWatcher();
+            if (_recovery == null)
+            {
+                _recovery = new System.Timers.Timer(1000);
+                _recovery.Elapsed += OnRecoveryTick;
+                _recovery.Start();
+            }
+        }
         await RescanAsync();
-        StartWatcher();
+    }
+
+    private async void OnRecoveryTick(object? sender, System.Timers.ElapsedEventArgs e)
+    {
+        if (_disposed || Interlocked.Exchange(ref _recovering, 1) != 0) return;
+        try
+        {
+            bool rescan;
+            lock (_pendingLock)
+            {
+                if (_disposed) return;
+                bool missing = !Directory.Exists(OriDir);
+                if (_watcherFailed || missing)
+                {
+                    _watcher?.Dispose();
+                    _watcher = null;
+                    _watcherFailed = false;
+                }
+                bool restart = _watcher == null && !missing;
+                if (restart) StartWatcher();
+                rescan = restart || Environment.TickCount64 - _lastRecoveryScan >= 60_000;
+                if (rescan) _lastRecoveryScan = Environment.TickCount64;
+            }
+            if (rescan) await RescanAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) { QqPanelWatcher.Log("QQ watcher recovery failed: " + ex.GetType().Name); }
+        finally { Interlocked.Exchange(ref _recovering, 0); }
     }
 
     public async Task RescanAsync()
     {
-        var items = await Task.Run(() =>
+        if (_disposed) return;
+        await _refreshLock.WaitAsync();
+        try
         {
-            var list = new List<QqStickerModel>();
-            if (!Directory.Exists(OriDir)) return list;
-            foreach (var f in Directory.EnumerateFiles(OriDir))
+            if (_disposed) return;
+            var items = await Task.Run(() =>
             {
-                var m = BuildModelOrNull(f);
-                if (m != null) list.Add(m);
-            }
-            list.Sort((a, b) => b.FileMtime.CompareTo(a.FileMtime));
-            return list;
-        });
+                var list = new List<QqStickerModel>();
+                if (!Directory.Exists(OriDir)) return list;
+                foreach (var f in Directory.EnumerateFiles(OriDir))
+                {
+                    var m = BuildModelOrNull(f);
+                    if (m != null) list.Add(m);
+                }
+                list.Sort((a, b) => b.FileMtime.CompareTo(a.FileMtime));
+                return list;
+            });
 
-        _marshal(() =>
+            _marshal(() =>
+            {
+                if (_disposed) return;
+                Mirror.Clear();
+                foreach (var m in items) Mirror.Add(m);
+                MirrorChanged?.Invoke(this, EventArgs.Empty);
+            });
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            Mirror.Clear();
-            foreach (var m in items) Mirror.Add(m);
-            MirrorChanged?.Invoke(this, EventArgs.Empty);
-        });
+            QqPanelWatcher.Log("QQ mirror rescan failed: " + ex.Message);
+        }
+        finally { _refreshLock.Release(); }
     }
 
     private QqStickerModel? BuildModelOrNull(string path)
@@ -181,8 +247,10 @@ public class QqEmojiService : IDisposable
 
     private void StartWatcher()
     {
-        if (!Directory.Exists(OriDir)) return;
+        if (_disposed || _watcher != null || !Directory.Exists(OriDir)) return;
 
+        try
+        {
         _watcher = new FileSystemWatcher(OriDir, "*.*")
         {
             IncludeSubdirectories = false,
@@ -192,8 +260,15 @@ public class QqEmojiService : IDisposable
         _watcher.Changed += (_, e) => Enqueue(e.FullPath);
         _watcher.Deleted += (_, e) => Enqueue(e.FullPath);
         _watcher.Renamed += (_, e) => { Enqueue(e.OldFullPath); Enqueue(e.FullPath); };
-        _watcher.Error += (_, _) => _marshal(() => _ = RescanAsync()); // 缓冲溢出兜底：全量重扫
+        _watcher.Error += (_, _) => _watcherFailed = true;
         _watcher.EnableRaisingEvents = true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _watcher?.Dispose();
+            _watcher = null;
+            _watcherFailed = true;
+        }
     }
 
     private void Enqueue(string path)
@@ -201,6 +276,7 @@ public class QqEmojiService : IDisposable
         if (_disposed) return;
         lock (_pendingLock)
         {
+            if (_disposed) return;
             _pending.Add(path);
             _debounce ??= NewDebounce();
             _debounce.Stop();
@@ -208,12 +284,19 @@ public class QqEmojiService : IDisposable
         }
     }
 
-    private System.Timers.Timer NewDebounce() => new(400) { AutoReset = false };
+    private System.Timers.Timer NewDebounce()
+    {
+        var timer = new System.Timers.Timer(400) { AutoReset = false };
+        timer.Elapsed += OnDebounceTick;
+        return timer;
+    }
 
     private async void OnDebounceTick(object? sender, System.Timers.ElapsedEventArgs e)
     {
+        await _refreshLock.WaitAsync();
         try
         {
+            if (_disposed) return;
             string[] paths;
             lock (_pendingLock)
             {
@@ -227,12 +310,13 @@ public class QqEmojiService : IDisposable
                 await ApplyOneAsync(path);
             }
 
-            _marshal(() => MirrorChanged?.Invoke(this, EventArgs.Empty));
+            _marshal(() => { if (!_disposed) MirrorChanged?.Invoke(this, EventArgs.Empty); });
         }
         catch
         {
             // 定时器线程上的兜底：任何异常都不能带崩进程，下次事件/全量重扫自愈
         }
+        finally { _refreshLock.Release(); }
     }
 
     private async Task ApplyOneAsync(string path)
@@ -241,6 +325,7 @@ public class QqEmojiService : IDisposable
         {
             _marshal(() =>
             {
+                if (_disposed) return;
                 var stale = Mirror.FirstOrDefault(m => string.Equals(m.FullPath, path, StringComparison.OrdinalIgnoreCase));
                 if (stale != null) Mirror.Remove(stale);
             });
@@ -276,6 +361,7 @@ public class QqEmojiService : IDisposable
         // 集合变更必须回 UI 线程（Mirror 绑定在列表上）
         _marshal(() =>
         {
+            if (_disposed) return;
             var existing = Mirror.FirstOrDefault(m => string.Equals(m.FullPath, path, StringComparison.OrdinalIgnoreCase));
             if (existing != null)
                 Mirror[Mirror.IndexOf(existing)] = model; // 同名重写入：内容不变（名字即 MD5），仅刷新元数据
@@ -296,8 +382,11 @@ public class QqEmojiService : IDisposable
             _debounce?.Stop();
             _debounce?.Dispose();
             _debounce = null;
+            _recovery?.Stop();
+            _recovery?.Dispose();
+            _recovery = null;
+            _watcher?.Dispose();
+            _watcher = null;
         }
-        _watcher?.Dispose();
-        _watcher = null;
     }
 }

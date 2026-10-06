@@ -12,7 +12,23 @@ public static class ClipboardCapture
     public const int WM_CLIPBOARDUPDATE = 0x031D;
 
     /// <summary>发送到恢复完成的整个窗口期置 true（WindowService 三个发送方法 try/finally 管理）。</summary>
-    public static bool Suppress;
+    public static bool Suppress => Volatile.Read(ref _suppressionCount) > 0;
+    private static int _suppressionCount;
+
+    public static IDisposable BeginSuppression()
+    {
+        Interlocked.Increment(ref _suppressionCount);
+        return new SuppressionScope();
+    }
+
+    private sealed class SuppressionScope : IDisposable
+    {
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0) Interlocked.Decrement(ref _suppressionCount);
+        }
+    }
 
     [DllImport("user32.dll")]
     private static extern bool AddClipboardFormatListener(IntPtr hwndOwner);

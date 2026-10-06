@@ -16,41 +16,64 @@ public enum QqSyncStrategy
     Adopt = 2,
 }
 
+public enum QqAdoptionResult { Added, AlreadyExists, Failed }
+
 /// <summary>
 /// QQ 收藏深度同步（Phase B）：解密各绑定账号的 emoji.db，读出权威收藏 MD5 集合，
 /// 与 Ori 目录对账 → 按策略处理孤儿。失败一律良性：返回 false 让上层降级回目录镜像模式。
 /// </summary>
 public class QqDeepSyncService
 {
+    public const int Deferred = -3;
+    public const int AdoptionFailed = -4;
+    public const int AuthenticationFailed = -5;
     private readonly string _dbKey;
     private readonly Func<string, QqEmojiService?> _serviceOf;
-    private readonly Func<QqStickerModel, Task<bool>> _adoptToLibrary;
+    private readonly Func<QqStickerModel, Task<QqAdoptionResult>> _adoptToLibrary;
+    private readonly Func<string, Task<(HashSet<string>? Md5s, bool Deferred)>>? _readIndex;
 
-    /// <param name="adoptToLibrary">宿主提供的收编实现（复制进图库，无 QQ 标签，MD5 去重）。返回 false=重复/失败。</param>
     public QqDeepSyncService(string dbKey, Func<string, QqEmojiService?> serviceOf,
-        Func<QqStickerModel, Task<bool>> adoptToLibrary)
+        Func<QqStickerModel, Task<bool>> adoptToLibrary,
+        Func<string, Task<(HashSet<string>? Md5s, bool Deferred)>>? readIndex = null)
+        : this(dbKey, serviceOf, async sticker => await adoptToLibrary(sticker)
+            ? QqAdoptionResult.Added : QqAdoptionResult.Failed, readIndex) { }
+
+    public QqDeepSyncService(string dbKey, Func<string, QqEmojiService?> serviceOf,
+        Func<QqStickerModel, Task<QqAdoptionResult>> adoptToLibrary,
+        Func<string, Task<(HashSet<string>? Md5s, bool Deferred)>>? readIndex = null)
     {
         _dbKey = dbKey;
         _serviceOf = serviceOf;
         _adoptToLibrary = adoptToLibrary;
+        _readIndex = readIndex;
     }
 
-    /// <summary>对全部绑定账号执行对账。返回处理的孤儿数；-1 = 失败（不抛出，调用方降级/引导重读）。</summary>
+    /// <summary>返回处理的孤儿数；-1 = 读取失败；Deferred = 快照不稳定，保留密钥和镜像。</summary>
     public async Task<int> ReconcileAllAsync(List<string> uins, QqSyncStrategy strategy)
     {
         try
         {
-            int orphanCount = 0;
-            foreach (var uin in uins)
+            var snapshots = new List<(QqEmojiService Service, HashSet<string> Index)>();
+            foreach (var uin in uins.Distinct())
             {
                 var service = _serviceOf(uin);
                 if (service == null) continue;
 
-                var indexedMd5 = await ReadAuthoritativeMd5sAsync(uin);
+                var (indexedMd5, deferred) = await (_readIndex?.Invoke(uin) ?? ReadAuthoritativeMd5sAsync(uin));
+                if (deferred) return Deferred;
                 if (indexedMd5 == null) return -1; // 解密失败 → 整体降级
 
-                // 目录有、索引无 = 孤儿（QQ 已取消收藏但缓存残留）；Md5 为空的残留也按孤儿处理
-                var orphans = service.Mirror.Where(m => !indexedMd5.Contains(m.Md5 ?? "")).ToList();
+                snapshots.Add((service, new HashSet<string>(indexedMd5, StringComparer.OrdinalIgnoreCase)));
+            }
+
+            int orphanCount = 0;
+            bool adoptionFailed = false;
+            foreach (var (service, index) in snapshots)
+            {
+                foreach (var item in service.Mirror.Where(m => m.Md5 != null && index.Contains(m.Md5)))
+                    item.IsOrphaned = false;
+                // Unknown cache names are not evidence of removed favorites.
+                var orphans = service.Mirror.Where(m => IsMd5(m.Md5) && !index.Contains(m.Md5!)).ToList();
                 orphanCount += orphans.Count;
                 foreach (var orphan in orphans)
                 {
@@ -60,8 +83,13 @@ public class QqDeepSyncService
                             service.Mirror.Remove(orphan);
                             break;
                         case QqSyncStrategy.Adopt:
-                            if (await _adoptToLibrary(orphan)) { /* 收编成功 */ }
-                            service.Mirror.Remove(orphan); // 重复也已入图库，同样出镜像
+                            var result = await _adoptToLibrary(orphan);
+                            if (result == QqAdoptionResult.Failed)
+                            {
+                                orphan.IsOrphaned = true;
+                                adoptionFailed = true;
+                            }
+                            else service.Mirror.Remove(orphan);
                             break;
                         default:
                             orphan.IsOrphaned = true;
@@ -69,7 +97,11 @@ public class QqDeepSyncService
                     }
                 }
             }
-            return orphanCount;
+            return adoptionFailed ? AdoptionFailed : orphanCount;
+        }
+        catch (System.Security.Cryptography.CryptographicException)
+        {
+            return AuthenticationFailed;
         }
         catch
         {
@@ -77,34 +109,45 @@ public class QqDeepSyncService
         }
     }
 
-    /// <summary>解密某账号的 emoji.db（只读快照到临时目录），返回权威收藏 MD5 集合；失败返回 null。</summary>
-    private async Task<HashSet<string>?> ReadAuthoritativeMd5sAsync(string uin)
+    private static bool IsMd5(string? value) => value is { Length: 32 } && value.All(char.IsAsciiHexDigit);
+
+    public async Task<bool> ConfirmOrphanAsync(QqStickerModel sticker)
+    {
+        if (!IsMd5(sticker.Md5) || _serviceOf(sticker.Uin) == null) return false;
+        var (index, deferred) = await (_readIndex?.Invoke(sticker.Uin) ?? ReadAuthoritativeMd5sAsync(sticker.Uin));
+        if (deferred || index == null) return false;
+        bool orphan = !index.Contains(sticker.Md5!, StringComparer.OrdinalIgnoreCase);
+        sticker.IsOrphaned = orphan;
+        return orphan;
+    }
+
+    /// <summary>读取账号索引；区分读取失败与数据库仍在写入的暂缓状态。</summary>
+    private async Task<(HashSet<string>? Md5s, bool Deferred)> ReadAuthoritativeMd5sAsync(string uin)
     {
         string? tempDir = null;
         try
         {
-            var dbPath = Path.Combine(QqEmojiService.TencentFilesRoot, uin, "nt_qq", "nt_db", "emoji.db");
-            if (!File.Exists(dbPath)) return new HashSet<string>(StringComparer.Ordinal); // 无库 = 无收藏记录
+            var dbPath = _serviceOf(uin)?.DatabasePath ?? Path.Combine(QqEmojiService.TencentFilesRoot, uin, "nt_qq", "nt_db", "emoji.db");
+            if (!File.Exists(dbPath)) return (null, false);
+            var wal = dbPath + "-wal";
+            if (File.Exists(wal) && new FileInfo(wal).Length is > 0 and < 32) return (null, true);
 
             tempDir = Path.Combine(Path.GetTempPath(), "asuka-deepsync", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tempDir);
-            var snapshot = Path.Combine(tempDir, "emoji.db");
-            await Task.Run(() => File.Copy(dbPath, snapshot, overwrite: true));
-            var wal = dbPath + "-wal";
-            if (File.Exists(wal))
-            {
-                try { File.Copy(wal, snapshot + "-wal", true); } catch { /* 快照尽力 */ }
-            }
-
-            var encrypted = await File.ReadAllBytesAsync(snapshot);
-            var plain = await Task.Run(() => SqlcipherDecryptor.Decrypt(encrypted, _dbKey));
+            var snapshot = await QqDatabaseSnapshot.ReadAsync(dbPath);
+            byte[] plain;
+            try { plain = await Task.Run(() => SqlcipherDecryptor.Decrypt(snapshot.Database, _dbKey, snapshot.Wal)); }
+            catch (InvalidDataException) when (snapshot.Wal is { Length: > 0 }) { return (null, true); }
             var plainPath = Path.Combine(tempDir, "plain.db");
             await File.WriteAllBytesAsync(plainPath, plain);
-            return await Task.Run(() => ReadFavMd5s(plainPath));
+            var result = await Task.Run(() => ReadFavMd5s(plainPath));
+            return (result, false);
         }
+        catch (QqSnapshotChangedException) { return (null, true); }
+        catch (System.Security.Cryptography.CryptographicException) { throw; }
         catch
         {
-            return null; // 密钥失效/QQ 更新改结构 → 降级
+            return (null, false); // 密钥失效/QQ 更新改结构 → 降级
         }
         finally
         {
@@ -127,13 +170,19 @@ public class QqDeepSyncService
             }.ToString());
         conn.Open();
         using var cmd = conn.CreateCommand();
-        // 列名是混淆的纯数字（MD5 在 "80011"），必须双引号引用
-        cmd.CommandText = "SELECT \"80011\" FROM fav_emoji_info_storage_table WHERE \"80011\" IS NOT NULL AND \"80011\" != ''";
+        cmd.CommandText = "PRAGMA quick_check";
+        if (!string.Equals(Convert.ToString(cmd.ExecuteScalar()), "ok", StringComparison.Ordinal))
+            throw new InvalidDataException("QQ 索引结构完整性检查失败");
+        // Brackets reject a missing column; SQLite can interpret a double-quoted
+        // unknown identifier as a string literal and incorrectly return an empty index.
+        cmd.CommandText = "SELECT [80011] FROM fav_emoji_info_storage_table WHERE [80011] IS NOT NULL AND [80011] != ''";
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
             var md5 = reader.GetString(0).ToUpperInvariant();
-            if (md5.Length == 32) result.Add(md5);
+            if (md5.Length != 32 || !md5.All(char.IsAsciiHexDigit))
+                throw new InvalidDataException("QQ 收藏索引包含无法识别的 MD5");
+            result.Add(md5);
         }
         return result;
     }

@@ -163,11 +163,11 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 **QQ 联动**
 | 设置 | 说明 |
 |---|---|
-| 绑定 QQ 表情… | 扫描本机 QQ 账号，多选绑定 / 解绑；每个绑定一个「QQ（别名）」选项卡 |
+| 绑定 QQ 表情… | 扫描本机 QQ 账号，多选绑定 / 解绑；可选择自定义数字账号目录；每个绑定一个「QQ（别名）」选项卡 |
 | QQ 表情面板共存 | 点开 QQ 表情面板时，自动在旁边弹出快捷面板 |
-| 轮询保底 | 推荐快捷面板弹出异常时开启；开启后会定期查询 QQ 的表情面板状态，保证联动不失效，对性能影响很小 |
+| 轮询保底 | 快捷面板联动异常时可开启额外状态检测；不能保证恢复所有 QQ 版本的无障碍接口差异 |
 | QQ 新收藏自动入库 | 在 QQ 里点「添加到表情」后，自动复制进图库并打「QQ」标签；关闭则不自动导入 |
-| QQ 收藏深度同步 | 推荐想自动识别「已在 QQ 取消收藏的表情」时开启；开启时会引导你用官方工具读取一次收藏索引来保证识别准确，仅需登录一次。开启后可选择发现已取消收藏的表情时的处理方式：仅标记 / 同步删除 / 挪入图库 |
+| QQ 收藏深度同步 | 可选择第三方工具立即读取密钥，或在下次 QQ 登录时尝试自动读取；读取本机收藏索引后可选择仅标记 / 同步删除 / 挪入图库。索引不稳定或格式不支持时保留镜像并提示 |
 
 **图库 / 资源库**
 | 设置 | 说明 |
@@ -178,16 +178,22 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 | WebP 图片支持 | 显示系统 WebP 解码支持状态；未安装时可跳转微软商店安装「WebP 图像扩展」，支持重新检测 |
 | 打开表情存放文件夹 | 直接打开本地图库目录 |
 
-**数据位置**：所有数据都在 `文档\OICQStickerManager\`（`Library` 图片库 + `stickers.json` 标签
-+ `config.json` 配置），备份 / 迁移拷走整个文件夹即可。
+**数据位置**：图库、标签和用户配置默认在 `文档\OICQStickerManager\`（`Library` 图片库 +
+`stickers.json` 标签 + `config.json` 配置）。可通过 `ASUKA_DATA_DIR` 指定独立数据目录。
+备份 / 迁移应保留整个目录；密钥使用 Windows 当前用户级 DPAPI 保护，跨用户或机器通常需要重新读取。
 
 ## 🔒 隐私与安全
 
-- 表情与配置**全部存本机**，核心功能**零网络行为**、**零注入**——不修改 QQ 任何文件与内存；
-- QQ 联动基于只读文件系统监视与 Windows UI 自动化（纯只读感知），与 QQ 官方功能并行不悖；
-- 深度同步（默认关）是唯一的例外：开启时会从 GitHub 下载第三方开源脚本
-  [QQBackup/qq-win-db-key](https://github.com/QQBackup/qq-win-db-key) 读取一次收藏索引，
-  密钥只保存在本机。全过程只读，不注入、不写入 QQ，失败自动降级、不影响其他功能。
+- 表情与配置存本机；常规图库、快捷面板和目录镜像不需要联网，不改写 QQ 数据库。
+- 发送通过剪贴板和 Windows 输入接口完成，发送前检查目标窗口；系统全局输入仍存在切窗竞态，不能承诺绝对不会错发。
+- 深度同步默认关闭。立即读取方式会下载固定提交、校验 SHA256 的第三方开源脚本
+  [QQBackup/qq-win-db-key](https://github.com/QQBackup/qq-win-db-key)，启动由助手管理的额外 QQ 进程。
+  程序按启动器配置明确选择对应模块，多版本目录不按最新版猜测；运行模块与启动配置不一致时拒绝继续读取，需重新启动 QQ 后再尝试。
+  下次自动方式在新 QQ 进程上短暂附加调试器，使用硬件断点，不改写目标代码，并在成功、超时和取消后恢复寄存器、分离。
+  两种方式均不是腾讯官方接口，可能受 QQ 更新、权限和安全软件影响；自动附加目前仅适用于原生 AMD64 QQ。
+- 密钥以当前 Windows 用户级保护保存，诊断日志不记录原始密钥。辅助脚本缓存位于本机 LocalAppData，临时诊断文件位于 TEMP。
+- 权威索引使用本地加密主库及已提交 WAL 快照，不主动 checkpoint 或改写 QQ 数据库。
+  用户主动选择「删除缓存残留」时，会删除对应 QQ Ori 缓存文件；自动同步删除策略只摘除镜像条目。
 
 ## ⚠️ 已知限制
 
@@ -195,7 +201,20 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 - 动画 WebP 无法入库显示（会转成静态 PNG）；GIF 完整支持；
 - 快捷面板是非激活窗口（不抢聊天焦点），因此面板内没有搜索框，🔍 会跳转主窗口搜索；
 - 微信等无 UI 自动化联动的应用，请使用全局热键唤出快捷面板；
-- QQ 大版本更新可能导致共存联动失灵，属良性降级——开启「轮询保底」即可恢复。
+- QQ 更新可能导致共存联动失灵；轮询不能保证修复版本差异，热键面板仍保留。旧版本与混合 DPI 需要分别验证。
+- QQ 界面探测运行在可回收的辅助进程；订阅、查树或诊断超时会回收并重启该进程，主窗口和热键保留。旧版发送仍须确认编辑区焦点，失败会取消粘贴。
+
+## 兼容性回归
+
+Windows / .NET 10 SDK 下执行：
+
+```powershell
+dotnet run --project probes\CompatibilityTests\CompatibilityTests.csproj -c Release -p:OutputPath=bin\audit\tests\
+dotnet build OICQStickerManager.csproj -c Release -p:OutputPath=bin\audit\app\
+```
+
+探针使用临时数据目录、自有隐藏窗口和自有助手进程，不向真实 QQ 会话发送消息。
+组件回归不能代替旧 QQ、输入法、权限与多显示器的真机验收；详情见 [审查报告](docs/CODE-QUALITY-AND-COMPATIBILITY-AUDIT.md)。
 
 ## 📄 许可
 

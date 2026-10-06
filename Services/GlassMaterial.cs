@@ -13,6 +13,13 @@ public static class GlassMaterial
     private static int _opacityPercent = 70;
     private static bool _themeHooked;
 
+    internal static SolidColorBrush CreateBrush(Color color, bool blurAvailable)
+    {
+        var brush = new SolidColorBrush(Color.FromArgb(blurAvailable ? (byte)Math.Round(OpacityPercent * 2.55) : (byte)255, color.R, color.G, color.B));
+        brush.Freeze();
+        return brush;
+    }
+
     /// <summary>材质不透明度（百分比 50-100，默认 70）。</summary>
     public static int OpacityPercent
     {
@@ -42,9 +49,6 @@ public static class GlassMaterial
     {
         if (Application.Current?.TryFindResource("GlassOverlayBrush") is not SolidColorBrush brush) return;
         var c = brush.Color;
-        var adjusted = Color.FromArgb((byte)Math.Round(OpacityPercent * 2.55), c.R, c.G, c.B);
-        var frozen = new SolidColorBrush(adjusted);
-        frozen.Freeze();
-        Application.Current.Resources["GlassOverlayBrush"] = frozen;
+        Application.Current.Resources["GlassOverlayBrush"] = CreateBrush(c, true);
     }
 }

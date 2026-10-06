@@ -14,11 +14,13 @@ namespace OICQStickerManager.Services;
 internal sealed class BlurTile : IDisposable
 {
     private IntPtr _hwnd;
+    internal bool AccentAvailable => _accentOn;
 
     private BlurTile() { }
 
     public static BlurTile? Create(int x, int y, int w, int h, bool topmost, bool round = false)
     {
+        if (DwmIsCompositionEnabled(out bool enabled) != 0 || !enabled) return null;
         EnsureClass();
         var hwnd = CreateWindowExW(
             (uint)(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | (topmost ? WS_EX_TOPMOST : 0)),
@@ -27,11 +29,17 @@ internal sealed class BlurTile : IDisposable
         if (hwnd == IntPtr.Zero) return null;
 
         var tile = new BlurTile { _hwnd = hwnd };
-        var margins = new MARGINS { cxLeftWidth = -1, cxRightWidth = -1, cyTopHeight = -1, cyBottomHeight = -1 };
-        DwmExtendFrameIntoClientArea(hwnd, ref margins);
-        tile._rounded = round;
-        if (round) tile.ApplyRounding();
-        return tile;
+        try
+        {
+            var margins = new MARGINS { cxLeftWidth = -1, cxRightWidth = -1, cyTopHeight = -1, cyBottomHeight = -1 };
+            if (DwmExtendFrameIntoClientArea(hwnd, ref margins) != 0) { tile.Dispose(); return null; }
+            tile._rounded = round;
+            if (round) tile.ApplyRounding();
+            tile.ApplyAccent();
+            if (!tile._accentOn) { tile.Dispose(); return null; }
+            return tile;
+        }
+        catch { tile.Dispose(); throw; }
     }
 
     /// <summary>移动/缩放拼片（物理像素）。零尺寸 = 隐藏（不参与拼接）。
@@ -151,8 +159,7 @@ internal sealed class BlurTile : IDisposable
                 Data = ptr,
                 SizeOfData = Marshal.SizeOf<ACCENT_POLICY>(),
             };
-            SetWindowCompositionAttribute(_hwnd, ref data);
-            _accentOn = true;
+            _accentOn = SetWindowCompositionAttribute(_hwnd, ref data);
             if (_rounded) ApplyRounding(); // 圆角偏好理论上随窗口存续，重涂一次防各处 SW 重置
         }
         finally
@@ -294,6 +301,7 @@ internal sealed class BlurTile : IDisposable
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS margins);
+    [DllImport("dwmapi.dll")] private static extern int DwmIsCompositionEnabled([MarshalAs(UnmanagedType.Bool)] out bool enabled);
 
     private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
     private const int DWMWCP_ROUND = 2;

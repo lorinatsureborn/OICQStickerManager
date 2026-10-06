@@ -34,10 +34,11 @@ public class StickerModel : ViewModelBase // 💡 继承基类
         get => _tags;
         set
         {
+            value ??= new List<string>();
             // 同引用或同内容都不发通知：启动装载/镜像对账会批量重建列表，无差别通知是全列表绑定刷新
             if (ReferenceEquals(_tags, value)) return;
             if (value is List<string> incoming && _tags.SequenceEqual(incoming)) { _tags = incoming; return; }
-            _tags = value!;
+            _tags = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(DisplayName));
         }
