@@ -396,25 +396,48 @@ public class AiTagService
     /// <summary>从模型输出里抠出 JSON 字符串数组（容忍 markdown 代码块包裹与 &lt;think&gt; 思考块前缀），清洗为合法标签。</summary>
     public static List<string> ParseTags(string content, AiTagOptions opt, string rawBody = "")
     {
-        var text = StripThinkBlock(content).Trim();
-        var start = text.IndexOf('[');
-        var end = text.LastIndexOf(']');
-        if (start < 0 || end <= start)
-            throw new AiTagException(
-                "模型没有按约定返回标签列表，请重试；若反复出现，请在设置页换一个模型。",
-                $"unparseable content={Clip(content, 300)} body={Clip(rawBody, 200)}");
-        List<string>? list;
-        try
+        // 先做全角归一再搜索候选：中文模型可能连外层括号都打成【】
+        var text = NormalizeFullWidthPunctuation(StripThinkBlock(content).Trim());
+
+        // 多级候选，逐个尝试解析（2026-10-06 实测 deepseek-flash 会输出全角逗号/在答案前后夹杂说明，
+        // 首尾截取一把抓会撞上非 JSON 字节如全角"，"(EF BC 8C) 直接炸掉整个请求）：
+        // ①原文首尾截取 ②全角归一后 ③扫描全部 [..] 疑似数组（各自全角归一）
+        var candidates = new List<string>();
+        var s = text.IndexOf('[');
+        var e = text.LastIndexOf(']');
+        if (s >= 0 && e > s) candidates.Add(text[s..(e + 1)]);
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(text, @"\[[^\[\]]*\]"))
+            candidates.Add(m.Value);
+
+        List<string>? parsed = null;
+        string? lastError = null;
+        foreach (var c in candidates)
         {
-            list = JsonSerializer.Deserialize<List<string>>(text[start..(end + 1)], JsonOpts);
+            foreach (var v in new[] { c, NormalizeFullWidthPunctuation(c) })
+            {
+                if (parsed != null) break;
+                try
+                {
+                    parsed = JsonSerializer.Deserialize<List<string>>(v.Trim(), JsonOpts);
+                }
+                catch (Exception ex) { lastError = $"{ex.Message} candidate={Clip(v, 120)}"; }
+            }
+            if (parsed != null) break;
         }
-        catch (Exception ex)
+
+        if (parsed == null)
         {
+            if (candidates.Count == 0)
+                throw new AiTagException(
+                    "模型没有按约定返回标签列表，请重试；若反复出现，请在设置页换一个模型。",
+                    $"unparseable content={Clip(content, 300)} body={Clip(rawBody, 200)}");
             throw new AiTagException(
                 "模型返回的标签列表无法解析，请重试；若反复出现，请在设置页换一个模型。",
-                $"json parse failed: {ex.Message} content={Clip(content, 300)}", ex);
+                $"json parse failed: {lastError} content={Clip(content, 300)}");
         }
-        var tags = (list ?? new List<string>())
+
+        var tags = parsed
             .Select(t => (t ?? "").Trim())
             .Where(t => t.Length > 0 && t.Length <= 20)
             .Select(t => t.Replace('\n', ' ').Replace('\r', ' '))
@@ -427,6 +450,12 @@ public class AiTagService
                 $"empty tag list content={Clip(content, 300)}");
         return tags;
     }
+
+    /// <summary>全角标点归一：中文模型常把数组里的逗号/引号/括号打成全角（EF BC 8C 等），JSON 解析必炸。</summary>
+    public static string NormalizeFullWidthPunctuation(string s) => s
+        .Replace('，', ',').Replace('．', '.').Replace('：', ':')
+        .Replace('“', '"').Replace('”', '"')
+        .Replace('【', '[').Replace('】', ']');
 
     /// <summary>剥掉思考型模型的 &lt;think&gt;…&lt;/think&gt; 块（GLM-4.1V-Thinking 等把思考混进 content）。</summary>
     public static string StripThinkBlock(string text)

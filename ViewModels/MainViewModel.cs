@@ -730,7 +730,18 @@ public class MainViewModel : ViewModelBase
             if (_aiTagApiKey == value) return;
             _aiTagApiKey = value;
             OnPropertyChanged();
-            if (!_aiProfileSwitching) DetachActiveProfile();
+            if (!_aiProfileSwitching)
+            {
+                DetachActiveProfile();
+                // 前缀可识别 → 立即锁定厂商（摆脱 auto）：静态模型清单/思考档位随即可见，
+                // 不必等测试；识别不出保持 auto，由用户在芯片里手选
+                if (_aiTagProvider == "auto" && _aiTagApiKey.Length > 0
+                    && AiTagService.DetectProviderId(_aiTagApiKey) is { Length: > 0 } detected)
+                {
+                    _aiTagProvider = detected;
+                    OnPropertyChanged(nameof(AiTagProvider));
+                }
+            }
             NotifyAiConfigState();
             _ = SaveConfigAsync();
         }

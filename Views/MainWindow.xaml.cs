@@ -1653,7 +1653,9 @@ namespace OICQStickerManager.Views
             AiProviderKnownSection.Visibility = providerKnown ? Visibility.Visible : Visibility.Collapsed;
             if (providerKnown)
             {
-                var how = vm.AiTagProvider == "auto" ? "根据 Key 自动识别" : "手动选择";
+                var autoLocked = vm.AiTagProvider != "auto"
+                    && AiTagService.DetectProviderId(vm.AiTagApiKey) == vm.AiTagProvider;
+                var how = vm.AiTagProvider == "auto" || autoLocked ? "根据 Key 自动识别" : "手动选择";
                 var model = vm.AiTagModel.Length > 0 ? vm.AiTagModel : knownProvider.DefaultModel;
                 AiProviderKnownText.Text = $"{knownProvider.Name}（{how}）· 默认模型 {model}";
             }
