@@ -83,4 +83,11 @@ public class AppConfig
     // 自定义服务商的接口地址（OpenAI 兼容 /chat/completions 根，如 https://xxx/v1）
     public string AiTagBaseUrl { get; set; } = "";
 
+    // 思考强度档位（空=服务商默认；合法值随服务商，见 AiProviderDef.EffortLevels）
+    public string AiTagEffort { get; set; } = "";
+
+    // 已验证的 Key 档案列表 + 激活档案（多 Key 管理：测试通过后命名保存，随时切换）
+    public List<AiKeyProfile> AiKeyProfiles { get; set; } = new();
+    public string AiActiveProfileId { get; set; } = "";
+
 }

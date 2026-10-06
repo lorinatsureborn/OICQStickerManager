@@ -548,8 +548,18 @@
                             <!-- AI 视觉模型建议（点 AI 建议按钮后出现，点击即加；缓存结果可「重新识别」强刷） -->
                             <StackPanel x:Name="AiSuggestSection" Visibility="Collapsed" Margin="0,10,0,0">
                                 <Grid>
-                                    <TextBlock Text="AI 建议（点击添加）" Style="{StaticResource CaptionTextStyle}"
-                                               VerticalAlignment="Center"/>
+                                    <StackPanel Orientation="Horizontal">
+                                        <!-- 识别中的旋转反馈：请求已发出，正在等待回复（防用户以为失效而多击） -->
+                                        <TextBlock x:Name="AiSpinIcon" FontFamily="{StaticResource IconFontFamily}" Text="&#xE72C;"
+                                                   FontSize="12" VerticalAlignment="Center" Visibility="Collapsed"
+                                                   Foreground="{DynamicResource AccentBrush}" RenderTransformOrigin="0.5,0.5">
+                                            <TextBlock.RenderTransform>
+                                                <RotateTransform x:Name="AiSpinTransform" Angle="0"/>
+                                            </TextBlock.RenderTransform>
+                                        </TextBlock>
+                                        <TextBlock Text="AI 建议（点击添加）" Style="{StaticResource CaptionTextStyle}"
+                                                   VerticalAlignment="Center"/>
+                                    </StackPanel>
                                     <TextBlock x:Name="AiSuggestMetaText" HorizontalAlignment="Right"
                                                Style="{StaticResource CaptionTextStyle}" TextWrapping="Wrap"
                                                MaxWidth="300" TextAlignment="Right"
@@ -999,6 +1009,13 @@
                             <TextBlock Text="AI 识别" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
                             <Border Style="{StaticResource SettingsGroupStyle}">
                                 <StackPanel>
+                                    <!-- 已保存的 Key 档案：点选即切换（Key/服务商/模型/思考强度整体生效） -->
+                                    <StackPanel x:Name="AiProfilesSection" Margin="16,11" Visibility="Collapsed">
+                                        <TextBlock Text="已保存的 API Key" Style="{StaticResource BodyTextStyle}"/>
+                                        <StackPanel x:Name="AiProfilesPanel" Margin="0,8,0,0"/>
+                                    </StackPanel>
+                                    <Border x:Name="AiProfilesSeparator" Height="1" Background="{DynamicResource SeparatorBrush}"
+                                            Margin="16,0" Visibility="Collapsed"/>
                                     <Grid Margin="16,11">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
@@ -1010,12 +1027,15 @@
                                                        Style="{StaticResource FootnoteTextStyle}"
                                                        Margin="0,2,0,0" TextWrapping="Wrap"/>
                                         </StackPanel>
-                                        <Button x:Name="AiTestButton" Grid.Column="1" Style="{StaticResource TextButtonStyle}"
-                                                Content="测试连接" FontSize="12" Height="26" Padding="10,0"
+                                        <Button x:Name="AiTestButton" Grid.Column="1" Style="{StaticResource AccentButtonStyle}"
+                                                Content="测试并保存" MinWidth="96" FontSize="12" Height="30"
                                                 VerticalAlignment="Center" Margin="10,0,0,0" Click="AiTest_Click"
-                                                AutomationProperties.Name="测试 AI 识别连接"
-                                                ToolTip="用一张小测试图真实调用一次接口，验证 Key、模型与网络是否可用"/>
+                                                AutomationProperties.Name="测试 API Key 并保存为档案"
+                                                ToolTip="用小图真实调用验证 Key，并自动检测可用的视觉模型；通过后命名保存，随时可切换"/>
                                     </Grid>
+                                    <TextBlock x:Name="AiDraftHint" Margin="16,0,16,8" Style="{StaticResource FootnoteTextStyle}"
+                                               Text="当前配置尚未保存为档案：测试通过并命名后会加入上方列表" TextWrapping="Wrap"
+                                               Visibility="Collapsed"/>
                                     <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
                                     <StackPanel Margin="16,11">
                                         <TextBlock Text="API Key" Style="{StaticResource BodyTextStyle}"/>
@@ -1044,6 +1064,16 @@
                                         <TextBlock Text="接口地址" Style="{StaticResource BodyTextStyle}"/>
                                         <TextBox x:Name="AiBaseUrlBox" Margin="0,8,0,0" Tag="https://example.com/v1（OpenAI 兼容）"
                                                  Text="{Binding AiTagBaseUrl, UpdateSourceTrigger=LostFocus, Delay=200}"/>
+                                    </StackPanel>
+                                    <StackPanel x:Name="AiEffortSection" Margin="16,0,16,11" Visibility="Collapsed">
+                                        <TextBlock Text="思考强度" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBlock Text="档位越高回答越准但越慢；该模型的合法档位已按接口适配"
+                                                   Style="{StaticResource FootnoteTextStyle}" Margin="0,2,0,0"
+                                                   TextWrapping="Wrap"/>
+                                        <Border Background="{DynamicResource FieldBrush}" CornerRadius="11"
+                                                Padding="2" Height="32" Margin="0,9,0,0">
+                                            <UniformGrid x:Name="AiEffortPanel" Columns="4"/>
+                                        </Border>
                                     </StackPanel>
                                     <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
                                     <StackPanel Margin="16,11">
@@ -1267,6 +1297,31 @@
                                 Width="88" Click="CloseQqRename_Click"/>
                         <Button Style="{StaticResource AccentButtonStyle}" Content="保存"
                                 Width="88" Margin="10,0,0,0" Click="SaveQqRename_Click"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- ———— AI 档案命名 sheet（测试并保存通过后） ———— -->
+        <Grid x:Name="AiProfileNameOverlay" Grid.Row="0" Grid.RowSpan="3"
+              Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+              Opacity="0" MouseLeftButtonDown="OverlayScrim_Click">
+            <Border x:Name="AiProfileNameSheet" Style="{StaticResource SheetCardStyle}"
+                    Width="420" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5" Opacity="0">
+                <Border.RenderTransform>
+                    <ScaleTransform x:Name="AiProfileNameSheetScale" ScaleX="0.94" ScaleY="0.94"/>
+                </Border.RenderTransform>
+                <StackPanel Margin="26">
+                    <TextBlock Text="保存这份 API Key" Style="{StaticResource TitleTextStyle}"/>
+                    <TextBlock Style="{StaticResource FootnoteTextStyle}" Margin="0,4,0,0" TextWrapping="Wrap"
+                               x:Name="AiProfileNameSubtitle"/>
+                    <TextBox x:Name="AiProfileNameBox" Margin="0,16,0,0" Tag="给这份 Key 起个名字"
+                             KeyDown="AiProfileNameBox_KeyDown"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+                        <Button Style="{StaticResource TextButtonStyle}" Content="取消"
+                                Width="88" Click="AiProfileNameCancel_Click"/>
+                        <Button Style="{StaticResource AccentButtonStyle}" Content="保存"
+                                Width="88" Margin="10,0,0,0" Click="AiProfileNameSave_Click"/>
                     </StackPanel>
                 </StackPanel>
             </Border>

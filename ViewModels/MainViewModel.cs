@@ -719,7 +719,8 @@ public class MainViewModel : ViewModelBase
     public AiTagService AiTag { get; } = new();
 
     private string _aiTagApiKey = "";
-    /// <summary>服务商 API Key（明文本机存储，与 QqDbKey 同口径；不上传任何服务器）。</summary>
+    /// <summary>服务商 API Key（明文本机存储，与 QqDbKey 同口径；不上传任何服务器）。
+    /// 修改 Key 意味着"正在录入另一份配置"：脱离激活档案进入草稿态，测试通过后另存为新档案。</summary>
     public string AiTagApiKey
     {
         get => _aiTagApiKey;
@@ -729,13 +730,15 @@ public class MainViewModel : ViewModelBase
             if (_aiTagApiKey == value) return;
             _aiTagApiKey = value;
             OnPropertyChanged();
+            if (!_aiProfileSwitching) DetachActiveProfile();
             NotifyAiConfigState();
             _ = SaveConfigAsync();
         }
     }
 
     private string _aiTagProvider = "auto";
-    /// <summary>服务商 id：auto=按 Key 前缀自动识别；其余见 AiTagService.Providers。</summary>
+    /// <summary>服务商 id：auto=按 Key 前缀自动识别；其余见 AiTagService.Providers。
+    /// 修改服务商同样脱离激活档案（与 Key 一起构成一份新配置）。</summary>
     public string AiTagProvider
     {
         get => _aiTagProvider;
@@ -745,9 +748,18 @@ public class MainViewModel : ViewModelBase
             if (_aiTagProvider == value) return;
             _aiTagProvider = value;
             OnPropertyChanged();
+            if (!_aiProfileSwitching) DetachActiveProfile();
             NotifyAiConfigState();
             _ = SaveConfigAsync();
         }
+    }
+
+    /// <summary>改 Key/服务商 = 录入新配置：脱离激活档案（草稿态，档案原值不动）。</summary>
+    private void DetachActiveProfile()
+    {
+        if (_aiActiveProfileId.Length == 0) return;
+        _aiActiveProfileId = "";
+        OnPropertyChanged(nameof(AiActiveProfileId));
     }
 
     private string _aiTagModel = "";
@@ -780,6 +792,115 @@ public class MainViewModel : ViewModelBase
         }
     }
 
+    private string _aiTagEffort = "";
+    /// <summary>思考强度档位（空=服务商默认）。档位集合随服务商（AiProviderDef.EffortLevels），非法档位由 400 去参重试兜底。</summary>
+    public string AiTagEffort
+    {
+        get => _aiTagEffort;
+        set
+        {
+            value = value?.Trim() ?? "";
+            if (_aiTagEffort == value) return;
+            _aiTagEffort = value;
+            OnPropertyChanged();
+            if (_aiProfileSwitching) return;
+            _activeProfile?.Effort = value; // 模型/强度是使用偏好：即时写回激活档案
+            _ = SaveConfigAsync();
+        }
+    }
+
+    // ———— AI Key 档案（多 Key 管理：测试通过 → 命名保存 → 随时切换）————
+
+    /// <summary>档案列表为持久事实源；工作配置（上面的 AiTag* 属性）是编辑区当前值。</summary>
+    public List<AiKeyProfile> AiKeyProfiles { get; } = new();
+
+    private string _aiActiveProfileId = "";
+    public string AiActiveProfileId => _aiActiveProfileId;
+
+    private AiKeyProfile? _activeProfile => AiKeyProfiles.FirstOrDefault(p => p.Id == _aiActiveProfileId);
+
+    /// <summary>档案切换/迁移期间置 true：工作配置 setter 不做脱钩、不重复写档案。</summary>
+    private bool _aiProfileSwitching;
+
+    /// <summary>把工作配置四字段 + 思考强度写入指定档案。</summary>
+    private void CopyWorkConfigToProfile(AiKeyProfile p)
+    {
+        p.ProviderId = _aiTagProvider;
+        p.ApiKey = _aiTagApiKey;
+        p.BaseUrl = _aiTagBaseUrl;
+        p.Model = _aiTagModel;
+        p.Effort = _aiTagEffort;
+    }
+
+    /// <summary>激活某档案：档案值写回工作配置（触发 UI 刷新）。</summary>
+    public void ActivateAiProfile(string id)
+    {
+        var p = AiKeyProfiles.FirstOrDefault(x => x.Id == id);
+        if (p == null || _aiActiveProfileId == id) return;
+        _aiProfileSwitching = true;
+        try
+        {
+            _aiActiveProfileId = id;
+            AiTagProvider = p.ProviderId;
+            AiTagApiKey = p.ApiKey;
+            AiTagBaseUrl = p.BaseUrl;
+            AiTagModel = p.Model;
+            AiTagEffort = p.Effort;
+        }
+        finally { _aiProfileSwitching = false; }
+        OnPropertyChanged(nameof(AiActiveProfileId));
+        NotifyAiConfigState();
+        _ = SaveConfigAsync();
+    }
+
+    /// <summary>删除档案；删的是激活档案则回到草稿态（工作配置保持原值，便于改完重存）。</summary>
+    public void DeleteAiProfile(string id)
+    {
+        var p = AiKeyProfiles.FirstOrDefault(x => x.Id == id);
+        if (p == null) return;
+        AiKeyProfiles.Remove(p);
+        if (_aiActiveProfileId == id)
+        {
+            _aiActiveProfileId = "";
+            OnPropertyChanged(nameof(AiActiveProfileId));
+        }
+        NotifyAiConfigState();
+        _ = SaveConfigAsync();
+    }
+
+    /// <summary>把当前工作配置以给定别名存为新档案并激活（「测试并保存」通过后调用；Key 已验证）。</summary>
+    public AiKeyProfile SaveCurrentAsProfile(string name, IReadOnlyList<string> detectedModels)
+    {
+        var p = new AiKeyProfile
+        {
+            Name = string.IsNullOrWhiteSpace(name) ? "未命名 Key" : name.Trim(),
+            VerifiedAt = DateTime.Now,
+            DetectedModels = detectedModels.ToList(),
+        };
+        CopyWorkConfigToProfile(p);
+        AiKeyProfiles.Add(p);
+        _aiProfileSwitching = true;
+        try { _aiActiveProfileId = p.Id; }
+        finally { _aiProfileSwitching = false; }
+        OnPropertyChanged(nameof(AiActiveProfileId));
+        NotifyAiConfigState();
+        _ = SaveConfigAsync();
+        return p;
+    }
+
+    /// <summary>更新激活档案的检测结果（「检测可用视觉模型」重测后）。</summary>
+    public void UpdateActiveProfileDetectedModels(IReadOnlyList<string> models)
+    {
+        var p = _activeProfile;
+        if (p == null) return;
+        p.DetectedModels = models.ToList();
+        p.VerifiedAt = DateTime.Now;
+        _ = SaveConfigAsync();
+    }
+
+    /// <summary>草稿态提示：有 Key 但不属于任何档案（改过 Key/服务商，或删掉了激活档案）。</summary>
+    public bool AiHasUnsavedDraft => _activeProfile == null && _aiTagApiKey.Length > 0;
+
     /// <summary>配置变更后需要联动刷新的派生显示（状态行/引导/预设），统一补通知。</summary>
     private void NotifyAiConfigState()
     {
@@ -792,7 +913,29 @@ public class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(AiCustomUrlVisible));
         OnPropertyChanged(nameof(AiAutoDetectHint));
         OnPropertyChanged(nameof(AiTagConfigured));
+        OnPropertyChanged(nameof(AiHasUnsavedDraft));
+        OnPropertyChanged(nameof(AiKeyProfilesView));
+        OnPropertyChanged(nameof(AiEffortLevels));
+        OnPropertyChanged(nameof(AiEffortVisible));
     }
+
+    /// <summary>档案行的只读视图（列表绑定）。</summary>
+    public IReadOnlyList<AiKeyProfile> AiKeyProfilesView => AiKeyProfiles;
+
+    /// <summary>当前服务商的思考强度档位；未声明=不显示控件。</summary>
+    public string[] AiEffortLevels => AiSelectedProvider?.EffortLevels ?? Array.Empty<string>();
+    public bool AiEffortVisible => AiEffortLevels.Length > 0;
+
+    /// <summary>思考强度档位的显示名（默认=不发送参数）。</summary>
+    public static string EffortLabel(string effort) => effort switch
+    {
+        "" => "默认",
+        "low" => "低（快）",
+        "medium" => "中",
+        "high" => "高",
+        "max" => "最大（慢）",
+        _ => effort,
+    };
 
     /// <summary>当前生效的服务商定义：auto 时按 Key 识别，识别不出为 null（需手动选）。</summary>
     public AiProviderDef? AiSelectedProvider
@@ -855,7 +998,7 @@ public class MainViewModel : ViewModelBase
                 "无法从 API Key 识别服务商：请到 设置 → AI 识别 手动选择 Key 所属的服务商。",
                 $"auto detect failed keylen={_aiTagApiKey.Length}");
         }
-        return AiTagService.BuildOptions(id, _aiTagApiKey, _aiTagModel, _aiTagBaseUrl);
+        return AiTagService.BuildOptions(id, _aiTagApiKey, _aiTagModel, _aiTagBaseUrl, _aiTagEffort);
     }
 
     /// <summary>确保表情 Md5 就绪（旧数据惰性补算的即时版；AI 缓存键靠它区分同图副本）。</summary>
@@ -1551,7 +1694,10 @@ public class MainViewModel : ViewModelBase
                 AiTagApiKey = this._aiTagApiKey,
                 AiTagProvider = this._aiTagProvider,
                 AiTagModel = this._aiTagModel,
-                AiTagBaseUrl = this._aiTagBaseUrl
+                AiTagBaseUrl = this._aiTagBaseUrl,
+                AiTagEffort = this._aiTagEffort,
+                AiKeyProfiles = this.AiKeyProfiles.ToList(),
+                AiActiveProfileId = this._aiActiveProfileId
             };
             var configJson = JsonSerializer.Serialize(config);
             await WriteJsonWithBackupAsync(_configPath, configJson, _configWriteLock);
@@ -2464,11 +2610,30 @@ public class MainViewModel : ViewModelBase
                     InitializeQqBindings(config.QqBindings ?? new List<QqBindingInfo>(),
                         config.QqPromptDismissedUins ?? new List<string>());
                     this._webpNoticeDismissed = config.WebpNoticeDismissed;
-                    // AI 识别配置：按配置恢复（Key/服务商/模型/自定义地址）
+                    // AI 识别配置：按配置恢复（Key/服务商/模型/自定义地址/思考强度）
                     this._aiTagApiKey = config.AiTagApiKey ?? "";
                     this._aiTagProvider = string.IsNullOrEmpty(config.AiTagProvider) ? "auto" : config.AiTagProvider;
                     this._aiTagModel = config.AiTagModel ?? "";
                     this._aiTagBaseUrl = config.AiTagBaseUrl ?? "";
+                    this._aiTagEffort = config.AiTagEffort ?? "";
+                    // 档案恢复 + 老配置迁移：有 Key 但没有档案（升级前配置）→ 自动包成一份档案并激活，
+                    // 老用户无感进入多档案管理；此后档案列表是唯一事实源
+                    this.AiKeyProfiles.Clear();
+                    foreach (var p in config.AiKeyProfiles ?? new List<AiKeyProfile>())
+                        this.AiKeyProfiles.Add(p);
+                    if (this.AiKeyProfiles.Count == 0 && this._aiTagApiKey.Length > 0)
+                    {
+                        var legacy = new AiKeyProfile { Name = "我的 Key", VerifiedAt = DateTime.Now };
+                        legacy.ProviderId = this._aiTagProvider;
+                        legacy.ApiKey = this._aiTagApiKey;
+                        legacy.BaseUrl = this._aiTagBaseUrl;
+                        legacy.Model = this._aiTagModel;
+                        legacy.Effort = this._aiTagEffort;
+                        this.AiKeyProfiles.Add(legacy);
+                        config.AiActiveProfileId = legacy.Id;
+                    }
+                    this._aiActiveProfileId = this.AiKeyProfiles.Any(p => p.Id == config.AiActiveProfileId)
+                        ? config.AiActiveProfileId : "";
                     // 触发 UI 绑定更新
                     OnPropertyChanged(nameof(IsSingleClick));
                     OnPropertyChanged(nameof(IsDoubleClick));

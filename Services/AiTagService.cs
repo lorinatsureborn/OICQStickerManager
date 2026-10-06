@@ -7,7 +7,10 @@ using System.Windows.Media.Imaging;
 
 namespace OICQStickerManager.Services;
 
-/// <summary>AI 视觉识别的服务商定义：OpenAI 兼容的 /chat/completions 一套协议覆盖全部常见厂商。</summary>
+/// <summary>AI 视觉识别的服务商定义：OpenAI 兼容的 /chat/completions 一套协议覆盖全部常见厂商。
+/// 思考强度：各家参数名与档位不同（2026-10-06 实测定案）——DeepSeek 用顶层 effort（low/high/max）、
+/// 智谱用 reasoning_effort（low/high/max，medium 会被 400 拒绝）、OpenAI/Gemini 用 reasoning_effort
+/// （low/medium/high）；未声明档位的服务商不显示控件，用户选了档位但模型不支持时由 400 去参重试兜底。</summary>
 public sealed record AiProviderDef(
     string Id,
     string Name,
@@ -17,10 +20,13 @@ public sealed record AiProviderDef(
     string KeyPrefixHint,     // Key 前缀特征（供自动识别；空=无特征）
     string GuideUrl,          // 获取 Key 的控制台地址
     string Guide,             // 引导文案（怎么拿 Key、注意什么）
-    bool NeedsKey = true);
+    bool NeedsKey = true,
+    string? EffortParam = null,   // 思考强度的请求字段名；null=该服务商不做思考控制
+    string[]? EffortLevels = null); // 思考强度合法档位
 
 /// <summary>一次识别请求的完整配置（已解析好 base url 与模型）。</summary>
-public sealed record AiTagOptions(string ProviderId, string ProviderName, string ApiKey, string BaseUrl, string Model);
+public sealed record AiTagOptions(string ProviderId, string ProviderName, string ApiKey, string BaseUrl, string Model,
+    string? EffortParam = null, string Effort = "");
 
 /// <summary>识别结果：标签建议 + 来源信息（进缓存的元数据）。</summary>
 public sealed record AiTagResult(IReadOnlyList<string> Tags, string ProviderId, string Model, DateTime CreatedAt);
@@ -60,16 +66,19 @@ public class AiTagService
         new("openai", "OpenAI", "https://api.openai.com/v1",
             ["gpt-4o-mini", "gpt-4o", "gpt-5-mini", "gpt-5"], "gpt-4o-mini", "sk-",
             "https://platform.openai.com/api-keys",
-            "在 OpenAI 平台创建 API Key。gpt-4o-mini 带原生视觉且最便宜，推荐从它开始。", true),
+            "在 OpenAI 平台创建 API Key。gpt-4o-mini 带原生视觉且最便宜，推荐从它开始。", true,
+            "reasoning_effort", ["low", "medium", "high"]),
         new("deepseek", "DeepSeek", "https://api.deepseek.com/v1",
             ["deepseek-flash"], "deepseek-flash", "",
             "https://platform.deepseek.com/api_keys",
-            "在 DeepSeek 开放平台创建 API Key。deepseek-flash（V4.1）带原生视觉；注意 v4-pro 是纯文本模型，不要选。", true),
+            "在 DeepSeek 开放平台创建 API Key。deepseek-flash（V4.1）带原生视觉；注意 v4-pro 是纯文本模型，不要选。", true,
+            "effort", ["low", "high", "max"]),
         new("zhipu", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4",
             ["glm-5.3-flash", "glm-5.3-flashx", "glm-5v-turbo", "glm-4.6v", "glm-4.6v-flashx", "glm-4.1v-thinking-flash", "glm-4v-flash", "glm-4v-plus"],
             "glm-5.3-flash", "",
             "https://open.bigmodel.cn/usercenter/apikeys",
-            "在智谱开放平台创建 API Key。glm-5.3-flash 是最新视觉模型（原生多模态、会思考）；glm-4v-flash 免费（注意其 max_tokens 上限 1024，已自动适配）。", true),
+            "在智谱开放平台创建 API Key。glm-5.3-flash 是最新视觉模型（原生多模态、会思考）；glm-4v-flash 免费（注意其 max_tokens 上限 1024，已自动适配）。", true,
+            "reasoning_effort", ["low", "high", "max"]),
         new("moonshot", "Kimi 月之暗面", "https://api.moonshot.cn/v1",
             ["moonshot-v1-8k-vision-preview", "moonshot-v1-32k-vision-preview"], "moonshot-v1-8k-vision-preview", "sk-",
             "https://platform.moonshot.cn/console/api-keys",
@@ -90,7 +99,8 @@ public class AiTagService
         new("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai",
             ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"], "gemini-2.5-flash", "AIza",
             "https://aistudio.google.com/apikey",
-            "在 Google AI Studio 获取 API Key（免费额度充足）。国内网络需自行解决连通性。", true),
+            "在 Google AI Studio 获取 API Key（免费额度充足）。国内网络需自行解决连通性。", true,
+            "reasoning_effort", ["low", "medium", "high"]),
         new("anthropic", "Claude", "https://api.anthropic.com/v1",
             ["claude-sonnet-4-5", "claude-opus-4-1", "claude-3-5-haiku-latest"], "claude-sonnet-4-5", "sk-ant-",
             "https://console.anthropic.com/settings/keys",
@@ -99,7 +109,8 @@ public class AiTagService
             ["google/gemini-2.0-flash-001", "qwen/qwen2.5-vl-72b-instruct", "qwen/qwen2.5-vl-32b-instruct:free"],
             "google/gemini-2.0-flash-001", "sk-or-",
             "https://openrouter.ai/settings/keys",
-            "在 OpenRouter 创建 API Key。一个 Key 调用各家模型，带 :free 后缀的免费。", true),
+            "在 OpenRouter 创建 API Key。一个 Key 调用各家模型，带 :free 后缀的免费。", true,
+            "reasoning_effort", ["low", "medium", "high"]),
         new("ollama", "本地模型 Ollama", "http://localhost:11434/v1",
             ["qwen2.5vl:7b", "llama3.2-vision:11b", "gemma3:4b"], "qwen2.5vl:7b", "",
             "https://ollama.com",
@@ -130,8 +141,9 @@ public class AiTagService
         return null;
     }
 
-    /// <summary>把用户配置解析成一次请求所需的完整参数；解析失败抛 AiTagException（Message 面向用户）。</summary>
-    public static AiTagOptions BuildOptions(string providerId, string apiKey, string model, string baseUrl)
+    /// <summary>把用户配置解析成一次请求所需的完整参数；解析失败抛 AiTagException（Message 面向用户）。
+    /// effort=思考强度档位（空=服务商默认，不发送该字段）。</summary>
+    public static AiTagOptions BuildOptions(string providerId, string apiKey, string model, string baseUrl, string effort = "")
     {
         apiKey = apiKey.Trim();
         var def = FindProvider(providerId) ?? throw new AiTagException(
@@ -167,7 +179,7 @@ public class AiTagService
                     "还没有填写模型名，请到 设置 → AI 识别 选择或输入一个支持视觉（看图）的模型。",
                     "model empty");
         }
-        return new AiTagOptions(def.Id, def.Name, apiKey, url, modelId);
+        return new AiTagOptions(def.Id, def.Name, apiKey, url, modelId, def.EffortParam, effort);
     }
 
     // ———— 识别主流程 ————
@@ -207,14 +219,11 @@ public class AiTagService
         // 300 会被思考耗尽导致 content 为空（2026-10-06 实测 DS 真实表情图全灭的根因），
         // 起步给足 2000；个别老模型有更低的硬上限（glm-4v-flash=1024），400 报范围时按上限降档重发。
         var maxTokens = DefaultMaxTokens;
+        var effort = opt.Effort;
         while (true)
         {
-            var payload = new
+            object messages = new object[]
             {
-                model = opt.Model,
-                max_tokens = maxTokens,
-                messages = new object[]
-                {
                     new
                     {
                         role = "user",
@@ -231,8 +240,15 @@ public class AiTagService
                             new { type = "image_url", image_url = new { url = dataUrl } },
                         },
                     },
-                },
             };
+            var payload = new Dictionary<string, object?>
+            {
+                ["model"] = opt.Model,
+                ["max_tokens"] = maxTokens,
+                ["messages"] = messages,
+            };
+            if (effort.Length > 0 && !string.IsNullOrEmpty(opt.EffortParam))
+                payload[opt.EffortParam] = effort;
             var json = JsonSerializer.Serialize(payload);
 
             using var req = new HttpRequestMessage(HttpMethod.Post, opt.BaseUrl + "/chat/completions");
@@ -261,6 +277,13 @@ public class AiTagService
                     $"http request failed: {ex.Message}");
             }
 
+            if (status == 400 && effort.Length > 0 && !string.IsNullOrEmpty(opt.EffortParam))
+            {
+                // 档位非法/模型不支持思考控制（如智谱 medium、glm-4v-flash）：去参重试兜底
+                AiTagService.Log($"retry: effort={effort} rejected ({Clip(body, 120)}), retrying without effort");
+                effort = "";
+                continue;
+            }
             if (status == 400 && TryExtractMaxTokenLimit(body, out var limit) && limit < maxTokens)
             {
                 AiTagService.Log($"retry: max_tokens={maxTokens} rejected (model limit {limit}), retrying");
