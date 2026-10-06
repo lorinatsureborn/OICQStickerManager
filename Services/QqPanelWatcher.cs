@@ -143,6 +143,7 @@ public class QqPanelWatcher : IDisposable
     {
         _status = status;
         _mouseHookProc = MouseHookProc; // 提前物化并终身持有，防止钩子委托被 GC 回收
+        EmojiButtonTemplate.LogSink = Log; // 像素回退的采集/匹配诊断汇入同一份 asuka-watcher.log
         _active = this;
     }
 
@@ -435,6 +436,8 @@ public class QqPanelWatcher : IDisposable
                         firstScan = false;
                         Log($"qq monitor active (pid=[{string.Join(',', pids)}], windows={windows.Count}, scan every 5s)");
                     }
+                    if (_legacyMode && windows.Count > 0)
+                        ProbeTreeLiveness();
                     if (fresh.Count > 0 || unsubscribed.Count > 0)
                         PruneSubscriptions();
                     knownPids = pids;
@@ -457,6 +460,65 @@ public class QqPanelWatcher : IDisposable
         catch { }
         _qqMonitorCts = null;
         _qqMonitorLoop = null;
+    }
+
+    // --- a11y 树休眠判定（剪枝树代专属兜底，基于触发链信号源的证据，零 UIA 调用）---
+
+    private const int LivenessActivityWindowMs = 60_000; // 活动窗：最近 60s 内有 QQ 焦点活动才参与判定（空闲不说话防误报）
+    private const int DormantLatchAfter = 2;             // 连续探测到无信号的次数：防单次抖动误报
+    private int _a11yDormantStreak;
+    private volatile bool _a11yDormantAnnounced; // monitor 线程写、钩子线程读（像素回退的资格审查）
+    private long _lastLiveSignalTicks;                   // 最近一次「触发链信号源在场」时刻：按钮/标签命中或编辑框锚点 rectOk=True
+    private int _focusQualitySamples;                    // 焦点质量诊断采样计数（每实例前 3 条）
+
+    /// <summary>每 5s 基于"触发链信号源是否在场"判定 QQ 无障碍树是否休眠。判据与两侧实测对齐：
+    /// 激活树上表情按钮/面板标签的焦点命中与编辑框矩形（rectOk=True）都会出现；休眠树上焦点事件
+    /// 照常到达、窗口标题栏按钮（name=关闭等，无边框窗口的 HTML 标题栏）甚至也有名字有几何，
+    /// 但触发链依赖的 web 内容元素一个都不出现（2026-10-05 重启后冷启动 QQ 实测：矩形缓存
+    /// rectOk 恒 false、按钮命中为零，共存触发链死且零报错；WM_GETOBJECT warmup 在此状态
+    /// 不再能激活树）。活动窗内有焦点活动却无任何触发链信号 = 休眠：提示用户并绕过 60s 节流
+    /// 持续重发 warmup（SMTO_ABORTIFHUNG 500ms 封顶）；信号重现 = 恢复，自动解除提示。
+    /// 刻意不做任何 UIA 枚举：app 内跨进程 UIA 扫描在剪枝树激活态可阻塞数十秒并饿死
+    /// 焦点管线（版本闸门的成因），监控循环绝不能重蹈。</summary>
+    private void ProbeTreeLiveness()
+    {
+        var now = Environment.TickCount64;
+        var anyFocus = Volatile.Read(ref _lastQqFocusTicks);
+        var lastLive = Volatile.Read(ref _lastLiveSignalTicks);
+        if (anyFocus == 0 || now - anyFocus > LivenessActivityWindowMs)
+        {
+            _a11yDormantStreak = 0; // 活动窗内无 QQ 焦点活动：无法判定，保持沉默
+            return;
+        }
+        if (lastLive > 0 && now - lastLive <= LivenessActivityWindowMs)
+        {
+            if (_a11yDormantAnnounced)
+            {
+                Log("a11y tree recovered (trigger-chain signals present), coexist trigger re-enabled");
+                _status("QQ 表情面板联动已恢复");
+            }
+            _a11yDormantAnnounced = false;
+            _a11yDormantStreak = 0;
+            return;
+        }
+        // 有焦点活动、但活动窗内触发链信号源零出现 = 休眠证据
+        _a11yDormantStreak++;
+        List<IntPtr> targets;
+        lock (_gate) { targets = _subscribed.Keys.ToList(); }
+        foreach (var hwnd in targets) ForceWarmUp(hwnd);
+        if (_a11yDormantStreak >= DormantLatchAfter && !_a11yDormantAnnounced)
+        {
+            _a11yDormantAnnounced = true;
+            Log("a11y tree DORMANT (QQ focus events present but no trigger-chain signals): coexist trigger disabled until tree activates");
+            _status("QQ 无障碍树未激活：表情面板联动暂不可用（快捷键不受影响），恢复后会自动重新启用");
+        }
+    }
+
+    /// <summary>绕过 WarmUpAccessibility 的 60s 节流强制重发一次激活查询（仅休眠重试路径使用）。</summary>
+    private void ForceWarmUp(IntPtr hwnd)
+    {
+        lock (_gate) { _warmupTicks[hwnd] = 0; }
+        WarmUpAccessibility(hwnd);
     }
 
     /// <summary>QQ 版本早于 9.9.30 视为剪枝树代（9.9.19/9.9.21 实测剪枝；9.9.36 实测完整树）。</summary>
@@ -592,6 +654,11 @@ public class QqPanelWatcher : IDisposable
 
             Volatile.Write(ref _lastQqFocusTicks, Environment.TickCount64);
 
+            // 树活性证据（ProbeTreeLiveness 判据）由两处写入：按钮/标签命中（本分支顶部）与
+            // 编辑框锚点 rectOk=True（下方 editorConfirmed 块）。二者都要求真实 web 内容元素
+            // 在场——窗口标题栏按钮（name=关闭等，无边框窗口的 HTML 标题栏）在休眠树上同样
+            // 有名字有几何，不能当活性证据（2026-10-05 采样实证）。
+
             // 懒订阅：正在使用的 QQ 窗口补订结构变化事件（新开聊天窗口也由此覆盖）
             try
             {
@@ -605,9 +672,22 @@ public class QqPanelWatcher : IDisposable
 
             string name = SafeName(el);
             string cls = SafeClass(el);
+
+            // 诊断采样：每实例记录前 3 条 QQ 焦点事件的元素质量（名字/类名/是否带 HWND/矩形宽度）。
+            // 树休眠与激活的分辨现场就在这几条里（2026-10-05 树休眠事故的定位经验）。
+            if (_focusQualitySamples < 3)
+            {
+                _focusQualitySamples++;
+                int nhwnd = 0; double rw = -1;
+                try { nhwnd = el.Current.NativeWindowHandle; } catch { }
+                try { rw = el.Current.BoundingRectangle.Width; } catch { }
+                Log($"focus quality sample #{_focusQualitySamples}: name=\"{TruncateForLog(name)}\" cls=\"{TruncateForLog(cls)}\" hwndOwned={(nhwnd != 0)} rectW={rw:F0}");
+            }
+
             bool legacyTab = LegacyPanelTabNames.Contains(name.Trim());
             if (LooksLikeEmojiButton(name, cls) || legacyTab)
             {
+                Volatile.Write(ref _lastLiveSignalTicks, Environment.TickCount64); // 树活性证据：按钮/标签是真实 web 内容元素
                 Log($"focus hit emoji button (name={name}, class={cls}{(legacyTab ? ", legacy" : "")})");
 
                 // 缓存按钮矩形与宿主窗口：鼠标钩子的校验目标 + 乐观打开的合成锚点。
@@ -637,6 +717,9 @@ public class QqPanelWatcher : IDisposable
                             _emojiBtnPid = pid;
                             _emojiBtnRectRel = ToWindowRelative(topHwnd, br);
                             Log($"button rect cached {br} rel={_emojiBtnRectRel} hwnd={topHwnd}");
+                            // 顺带采集像素模板（休眠回退弹药，后台、每 DPI 缩放只存一份）：
+                            // 下一次 QQ 冷启动若树休眠（外部无法激活，讲述人都无效），钩子靠它识别按钮
+                            _ = Task.Run(() => EmojiButtonTemplate.CaptureFromScreen(topHwnd, br, FeedbackService.GetQqVersion()));
                         }
                     }
                     catch { }
@@ -673,45 +756,47 @@ public class QqPanelWatcher : IDisposable
                     return;
                 }
 
-                // 旧版 NTQQ 兜底锚：命中即刷新锚 + 按证据强度分级 TTL（见各分支注释）。
+                // 旧版 NTQQ 兜底锚：按证据强度分级 TTL（见各分支注释）。
                 // TAB 命中=面板确实开着（长 TTL）；BUTTON 命中=开/关动作（关闭证据=短 TTL，
                 // 打开证据=长 TTL 等 TAB 续期，防状态卡死/闪烁重开）。
+                // 打开证据必须由真实点击造成：窗口从最小化恢复/切回时 Chromium 会把旧焦点
+                // 原样送回表情按钮（2026-10-05 实测：restore 即弹面板，日志无任何钩子点击），
+                // 这种非点击命中若刷新锚/时间戳，轮询与验证会立即把面板报出来——故面板关着
+                // 且无点击证据的按钮命中只记元素引用，不碰任何锚状态。
                 _legacyTabElement = el;
                 _legacyTabHwnd = GetTopWindowHwnd(el);
-                _legacyTabShownTicks = Environment.TickCount64;
                 if (legacyTab)
                 {
+                    _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyTabHitTtlMs;
+                    // TAB 在面板内部，其矩形会把快捷面板带进面板里，锚保留光标近似。
+                    TrySetLegacyAnchorFromCursor();
                 }
                 else if (IsLegacyButtonCloseEvidence(_panelOpen, _lastPanelAppearedTicks, Environment.TickCount64))
                 {
                     // 面板开着且已过开面板编排保护窗时焦点落回按钮 = toggle 关闭证据：短 TTL 并启动
                     // 尾迹验证，否则无轮询/无事件时过期永不被发现（实测"关了以后再点没反应"的成因之一）。
+                    // 保护窗内的焦点编排回声不算关闭证据（见 IsLegacyButtonCloseEvidence）。
+                    _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyCloseEvidenceTtlMs;
+                    if (_emojiBtnRect.Width > 0) _legacyAnchorRect = _emojiBtnRect;
+                    else TrySetLegacyAnchorFromCursor();
                     ArmTailVerify();
                 }
-                else
+                else if (FocusPathClickIsOnButton())
                 {
-                    // 焦点落到按钮（面板关着，或开面板保护窗内的编排回声）= 打开证据：长 TTL 等 TAB
-                    // 续期（短 TTL 会在 TAB 迟到时误判关闭→闪烁重开）
+                    // 焦点落到按钮且确由真实点击造成（≤250ms 内落在重算后按钮矩形上的 mousedown，
+                    // 与下方焦点兜底开面板同源）= 打开证据：用户刚点了按钮、面板正在打开（含开面板
+                    // 保护窗内的快速第二击——保护窗挡住它被误判为关闭，此处按打开证据续期保持面板）。
+                    // 与钩子打开同级，用长 TTL 等 TAB 续期（短 TTL 会在 TAB 迟到时误判关闭→闪烁重开）。
+                    // 锚直接用按钮矩形（精确、确定性；光标在合成点击/焦点事件异步处理时可能错位——
+                    // 实测 18:52 锚跑到 800px 外）。
+                    _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
+                    if (_emojiBtnRect.Width > 0) _legacyAnchorRect = _emojiBtnRect;
+                    else TrySetLegacyAnchorFromCursor();
                 }
-                // 锚矩形：BUTTON 命中直接用按钮矩形（精确、确定性；光标在合成点击/焦点事件
-                // 异步处理时可能错位——实测 18:52 锚跑到 800px 外）；TAB 命中在面板内部，
-                // 其矩形会把快捷面板带进面板里，保留光标近似。
-                if (!legacyTab && _emojiBtnRect.Width > 0)
-                {
-                    _legacyAnchorRect = _emojiBtnRect;
-                }
-                else
-                {
-                    try
-                    {
-                        if (GetCursorPos(out var pt))
-                            _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
-                    }
-                    catch { }
-                }
+                // else：非点击性按钮焦点（窗口恢复/切回/程序性聚焦）——不刷锚、不刷时间戳。
 
                 // 焦点事件是异步投递的——乐观打开主要由鼠标钩子在 mousedown 瞬间完成。这里只兜
                 // 钩子没覆盖住的点击：钩子已为本次 mousedown 触发过则跳过（重复事件只会让面板重定位）；
@@ -813,6 +898,8 @@ public class QqPanelWatcher : IDisposable
                         {
                             OptimisticClosePanel("focus hit chat editor (light-dismiss within guard, editor clicked)");
                         }
+
+                        if (rectOk) Volatile.Write(ref _lastLiveSignalTicks, Environment.TickCount64); // 树活性证据：编辑框元素矩形可读 = web 内容在场
 
                         _editorHwnd = eroot;
                         _editorPid = pid;
@@ -1539,6 +1626,17 @@ public class QqPanelWatcher : IDisposable
         return true;
     }
 
+    /// <summary>兜底锚退化为光标近似（按钮/TAB 矩形不可用时）：32x32 光标中心块。</summary>
+    private void TrySetLegacyAnchorFromCursor()
+    {
+        try
+        {
+            if (GetCursorPos(out var pt))
+                _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
+        }
+        catch { }
+    }
+
     /// <summary>点击点是否真的落在（当前位置重算后的）表情按钮上：矩形包含 + 命中点的根窗口
     /// 必须是缓存矩形时的宿主 + 进程一致。陈旧矩形、其他 QQ 窗口、其他应用占据同屏位置、
     /// QQ 已退出都在此拒绝——否则钩子按一个全局坐标矩形对任意窗口的点击弹面板
@@ -1704,6 +1802,14 @@ public class QqPanelWatcher : IDisposable
                             _ = VerifyWithOpenRetriesAsync();
                         }
                     }
+                    else if (PixelFallbackEligible(s.pt))
+                    {
+                        // a11y 树休眠回退（2026-10-05 冷启动实证：QQ 9.9.21 的渲染器树外部无法激活，
+                        // 焦点命中永不出现、按钮矩形缓存永远建不起来）。钩子线程只做廉价资格审查，
+                        // 截屏 + 模板匹配放后台——LL 钩子回调里任何慢操作都会拖累全系统鼠标。
+                        var ptPx = s.pt;
+                        Task.Run(() => PixelFallbackOpen(ptPx));
+                    }
                 }
                 else if (msg == WM_LBUTTONUP && _closePending)
                 {
@@ -1718,6 +1824,82 @@ public class QqPanelWatcher : IDisposable
             catch { }
         }
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+    }
+
+    // --- a11y 树休眠回退：像素模板识别表情按钮（配套 Services/EmojiButtonTemplate.cs）---
+
+    private int _pixelWorker;        // 防重入：上一次匹配未完成时丢弃新触发（点击间隔远大于匹配耗时）
+    private bool _pixelFallbackOpenedLogged;
+    private long _pixelMissLogTicks; // 未命中日志节流：休眠期用户在 QQ 里每一下点击都会跑匹配，不能刷屏
+
+    /// <summary>钩子线程的廉价资格审查（零 UIA 零 GDI）：剪枝树代 + 常规几何缓存接不住 + 点击落在 QQ 窗口。
+    /// 不等休眠闩（那要焦点事件+2 轮探测 ~10s，冷启动第一击会落空）——模板匹配本身就是
+    /// "点了表情按钮"的充分证据（--pixel-selftest 校准：按钮 ±6px 全 0 差，相邻图标 17+ 拒绝），
+    /// 与焦点兜底路径的并发由 HookCoveredLastMouseDown 现有守卫吸收。
+    /// 模板缺失/缩放不符时 Available=false，行为与无回退时完全一致。</summary>
+    private bool PixelFallbackEligible(POINT pt)
+    {
+        if (!_legacyMode) return false;
+        if (!EmojiButtonTemplate.Available) return false;
+        if (_emojiBtnHwnd != IntPtr.Zero && TryResolveEmojiButtonRect(out _)) return false; // 树恢复或上次像素匹配已重建缓存：常规三重校验路径接住
+        if (_qqPids.Count == 0) return false;
+        var root = RootWindowFromPoint(pt);
+        if (root == IntPtr.Zero) return false;
+        GetWindowThreadProcessId(root, out var pid);
+        return _qqPids.Contains((int)pid);
+    }
+
+    /// <summary>休眠回退的打开路径（后台线程）：点击点邻域模板匹配 → 重建按钮几何缓存（与焦点命中
+    /// 路径同一组字段、同一写序）→ 复用钩子旧版乐观打开链路（锚/尾迹/验证/事件逐行同构）。
+    /// 不进 UIA：一次 GDI 屏幕读取（模板+2×半径 见方）+ 有早退的 SAD 搜索，毫秒级。</summary>
+    private void PixelFallbackOpen(POINT pt)
+    {
+        if (Interlocked.Exchange(ref _pixelWorker, 1) == 1) return;
+        try
+        {
+            var root = RootWindowFromPoint(pt); // 重新解析：距 mousedown 已流逝数十毫秒，窗口可能已变
+            if (root == IntPtr.Zero) return;
+            GetWindowThreadProcessId(root, out var pid);
+            if (!_qqPids.Contains((int)pid)) return;
+            if (!EmojiButtonTemplate.TryMatch(pt.X, pt.Y, root, out var rect))
+            {
+                var now = Environment.TickCount64;
+                if (now - Volatile.Read(ref _pixelMissLogTicks) > 5000)
+                {
+                    Volatile.Write(ref _pixelMissLogTicks, now);
+                    Log($"pixel fallback: no template match near ({pt.X},{pt.Y})");
+                }
+                return;
+            }
+            _emojiBtnRect = rect;
+            _emojiBtnHwnd = root;
+            _emojiBtnPid = (int)pid;
+            _emojiBtnRectRel = ToWindowRelative(root, rect);
+            // —— 以下与 MouseHookProc 旧版乐观打开分支逐行同构 ——
+            _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
+            _legacyTabShownTicks = Environment.TickCount64;
+            _legacyTabHwnd = root;
+            _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
+            var crect = _lastPanelRectHwnd == root ? _lastPanelRect : Rect.Empty;
+            _optimisticPending = true;
+            ArmTailVerify();
+            BumpUserAction();
+            Volatile.Write(ref _lastHookFireTicks, Environment.TickCount64);
+            Log($"pixel fallback: emoji button matched rect={rect}, optimistic open (pixel anchor, a11y-independent)");
+            Task.Run(() =>
+            {
+                try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(root, crect, rect)); }
+                catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
+            });
+            _ = VerifyWithOpenRetriesAsync();
+            if (!_pixelFallbackOpenedLogged)
+            {
+                _pixelFallbackOpenedLogged = true;
+                _status("QQ 无障碍树未激活：已启用像素识别维持表情面板联动");
+            }
+        }
+        catch (Exception ex) { Log("pixel fallback error: " + ex.Message); }
+        finally { Volatile.Write(ref _pixelWorker, 0); }
     }
 
     [DllImport("user32.dll", SetLastError = true)]

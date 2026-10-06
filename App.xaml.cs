@@ -54,6 +54,26 @@ namespace OICQStickerManager
                 return;
             }
 
+            // 诊断自检：--pixel-selftest <png> <x,y;...> → 表情按钮像素模板在截图上的匹配校准
+            // （阈值回归用；结果落 %TEMP%\asuka-pixel-selftest.txt，WPF 无控制台）
+            if (e.Args.Length == 3 && e.Args[0] == "--pixel-selftest")
+            {
+                RunPixelSelfTest(e.Args[1], e.Args[2]);
+                Shutdown(0);
+                return;
+            }
+
+            // 引导：--pixel-template-load <png> <centerX> <centerY> <scale> → 从截图裁块存模板。
+            // a11y 树休眠期无焦点命中可自动采集，首次部署用已知坐标的截图人工引导一次。
+            if (e.Args.Length == 5 && e.Args[0] == "--pixel-template-load")
+            {
+                var result = Services.EmojiButtonTemplate.LoadFromFile(e.Args[1],
+                    int.Parse(e.Args[2]), int.Parse(e.Args[3]), double.Parse(e.Args[4]));
+                File.WriteAllText(Path.Combine(Path.GetTempPath(), "asuka-pixel-selftest.txt"), result);
+                Shutdown(0);
+                return;
+            }
+
             // 主窗口渲染前先落定配色，避免以错误主题闪一帧
             ThemeManager.ApplyInitial();
             // 用户自定义的玻璃材质浓度在主题切换后自动重涂
@@ -158,6 +178,21 @@ namespace OICQStickerManager
             {
                 File.WriteAllText(Path.Combine(Path.GetTempPath(), "asuka-extract-out.txt"),
                     "EXTRACT EXCEPTION: " + ex.GetType().Name + ": " + ex.Message);
+                Environment.ExitCode = 1;
+            }
+        }
+
+        private static void RunPixelSelfTest(string imagePath, string clicks)
+        {
+            try
+            {
+                var result = Services.EmojiButtonTemplate.SelfTest(imagePath, clicks);
+                File.WriteAllText(Path.Combine(Path.GetTempPath(), "asuka-pixel-selftest.txt"), result);
+            }
+            catch (Exception ex)
+            {
+                File.WriteAllText(Path.Combine(Path.GetTempPath(), "asuka-pixel-selftest.txt"),
+                    "SELFTEST FAILED: " + ex.Message);
                 Environment.ExitCode = 1;
             }
         }
