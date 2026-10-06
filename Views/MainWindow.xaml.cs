@@ -901,9 +901,9 @@ namespace OICQStickerManager.Views
                 var anchor = e.PanelRect;
                 if (anchor == Rect.Empty)
                 {
-                    if (e.EmojiButtonRect == Rect.Empty) return;
-                    // QQ 原生面板标准尺寸 675x506（物理像素），出现在表情按钮上方、右缘对齐按钮右缘
-                    anchor = new Rect(e.EmojiButtonRect.Right - 675, e.EmojiButtonRect.Top - 506, 675, 506);
+                if (e.EmojiButtonRect == Rect.Empty) return;
+                // QQ 原生面板标准尺寸与贴靠几何统一收口在 watcher（与旧版面板区域点击的矩形推断共用）
+                anchor = QqPanelWatcher.InferPanelRectFromAnchor(e.EmojiButtonRect);
                 }
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 if (_quickPanel == null) _quickPanel = new QuickPanelWindow((MainViewModel)DataContext);

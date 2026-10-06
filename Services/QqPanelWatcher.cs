@@ -29,6 +29,10 @@ public class QqPanelEventArgs : EventArgs
 ///   焦点命中按钮仅作钩子没覆盖的点击的兜底（见 OnFocusChanged）。
 /// - 关闭：与打开对称的乐观路径——面板开着时完整点击按钮（down+up 都落在按钮上）立即收起；
 ///   焦点进入聊天输入框也立即收起（面板浮在输入框上层，焦点能到输入框 = 面板已被 QQ 收起）。
+///   面板开着时落在 QQ 窗口内的其他点击（面板自带 X 关闭、表情发送、面板内浏览）是既有信号
+///   的盲区：新版武装补验尾迹由真实扫描裁决；旧版（剪枝树，无扫描）对落在推断面板矩形内的
+///   点击把锚信念窗降到宽限档，无锚续期即时间确认收起。焦点离开 QQ 立即收起共存面板
+///   （Topmost 面板不得悬浮在非宿主应用之上；新版切回后扫描重报 APPEARED 自愈）。
 ///   乐观误判可自愈：尾迹验证发现 QQ 面板仍在则重新报 APPEARED，OpenForCoexist 的淡出中重开接住。
 ///   另有 QQ 窗口的 UIA 结构变化事件（节流后验证）与点击后的补验尾迹兜底。
 /// 轮询保底（可选设置项，默认关）：事件在个别 QQ 版本上失灵时的兜底，常开会持续查询 QQ。
@@ -82,6 +86,19 @@ public class QqPanelWatcher : IDisposable
     // 不是 toggle 关闭证据。照关闭证据处理会把锚 TTL 砍到 250ms，开面板 ~0.75s 后被时间确认
     // 关闭（快捷面板"弹出后 ~1s 消失"，2026-10-04 日志实锤）。与编辑框光灭的同名保护窗同值。
     internal const int OpenChoreographyGuardMs = 1500;
+
+    // 面板区域点击的宽限档：面板开着时点击落在 QQ 面板矩形内（X 关闭/表情发送/面板内搜索框），
+    // 此类点击不经过表情按钮、焦点也不进编辑框（X 关闭后焦点停在面板内部元素上），是纯事件
+    // 驱动的盲区。旧版把锚信念窗降到本档——点击后 2.5s 内无锚续期（TAB 命中/编辑框光灭/
+    // 按钮 toggle）即由时间确认收起；TAB 命中照常把 TTL 续回长档，滞留 TAB（Chromium 焦点
+    // 事件可迟到数秒）最坏自愈为关→弹一次。新版无需此档：真实扫描在尾迹里 ~350ms 检出关闭。
+    internal const int PanelClickGraceTtlMs = 2500;
+
+    // QQ 原生面板标准尺寸（物理像素），出现在表情按钮上方、右缘对齐按钮右缘。
+    // 乐观打开的合成锚点与旧版"面板区域点击"的矩形推断共用同一几何（DPI>100% 时真实面板
+    // 更大、本矩形是其右下子集，X 按钮恰在共享的右上角附近，推断矩形仍覆盖）。
+    internal const double PanelStdWidthPx = 675;
+    internal const double PanelStdHeightPx = 506;
 
     /// <summary>「面板开着 + 焦点命中表情按钮」的语义分级：距面板 APPEARED 超过保护窗才算
     /// toggle 关闭证据（QQ 真关闭面板后焦点落回按钮）；窗口内是开面板的焦点编排回声。</summary>
@@ -645,10 +662,27 @@ public class QqPanelWatcher : IDisposable
 
             if (!_qqPids.Contains(pid))
             {
-                // 焦点离开 QQ（点了桌面/其他应用）：QQ 面板大概率已被关掉，验证一次
-                if (_panelOpen) ScheduleThrottledVerify();
+                // 焦点离开 QQ（点了桌面/其他应用/本应用主窗）：QQ 面板大概率已被关掉。
+                // 即便新版 QQ 保留面板，共存快捷面板是 Topmost，宿主失焦后继续悬浮在
+                // 其他应用之上也是错误状态——立即收起，不等验证（旧版此路径本就清锚即收）。
+                // 误收自愈：若 QQ 面板其实还开着，切回 QQ 后的焦点验证会重新报 APPEARED，
+                // OpenForCoexist 接住（新版真实扫描可自愈；旧版锚已清不重弹，与改动前一致）。
+                // 不走 OptimisticClosePanel：它武装的尾迹在新版上会立刻扫出"面板还开着"
+                // 把面板弹回来，恰好抵消本次收起。
                 _legacyTabElement = null;  // 旧版兜底锚同步失效：切走即收，缓解面板滞留
                 _legacyAnchorRect = Rect.Empty;
+                if (_panelOpen || Volatile.Read(ref CoexistPanelShowing) == 1)
+                {
+                    _optimisticPending = false;
+                    _panelOpen = false;
+                    _openMisses = 0;
+                    Log("focus left QQ: dismiss coexist panel");
+                    Task.Run(() =>
+                    {
+                        try { PanelDisappeared?.Invoke(this, EventArgs.Empty); }
+                        catch (Exception ex) { Log("focus-out dismiss dispatch failed: " + ex.Message); }
+                    });
+                }
                 return;
             }
 
@@ -1637,6 +1671,27 @@ public class QqPanelWatcher : IDisposable
         catch { }
     }
 
+    /// <summary>由按钮/锚矩形推断 QQ 原生面板矩形（物理像素）：面板在锚上方、右缘对齐锚右缘，
+    /// 标准尺寸见 PanelStdWidthPx/PanelStdHeightPx。anchorRect 为 Empty 或无面积时返回 Empty。</summary>
+    internal static Rect InferPanelRectFromAnchor(Rect anchorRect)
+    {
+        if (anchorRect.IsEmpty || anchorRect.Width <= 0 || double.IsNaN(anchorRect.Right)) return Rect.Empty;
+        return new Rect(anchorRect.Right - PanelStdWidthPx, anchorRect.Top - PanelStdHeightPx,
+            PanelStdWidthPx, PanelStdHeightPx);
+    }
+
+    /// <summary>点击点是否落在推断面板矩形内（含 16px 容差）：面板区域点击判定的纯几何部分，
+    /// 静态可测。QQ 高版会把面板翻到按钮下方（空间不足时），此时推断矩形落在按钮上方的空白区，
+    /// X 点击不命中——退化为改动前行为（锚 TTL 到期后才收），与乐观打开合成锚点是同一已知局限。</summary>
+    internal static bool IsPointInInferredPanelRect(double x, double y, Rect anchorRect)
+    {
+        var r = InferPanelRectFromAnchor(anchorRect);
+        if (r.IsEmpty) return false;
+        const double tol = 16;
+        return x >= r.Left - tol && x <= r.Right + tol
+            && y >= r.Top - tol && y <= r.Bottom + tol;
+    }
+
     /// <summary>点击点是否真的落在（当前位置重算后的）表情按钮上：矩形包含 + 命中点的根窗口
     /// 必须是缓存矩形时的宿主 + 进程一致。陈旧矩形、其他 QQ 窗口、其他应用占据同屏位置、
     /// QQ 已退出都在此拒绝——否则钩子按一个全局坐标矩形对任意窗口的点击弹面板
@@ -1698,6 +1753,44 @@ public class QqPanelWatcher : IDisposable
             catch (Exception ex) { Log("optimistic close dispatch failed: " + ex.Message); }
         });
         ArmTailVerify();
+    }
+
+    /// <summary>钩子线程的廉价判定（零 UIA）：面板开着（或共存面板可见）时，点击落在 QQ 进程
+    /// 窗口内且未命中表情按钮——候选的「面板区域点击」。本应用自己的窗口（快捷面板 NOACTIVATE、
+    /// 主窗）与其他应用天然被进程判定排除。</summary>
+    private bool PanelAreaClickCandidate(POINT pt)
+    {
+        if (!_panelOpen && Volatile.Read(ref CoexistPanelShowing) != 1) return false;
+        var root = RootWindowFromPoint(pt);
+        if (root == IntPtr.Zero) return false;
+        GetWindowThreadProcessId(root, out var pid);
+        return _qqPids.Count > 0 && _qqPids.Contains((int)pid);
+    }
+
+    /// <summary>面板区域点击的处理：此类点击（X 关闭/表情发送/面板内浏览）不产生任何既有
+    /// 关闭路径能识别的信号——按钮 toggle 走钩子按钮分支，编辑框光灭走焦点路径，而 X 关闭后
+    /// 焦点停在面板内部元素（剪枝树上空类名、非编辑区证据被拒），透明隐藏也不派发结构事件。
+    /// 新版：武装补验尾迹即可，真实扫描是权威判定——真关闭 ~350ms 内被命中测试检出，
+    /// 误武装（面板其实还开着，如点标题栏拖动）扫描报 open 无动作，自愈。
+    /// 旧版：无真实扫描可用（全扫=阻塞毒药），锚是「面板开着」的唯一信念。点击落在推断面板
+    /// 矩形内才动信念窗：X 关闭/表情发送后无锚续期 → 2.5s 宽限后时间确认收起；TAB 命中照常
+    /// 续回长档（浏览分类不受影响）；面板矩形外的点击（标题栏拖动/消息区）不碰——旧版无扫描
+    /// 无法自愈，误收的代价是共存对失联，宁可滞留到锚 TTL 自然过期。</summary>
+    private void OnPanelAreaMouseDown(POINT pt)
+    {
+        BumpUserAction(); // 面板内点击是真实用户操作：在途的发送预关闭（close-q）必须让位
+        if (!_legacyMode)
+        {
+            ArmTailVerify();
+            Log("panel area mousedown: tail verify armed (non-legacy)");
+            return;
+        }
+        var anchorRect = _emojiBtnRect.Width > 0 ? _emojiBtnRect : _legacyAnchorRect;
+        if (!IsPointInInferredPanelRect(pt.X, pt.Y, anchorRect)) return;
+        _legacyOpenTtlMs = PanelClickGraceTtlMs;
+        _legacyTabShownTicks = Environment.TickCount64;
+        ArmTailVerify();
+        Log("panel area mousedown inside inferred rect: anchor TTL → grace (legacy)");
     }
 
     private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1801,6 +1894,13 @@ public class QqPanelWatcher : IDisposable
                             });
                             _ = VerifyWithOpenRetriesAsync();
                         }
+                    }
+                    else if (PanelAreaClickCandidate(s.pt))
+                    {
+                        // 面板开着时点击 QQ 窗口内非按钮区域：X 关闭/表情发送/面板内点击的
+                        // 关闭候选。纯事件驱动的盲区（不经过按钮、焦点不进编辑框、透明隐藏
+                        // 不派发结构事件）——此前这类关闭全靠锚 TTL 自然过期，快捷面板滞留。
+                        OnPanelAreaMouseDown(s.pt);
                     }
                     else if (PixelFallbackEligible(s.pt))
                     {
