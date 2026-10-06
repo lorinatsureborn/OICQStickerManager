@@ -274,6 +274,7 @@ public class MainViewModel : ViewModelBase, IDisposable
         foreach (var service in _qqServices.Values) service.Dispose();
         _qqServices.Clear();
         _qqMirrorViews.Clear();
+        AiTag.Dispose();
     }
 
     private async Task<T> MutateLibraryAsync<T>(Func<Task<T>> operation, bool waitForInitialization = true)
@@ -846,7 +847,8 @@ public class MainViewModel : ViewModelBase, IDisposable
     public AiTagService AiTag { get; } = new();
 
     private string _aiTagApiKey = "";
-    /// <summary>服务商 API Key（明文本机存储，与 QqDbKey 同口径；不上传任何服务器）。
+    private bool _aiKeyUnlockFailed;
+    /// <summary>服务商 API Key（仅在内存中使用；保存档案时用 DPAPI 加密）。
     /// 修改 Key 意味着"正在录入另一份配置"：脱离激活档案进入草稿态，测试通过后另存为新档案。</summary>
     public string AiTagApiKey
     {
@@ -855,19 +857,18 @@ public class MainViewModel : ViewModelBase, IDisposable
         {
             value = value?.Trim() ?? "";
             if (_aiTagApiKey == value) return;
+            var inferProvider = _aiTagProvider == "auto" || AiTagService.DetectProviderId(_aiTagApiKey) == _aiTagProvider;
             _aiTagApiKey = value;
+            if (!_aiProfileSwitching) _aiKeyUnlockFailed = false;
+            _aiConfigRevision++;
             OnPropertyChanged();
             if (!_aiProfileSwitching)
             {
                 DetachActiveProfile();
+                InvalidateAiDraftVerification();
                 // 前缀可识别 → 立即锁定厂商（摆脱 auto）：静态模型清单/思考档位随即可见，
                 // 不必等测试；识别不出保持 auto，由用户在芯片里手选
-                if (_aiTagProvider == "auto" && _aiTagApiKey.Length > 0
-                    && AiTagService.DetectProviderId(_aiTagApiKey) is { Length: > 0 } detected)
-                {
-                    _aiTagProvider = detected;
-                    OnPropertyChanged(nameof(AiTagProvider));
-                }
+                if (inferProvider) AiTagProvider = AiTagService.DetectProviderId(_aiTagApiKey) ?? "auto";
             }
             NotifyAiConfigState();
             _ = SaveConfigAsync();
@@ -885,8 +886,16 @@ public class MainViewModel : ViewModelBase, IDisposable
             value = string.IsNullOrEmpty(value) ? "auto" : value!;
             if (_aiTagProvider == value) return;
             _aiTagProvider = value;
+            _aiConfigRevision++;
             OnPropertyChanged();
-            if (!_aiProfileSwitching) DetachActiveProfile();
+            if (!_aiProfileSwitching)
+            {
+                DetachActiveProfile();
+                InvalidateAiDraftVerification();
+                AiTagModel = "";
+                AiTagEffort = "";
+                AiTagBaseUrl = "";
+            }
             NotifyAiConfigState();
             _ = SaveConfigAsync();
         }
@@ -900,9 +909,21 @@ public class MainViewModel : ViewModelBase, IDisposable
         OnPropertyChanged(nameof(AiActiveProfileId));
     }
 
+    // 异步测试/模型检测只允许回填它启动时的配置。
+    private long _aiConfigRevision;
+    public long AiConfigRevision => _aiConfigRevision;
+
+    private void InvalidateAiDraftVerification()
+    {
+        _aiDraftVerified = false;
+        OnPropertyChanged(nameof(AiDraftVerified));
+    }
+
     /// <summary>清空工作配置并重置验证态（「添加 API Key」入口）。</summary>
     public void BeginNewAiDraft()
     {
+        _aiConfigRevision++;
+        _aiKeyUnlockFailed = false;
         _aiProfileSwitching = true;
         try
         {
@@ -938,7 +959,10 @@ public class MainViewModel : ViewModelBase, IDisposable
             value = value?.Trim() ?? "";
             if (_aiTagModel == value) return;
             _aiTagModel = value;
+            _aiConfigRevision++;
             OnPropertyChanged();
+            if (!_aiProfileSwitching) _activeProfile?.Model = value;
+            NotifyAiConfigState();
             _ = SaveConfigAsync();
         }
     }
@@ -953,7 +977,14 @@ public class MainViewModel : ViewModelBase, IDisposable
             value = value?.Trim() ?? "";
             if (_aiTagBaseUrl == value) return;
             _aiTagBaseUrl = value;
+            _aiConfigRevision++;
             OnPropertyChanged();
+            if (!_aiProfileSwitching)
+            {
+                DetachActiveProfile();
+                InvalidateAiDraftVerification();
+                NotifyAiConfigState();
+            }
             _ = SaveConfigAsync();
         }
     }
@@ -968,6 +999,7 @@ public class MainViewModel : ViewModelBase, IDisposable
             value = value?.Trim() ?? "";
             if (_aiTagEffort == value) return;
             _aiTagEffort = value;
+            _aiConfigRevision++;
             OnPropertyChanged();
             if (_aiProfileSwitching) return;
             _activeProfile?.Effort = value; // 模型/强度是使用偏好：即时写回激活档案
@@ -985,17 +1017,42 @@ public class MainViewModel : ViewModelBase, IDisposable
 
     private AiKeyProfile? _activeProfile => AiKeyProfiles.FirstOrDefault(p => p.Id == _aiActiveProfileId);
 
-    /// <summary>档案切换/迁移期间置 true：工作配置 setter 不做脱钩、不重复写档案。</summary>
+    /// <summary>档案切换期间置 true：工作配置 setter 不做脱钩、不重复写档案。</summary>
     private bool _aiProfileSwitching;
 
     /// <summary>把工作配置四字段 + 思考强度写入指定档案。</summary>
     private void CopyWorkConfigToProfile(AiKeyProfile p)
     {
+        string protectedKey;
+        try { protectedKey = ProtectedSecret.ProtectApiKey(_aiTagApiKey); }
+        catch (System.Security.Cryptography.CryptographicException)
+        {
+            throw new AiTagException("无法保护 API Key，档案未保存。请检查当前 Windows 用户环境后重试。", "AI key DPAPI protection failed");
+        }
         p.ProviderId = _aiTagProvider;
-        p.ApiKey = _aiTagApiKey;
+        p.ProtectedApiKey = protectedKey;
         p.BaseUrl = _aiTagBaseUrl;
         p.Model = _aiTagModel;
         p.Effort = _aiTagEffort;
+    }
+
+    private string UnlockAiProfile(AiKeyProfile p)
+    {
+        _aiKeyUnlockFailed = false;
+        try
+        {
+            var key = ProtectedSecret.UnprotectApiKey(p.ProtectedApiKey);
+            if (key.Length == 0 && (AiTagService.FindProvider(p.ProviderId)?.NeedsKey ?? true))
+                throw new FormatException("AI profile has no protected key.");
+            return key;
+        }
+        catch (Exception ex) when (ex is System.Security.Cryptography.CryptographicException or FormatException)
+        {
+            p.VerifiedAt = null;
+            _aiKeyUnlockFailed = true;
+            StatusText = "AI API Key 无法在当前 Windows 用户下解锁，请编辑档案重新输入并测试 Key";
+            return "";
+        }
     }
 
     /// <summary>激活某档案：档案值写回工作配置（触发 UI 刷新）。</summary>
@@ -1003,12 +1060,13 @@ public class MainViewModel : ViewModelBase, IDisposable
     {
         var p = AiKeyProfiles.FirstOrDefault(x => x.Id == id);
         if (p == null || _aiActiveProfileId == id) return;
+        _aiConfigRevision++;
         _aiProfileSwitching = true;
         try
         {
             _aiActiveProfileId = id;
             AiTagProvider = p.ProviderId;
-            AiTagApiKey = p.ApiKey;
+            AiTagApiKey = UnlockAiProfile(p);
             AiTagBaseUrl = p.BaseUrl;
             AiTagModel = p.Model;
             AiTagEffort = p.Effort;
@@ -1093,6 +1151,7 @@ public class MainViewModel : ViewModelBase, IDisposable
         OnPropertyChanged(nameof(AiKeyProfilesView));
         OnPropertyChanged(nameof(AiEffortLevels));
         OnPropertyChanged(nameof(AiEffortVisible));
+        OnPropertyChanged(nameof(AiDraftVerified));
     }
 
     // 草稿（或编辑中的档案）是否已通过测试连接：通过后才展开模型/档位设置区
@@ -1141,6 +1200,7 @@ public class MainViewModel : ViewModelBase, IDisposable
     {
         get
         {
+            if (_aiKeyUnlockFailed) return "API Key 无法解锁，请编辑档案重新输入并测试 Key";
             if (_aiTagApiKey.Trim().Length == 0 && _aiTagProvider != "ollama")
                 return "未配置：填入 API Key 即可启用";
             var p = AiSelectedProvider;
@@ -1158,7 +1218,7 @@ public class MainViewModel : ViewModelBase, IDisposable
     public string[] AiModelPresets => _aiTagProvider == "auto" ? Array.Empty<string>() : AiSelectedProvider?.Models ?? Array.Empty<string>();
 
     /// <summary>AI 识别是否已可使用（有 Key，或选择了免 Key 的本地服务商）。</summary>
-    public bool AiTagConfigured => _aiTagApiKey.Trim().Length > 0 || _aiTagProvider == "ollama";
+    public bool AiTagConfigured => !_aiKeyUnlockFailed && (_aiTagApiKey.Trim().Length > 0 || _aiTagProvider == "ollama");
 
     /// <summary>自动识别一行说明：识别成功报哪家；sk- 开头各家通用识别不出时请用户手动挑。</summary>
     public string AiAutoDetectHint
@@ -1895,7 +1955,8 @@ public class MainViewModel : ViewModelBase, IDisposable
     public void FlushPendingConfigSave(int timeoutMs = 2000)
     {
         try { Task.WhenAll(_lastConfigSaveTask ?? Task.CompletedTask, _databaseWriter.Completion,
-            _qqStatsWriter.Completion, _tagStatsWriter.Completion, _pendingWriter.Completion, _configWriter.Completion).Wait(timeoutMs); }
+            _qqStatsWriter.Completion, _tagStatsWriter.Completion, _pendingWriter.Completion, _configWriter.Completion,
+            AiTagCache.FlushAsync()).Wait(timeoutMs); }
         catch { /* 保存失败的警报链路另行提示 */ }
     }
 
@@ -1934,12 +1995,11 @@ public class MainViewModel : ViewModelBase, IDisposable
                 QqBindings = _qqBindings.Select(b => new QqBindingInfo { Uin = b.Uin, Alias = b.Alias, AccountDirectory = b.AccountDirectory, BoundAt = b.BoundAt }).ToList(),
                 QqPromptDismissedUins = new List<string>(this._qqPromptDismissedUins),
                 WebpNoticeDismissed = this._webpNoticeDismissed,
-                AiTagApiKey = this._aiTagApiKey,
                 AiTagProvider = this._aiTagProvider,
                 AiTagModel = this._aiTagModel,
                 AiTagBaseUrl = this._aiTagBaseUrl,
                 AiTagEffort = this._aiTagEffort,
-                AiKeyProfiles = this.AiKeyProfiles.ToList(),
+                AiKeyProfiles = this.AiKeyProfiles.Select(p => p.Capture()).ToList(),
                 AiActiveProfileId = this._aiActiveProfileId
             };
             var savedKey = _qqDbKey;
@@ -1968,6 +2028,9 @@ public class MainViewModel : ViewModelBase, IDisposable
         await writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
+            // 配置的安全边界放在首次落盘前，失败留下的 .tmp 也不能含明文密钥。
+            if (string.Equals(Path.GetFileName(path), "config.json", StringComparison.OrdinalIgnoreCase))
+                json = ProtectedSecret.ProtectConfigKeys(json);
             var tmp = path + ".tmp";
             await File.WriteAllTextAsync(tmp, json).ConfigureAwait(false);
             // 备份与改名是同步文件 IO，也放到线程池：调用方多是 UI 线程上的 await 链
@@ -2873,34 +2936,22 @@ public class MainViewModel : ViewModelBase, IDisposable
                         config.QqPromptDismissedUins ?? new List<string>());
                     this._webpNoticeDismissed = config.WebpNoticeDismissed;
                     // AI 识别配置：按配置恢复（Key/服务商/模型/自定义地址/思考强度）
-                    this._aiTagApiKey = config.AiTagApiKey ?? "";
+                    this._aiTagApiKey = "";
                     this._aiTagProvider = string.IsNullOrEmpty(config.AiTagProvider) ? "auto" : config.AiTagProvider;
                     this._aiTagModel = config.AiTagModel ?? "";
                     this._aiTagBaseUrl = config.AiTagBaseUrl ?? "";
                     this._aiTagEffort = config.AiTagEffort ?? "";
-                    // 档案恢复 + 老配置迁移：有 Key 但没有档案（升级前配置）→ 自动包成一份档案并激活，
-                    // 老用户无感进入多档案管理；此后档案列表是唯一事实源
+                    // 只读加密档案；未发布功能不兼容、不迁移旧明文 AI 配置。
                     this.AiKeyProfiles.Clear();
                     foreach (var p in config.AiKeyProfiles ?? new List<AiKeyProfile>())
                         this.AiKeyProfiles.Add(p);
-                    if (this.AiKeyProfiles.Count == 0 && this._aiTagApiKey.Length > 0)
-                    {
-                        var legacy = new AiKeyProfile { Name = "我的 Key", VerifiedAt = DateTime.Now };
-                        legacy.ProviderId = this._aiTagProvider;
-                        legacy.ApiKey = this._aiTagApiKey;
-                        legacy.BaseUrl = this._aiTagBaseUrl;
-                        legacy.Model = this._aiTagModel;
-                        legacy.Effort = this._aiTagEffort;
-                        this.AiKeyProfiles.Add(legacy);
-                        config.AiActiveProfileId = legacy.Id;
-                    }
                     this._aiActiveProfileId = this.AiKeyProfiles.Any(p => p.Id == config.AiActiveProfileId)
                         ? config.AiActiveProfileId : "";
                     // 激活档案是事实源；旧的工作字段可能缺失或停留在上一次草稿。
                     // 加载期间直写后备字段，避免 setter 触发脱钩和异步保存。
                     if (this._activeProfile is { } activeProfile)
                     {
-                        this._aiTagApiKey = activeProfile.ApiKey ?? "";
+                        this._aiTagApiKey = UnlockAiProfile(activeProfile);
                         this._aiTagProvider = string.IsNullOrEmpty(activeProfile.ProviderId) ? "auto" : activeProfile.ProviderId;
                         this._aiTagModel = activeProfile.Model ?? "";
                         this._aiTagBaseUrl = activeProfile.BaseUrl ?? "";

@@ -129,6 +129,11 @@ internal static class Program
         tests = tests.Concat(FocusSettlementTests.Cases).ToArray();
         tests = tests.Concat(LegacyPanelTests.Cases).ToArray();
         tests = tests.Concat(CoexistTests.Cases).ToArray();
+        tests = tests.Concat(AiTagTests.Cases).ToArray();
+        tests = tests.Concat(AiSecurityTests.Cases).ToArray();
+        tests = tests.Concat(AiUiTests.Cases).ToArray();
+        if (args.Contains("--ai-only")) tests = AiTagTests.Cases.Concat(AiSecurityTests.Cases).Concat(AiUiTests.Cases).ToArray();
+        if (args.Contains("--ai-security-only")) tests = AiSecurityTests.Cases.ToArray();
         if (args.Contains("--qq-core-only")) tests = CoexistTests.Cases.Concat(SendTests.Cases).Concat(FocusSettlementTests.Cases).Concat(LifecycleTests.Cases).Concat(LegacyPanelTests.Cases).ToArray();
         if (args.Contains("--skip-key-bootstrap")) tests = tests.Where(t => t.Name != "Key helper bootstrap bypasses registry detection and quotes paths safely").ToArray();
         int failed = 0;

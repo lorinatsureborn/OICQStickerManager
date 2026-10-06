@@ -101,7 +101,7 @@ internal static class PersistenceTests
         var profile = new AiKeyProfile
         {
             Id = "merge-fixture-profile", Name = "Synthetic profile", ProviderId = "custom",
-            ApiKey = "synthetic-ai-key", BaseUrl = "https://example.invalid/v1",
+            ProtectedApiKey = ProtectedSecret.ProtectApiKey("synthetic-ai-key"), BaseUrl = "https://example.invalid/v1",
             Model = "synthetic-vision", Effort = "high", DetectedModels = ["synthetic-vision"],
         };
         System.IO.File.WriteAllText(path, JsonSerializer.Serialize(new AppConfig
@@ -116,10 +116,10 @@ internal static class PersistenceTests
         var saved = JsonSerializer.Deserialize<AppConfig>(System.IO.File.ReadAllText(path))!;
         var restored = saved.AiKeyProfiles.Single();
         Program.Require(saved.AiActiveProfileId == profile.Id && restored.Id == profile.Id
-            && restored.ApiKey == profile.ApiKey && restored.BaseUrl == profile.BaseUrl
+            && restored.ProtectedApiKey == profile.ProtectedApiKey && restored.BaseUrl == profile.BaseUrl
             && restored.Model == profile.Model && restored.Effort == profile.Effort
             && restored.DetectedModels.SequenceEqual(profile.DetectedModels), "AI profile fields were lost during an ordered save");
-        Program.Require(saved.AiTagApiKey == profile.ApiKey && saved.AiTagModel == profile.Model
+        Program.Require(vm.AiTagApiKey == "synthetic-ai-key" && saved.AiTagModel == profile.Model
             && saved.AiTagProvider == profile.ProviderId && saved.AiTagBaseUrl == profile.BaseUrl
             && saved.AiTagEffort == profile.Effort
             && saved.GallerySortMode == 2, "active AI configuration or local settings did not survive the save");
@@ -133,12 +133,12 @@ internal static class PersistenceTests
         var path = System.IO.Path.Combine(root, "config.json");
         System.IO.File.WriteAllText(path, JsonSerializer.Serialize(new AppConfig
         {
-            AiTagApiKey = "synthetic-draft-key", AiTagModel = "draft-model", AiActiveProfileId = "deleted-profile",
-            AiKeyProfiles = [new AiKeyProfile { Id = "inactive-profile", ApiKey = "synthetic-profile-key", Model = "profile-model" }],
+            AiTagModel = "draft-model", AiActiveProfileId = "deleted-profile",
+            AiKeyProfiles = [new AiKeyProfile { Id = "inactive-profile", ProtectedApiKey = ProtectedSecret.ProtectApiKey("synthetic-profile-key"), Model = "profile-model" }],
         }));
         using var vm = LibraryTests.Create(root);
         Program.RunAsync(vm.Initialization);
-        Program.Require(vm.AiActiveProfileId == "" && vm.AiTagApiKey == "synthetic-draft-key"
+        Program.Require(vm.AiActiveProfileId == "" && vm.AiTagApiKey == ""
             && vm.AiTagModel == "draft-model", "an inactive profile overwrote the saved draft");
     }
 

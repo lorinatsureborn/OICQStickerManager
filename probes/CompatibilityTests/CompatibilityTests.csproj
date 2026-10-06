@@ -9,5 +9,8 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\OICQStickerManager.csproj" />
+    <!-- App views use application-root pack URIs, which resolve against this test host. -->
+    <Resource Include="..\..\Assets\Asuka.ico" Link="Assets\Asuka.ico" />
+    <Resource Include="..\..\Assets\bird-mask.png" Link="Assets\bird-mask.png" />
   </ItemGroup>
 </Project>

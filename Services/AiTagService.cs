@@ -10,7 +10,7 @@ namespace OICQStickerManager.Services;
 /// <summary>AI 视觉识别的服务商定义：OpenAI 兼容的 /chat/completions 一套协议覆盖全部常见厂商。
 /// 思考强度：各家参数名与档位不同（2026-10-06 实测定案）——DeepSeek 用顶层 effort（low/high/max）、
 /// 智谱用 reasoning_effort（low/high/max，medium 会被 400 拒绝）、OpenAI/Gemini 用 reasoning_effort
-/// （low/medium/high）；未声明档位的服务商不显示控件，用户选了档位但模型不支持时由 400 去参重试兜底。</summary>
+/// （具体档位见注册表）；未声明档位的服务商不显示控件，用户选了档位但模型不支持时由 400 去参重试兜底。</summary>
 public sealed record AiProviderDef(
     string Id,
     string Name,
@@ -26,7 +26,11 @@ public sealed record AiProviderDef(
 
 /// <summary>一次识别请求的完整配置（已解析好 base url 与模型）。</summary>
 public sealed record AiTagOptions(string ProviderId, string ProviderName, string ApiKey, string BaseUrl, string Model,
-    string? EffortParam = null, string Effort = "");
+    string? EffortParam = null, string Effort = "")
+{
+    public override string ToString() => AiTagService.RedactKey(
+        $"AiTagOptions {{ ProviderId = {ProviderId}, ProviderName = {ProviderName}, ApiKey = ***, BaseUrl = {BaseUrl}, Model = {Model}, EffortParam = {EffortParam}, Effort = {Effort} }}", ApiKey);
+}
 
 /// <summary>识别结果：标签建议 + 来源信息（进缓存的元数据）。</summary>
 public sealed record AiTagResult(IReadOnlyList<string> Tags, string ProviderId, string Model, DateTime CreatedAt);
@@ -43,19 +47,17 @@ public class AiTagException : Exception
 /// 协议统一走各厂商的 OpenAI 兼容接口（Anthropic/Gemini 均提供兼容层，无需单独适配）。
 /// 失败必须可解释：所有异常按"用户能做什么"转译，完整现场落 asuka-aitag.log。
 /// </summary>
-public class AiTagService
+public class AiTagService : IDisposable
 {
     public static string LogFilePath => Path.Combine(Path.GetTempPath(), "asuka-aitag.log");
 
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
 
     private readonly HttpClient _http;
-    private readonly bool _ownsHttp;
 
     public AiTagService(HttpMessageHandler? handler = null)
     {
-        _ownsHttp = handler == null;
-        _http = handler != null ? new HttpClient(handler) : new HttpClient();
+        _http = handler != null ? new HttpClient(handler, disposeHandler: false) : new HttpClient();
         _http.Timeout = TimeSpan.FromSeconds(60);
     }
 
@@ -64,10 +66,10 @@ public class AiTagService
     public static readonly AiProviderDef[] Providers =
     [
         new("openai", "OpenAI", "https://api.openai.com/v1",
-            ["gpt-4o-mini", "gpt-4o", "gpt-5-mini", "gpt-5"], "gpt-4o-mini", "sk-",
+            ["gpt-4o-mini", "gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra", "gpt-5.4-mini", "gpt-4.1-mini", "gpt-4o", "gpt-5-mini", "gpt-5"], "gpt-4o-mini", "sk-proj-",
             "https://platform.openai.com/api-keys",
-            "在 OpenAI 平台创建 API Key。gpt-4o-mini 带原生视觉且最便宜，推荐从它开始。", true,
-            "reasoning_effort", ["minimal", "low", "medium", "high"]),
+            "在 OpenAI 平台创建 API Key。gpt-4o-mini 支持视觉，适合快速打标签；也可选 GPT-6 系列。预设不代表该 Key 已开通，检测可查询账号可用模型。", true,
+            "reasoning_effort", ["low", "medium", "high", "xhigh", "max"]),
         new("deepseek", "DeepSeek", "https://api.deepseek.com/v1",
             ["deepseek-flash"], "deepseek-flash", "",
             "https://platform.deepseek.com/api_keys",
@@ -103,9 +105,9 @@ public class AiTagService
             "在 Google AI Studio 获取 API Key（免费额度充足）。国内网络需自行解决连通性。", true,
             "reasoning_effort", ["low", "medium", "high"]),
         new("anthropic", "Claude", "https://api.anthropic.com/v1",
-            ["claude-sonnet-4-5", "claude-opus-4-1", "claude-3-5-haiku-latest"], "claude-sonnet-4-5", "sk-ant-",
+            ["claude-haiku-4-5-20251001", "claude-sonnet-5-5", "claude-opus-5-5", "claude-sonnet-4-6", "claude-opus-4-6"], "claude-haiku-4-5-20251001", "sk-ant-",
             "https://console.anthropic.com/settings/keys",
-            "在 Anthropic 控制台创建 API Key（走官方 OpenAI 兼容层，无需额外配置）。", true),
+            "在 Claude Console 创建 API Key。Haiku 4.5 适合快速打标签；走官方 OpenAI 兼容接口。预设不代表该 Key 已开通，可检测账号可用模型。", true),
         new("openrouter", "OpenRouter", "https://openrouter.ai/api/v1",
             ["google/gemini-2.0-flash-001", "qwen/qwen2.5-vl-72b-instruct", "qwen/qwen2.5-vl-32b-instruct:free"],
             "google/gemini-2.0-flash-001", "sk-or-",
@@ -132,6 +134,7 @@ public class AiTagService
     {
         var key = apiKey.Trim();
         if (key.Length == 0) return null;
+        if (key.StartsWith("sk-svcacct-", StringComparison.Ordinal)) return "openai";
         foreach (var p in Providers.Where(p => p.NeedsKey && p.KeyPrefixHint.Length > 3)
                      .OrderByDescending(p => p.KeyPrefixHint.Length))
             if (key.StartsWith(p.KeyPrefixHint, StringComparison.OrdinalIgnoreCase))
@@ -189,37 +192,40 @@ public class AiTagService
     public async Task<AiTagResult> SuggestTagsAsync(string imagePath, AiTagOptions opt,
         IReadOnlyList<string> existingTags, CancellationToken ct = default)
     {
-        var (dataUrl, ext, bytes) = await Task.Run(() => BuildImageDataUrl(imagePath));
+        ct.ThrowIfCancellationRequested();
+        var (dataUrl, ext, bytes) = await Task.Run(() => BuildImageDataUrl(imagePath), ct);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             for (var attempt = 1; ; attempt++)
             {
-                var (content, status, body) = await PostChatAsync(opt, dataUrl, existingTags, ct);
                 try
                 {
+                    var (content, status, body) = await PostChatAsync(opt, dataUrl, existingTags, ct);
                     var tags = ParseTags(content, opt, body);
                     Log($"OK {opt.ProviderName} model={opt.Model} img={bytes}B({ext}) {sw.ElapsedMilliseconds}ms" +
-                        (attempt > 1 ? $" (attempt {attempt})" : "") + $" tags=[{string.Join(",", tags)}]");
+                        (attempt > 1 ? $" (attempt {attempt})" : "") + $" tags=[{string.Join(",", tags)}]", opt.ApiKey);
                     return new AiTagResult(tags, opt.ProviderId, opt.Model, DateTime.Now);
                 }
                 catch (AiTagException ex) when (attempt == 1 && IsFormatDrift(ex))
                 {
                     // 思考型模型偶发把回复漂移成英文图片描述等非 JSON 文本（2026-10-06 智谱实测）：
                     // 属模型随机性，自动重试一次，不打扰用户
-                    Log($"retry: format drift on attempt 1 ({Clip(ex.Detail, 120)}), retrying");
+                    Log($"retry: format drift on attempt 1 ({Clip(ex.Detail, 120)}), retrying", opt.ApiKey);
                 }
             }
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (AiTagException ex)
         {
-            Log($"FAIL {opt.ProviderName} model={opt.Model} img={bytes}B({ext}) {sw.ElapsedMilliseconds}ms :: {ex.Detail}");
-            throw;
+            Log($"FAIL {opt.ProviderName} model={opt.Model} img={bytes}B({ext}) {sw.ElapsedMilliseconds}ms :: {ex.Detail}", opt.ApiKey);
+            throw new AiTagException(RedactKey(ex.Message, opt.ApiKey), RedactKey(ex.Detail, opt.ApiKey));
         }
         catch (Exception ex)
         {
-            Log($"FAIL {opt.ProviderName} model={opt.Model} img={bytes}B({ext}) {sw.ElapsedMilliseconds}ms :: UNEXPECTED {ex}");
-            throw new AiTagException($"识别失败：{ex.Message}", $"unexpected {ex.GetType().Name}: {ex}", ex);
+            Log($"FAIL {opt.ProviderName} model={opt.Model} img={bytes}B({ext}) {sw.ElapsedMilliseconds}ms :: UNEXPECTED {ex}", opt.ApiKey);
+            // 原异常的 Message/InnerException 也可能携带网关回显的 Key，不把它传给 UI。
+            throw new AiTagException(RedactKey($"识别失败：{ex.Message}", opt.ApiKey), RedactKey($"unexpected {ex.GetType().Name}: {ex}", opt.ApiKey));
         }
     }
 
@@ -256,22 +262,7 @@ public class AiTagService
                         },
                     },
             };
-            var payload = new Dictionary<string, object?>
-            {
-                ["model"] = opt.Model,
-                ["max_tokens"] = maxTokens,
-                ["messages"] = messages,
-            };
-            if (effort.Length > 0 && !string.IsNullOrEmpty(opt.EffortParam))
-                payload[opt.EffortParam] = effort;
-            var json = JsonSerializer.Serialize(payload);
-
-            using var req = new HttpRequestMessage(HttpMethod.Post, opt.BaseUrl + "/chat/completions");
-            req.Content = new StringContent(json, Encoding.UTF8, "application/json");
-            if (opt.ApiKey.Length > 0)
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", opt.ApiKey);
-            // Anthropic 兼容层要求的额外头（其余服务商忽略）
-            req.Headers.TryAddWithoutValidation("anthropic-version", "2023-06-01");
+            using var req = CreateChatRequest(opt, messages, maxTokens, effort);
 
             int status;
             string body;
@@ -279,7 +270,7 @@ public class AiTagService
             {
                 using var resp = await _http.SendAsync(req, ct);
                 status = (int)resp.StatusCode;
-                body = await resp.Content.ReadAsStringAsync(ct);
+                body = RedactKey(await resp.Content.ReadAsStringAsync(ct), opt.ApiKey);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
@@ -289,19 +280,19 @@ public class AiTagService
             {
                 throw new AiTagException(
                     "网络请求失败，无法连接到服务商接口。请检查网络连通性（部分境外服务需要代理）。",
-                    $"http request failed: {ex.Message}");
+                    RedactKey($"http request failed: {ex.Message}", opt.ApiKey));
             }
 
             if (status == 400 && effort.Length > 0 && !string.IsNullOrEmpty(opt.EffortParam))
             {
                 // 档位非法/模型不支持思考控制（如智谱 medium、glm-4v-flash）：去参重试兜底
-                AiTagService.Log($"retry: effort={effort} rejected ({Clip(body, 120)}), retrying without effort");
+                AiTagService.Log($"retry: effort={effort} rejected ({Clip(body, 120)}), retrying without effort", opt.ApiKey);
                 effort = "";
                 continue;
             }
             if (status == 400 && TryExtractMaxTokenLimit(body, out var limit) && limit < maxTokens)
             {
-                AiTagService.Log($"retry: max_tokens={maxTokens} rejected (model limit {limit}), retrying");
+                AiTagService.Log($"retry: max_tokens={maxTokens} rejected (model limit {limit}), retrying", opt.ApiKey);
                 maxTokens = limit;
                 continue;
             }
@@ -338,6 +329,33 @@ public class AiTagService
 
     /// <summary>应用请求的输出预算起步值；各模型有更低硬上限时按 400 报错降档。</summary>
     public const int DefaultMaxTokens = 2000;
+
+    // OpenAI 推理模型拒绝 max_tokens；标注和探测必须使用同一套请求参数。
+    private static HttpRequestMessage CreateChatRequest(AiTagOptions opt, object messages, int maxTokens, string effort = "")
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["model"] = opt.Model,
+            [opt.ProviderId == "openai" ? "max_completion_tokens" : "max_tokens"] = maxTokens,
+            ["messages"] = messages,
+        };
+        if (effort.Length > 0 && !string.IsNullOrEmpty(opt.EffortParam)) payload[opt.EffortParam] = effort;
+        var req = new HttpRequestMessage(HttpMethod.Post, opt.BaseUrl + "/chat/completions");
+        req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        AddAuthentication(req, opt);
+        return req;
+    }
+
+    private static void AddAuthentication(HttpRequestMessage req, AiTagOptions opt, bool modelList = false)
+    {
+        if (opt.ApiKey.Length > 0)
+        {
+            if (opt.ProviderId == "anthropic" && modelList)
+                req.Headers.Add("x-api-key", opt.ApiKey);
+            else req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", opt.ApiKey);
+        }
+        if (opt.ProviderId == "anthropic") req.Headers.Add("anthropic-version", "2023-06-01");
+    }
 
     /// <summary>输出格式漂移类失败（可重试）：非 JSON 文本/无法解析/空标签/空内容——区别于网络与鉴权类失败。</summary>
     private static bool IsFormatDrift(AiTagException ex) =>
@@ -378,8 +396,9 @@ public class AiTagService
     /// <summary>把 HTTP 错误码转译成"用户下一步该做什么"。</summary>
     private static AiTagException ExplainHttpError(int status, string body, AiTagOptions opt)
     {
-        var serverMsg = ExtractServerErrorMessage(body);
-        var detail = $"http {status} model={opt.Model} body={Clip(body, 500)}";
+        body = RedactKey(body, opt.ApiKey);
+        var serverMsg = MaskKey(ExtractServerErrorMessage(body));
+        var detail = $"http {status} model={opt.Model} body={Clip(MaskKey(body), 500)}";
         var suffix = serverMsg.Length > 0 ? $"\n接口说明：{Clip(serverMsg, 160)}" : "";
         return status switch
         {
@@ -417,6 +436,8 @@ public class AiTagService
     /// <summary>从模型输出里抠出 JSON 字符串数组（容忍 markdown 代码块包裹与 &lt;think&gt; 思考块前缀），清洗为合法标签。</summary>
     public static List<string> ParseTags(string content, AiTagOptions opt, string rawBody = "")
     {
+        content = RedactKey(content, opt.ApiKey);
+        rawBody = RedactKey(rawBody, opt.ApiKey);
         // 先做全角归一再搜索候选：中文模型可能连外层括号都打成【】
         var text = NormalizeFullWidthPunctuation(StripThinkBlock(content).Trim());
 
@@ -496,7 +517,7 @@ public class AiTagService
         "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEUlEQVR4nGP4sCAAK2IYWhIAC4l4AVIFK8MAAAAASUVORK5CYII=";
 
     private static readonly System.Text.RegularExpressions.Regex NonChatModelRegex =
-        new(@"embed|rerank|tts|audio|speech|whisper|moderation|dall-e|image-gen|text-embedding|ranker|asr|ocr|video|cogview|cogvideo|vidu|seedance|seedream|wanx|flux|stable-diffusion|sora",
+        new(@"embed|rerank|tts|audio|speech|whisper|moderation|dall-e|image-gen|gpt-image|chatgpt-image|realtime|text-embedding|ranker|asr|ocr|video|cogview|cogvideo|vidu|seedance|seedream|wanx|flux|stable-diffusion|sora",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     /// <summary>
@@ -506,6 +527,20 @@ public class AiTagService
     /// DeepSeek 式带 input_modalities 的清单可直接判定，其余发 8×8 小图请求：HTTP 200=能收图=视觉。
     /// </summary>
     public async Task<List<string>> ListVisionModelsAsync(AiTagOptions opt, CancellationToken ct = default)
+    {
+        try { return await ListVisionModelsCoreAsync(opt, ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (AiTagException ex)
+        {
+            throw new AiTagException(RedactKey(ex.Message, opt.ApiKey), RedactKey(ex.Detail, opt.ApiKey));
+        }
+        catch (Exception ex)
+        {
+            throw new AiTagException("模型检测失败，请稍后重试。", RedactKey($"models {ex.GetType().Name}: {ex}", opt.ApiKey));
+        }
+    }
+
+    private async Task<List<string>> ListVisionModelsCoreAsync(AiTagOptions opt, CancellationToken ct)
     {
         var (ids, modalities) = await FetchModelIdsAsync(opt, ct);
         if (ids.Count == 0)
@@ -542,7 +577,7 @@ public class AiTagService
             else if (state == ProbeResult.Unknown) unknown++;
         }
 
-        AiTagService.Log($"vision-models: provider={opt.ProviderName} listed={ids.Count} vision={vision.Count} unknown={unknown} [{string.Join(",", vision)}]");
+        AiTagService.Log($"vision-models: provider={opt.ProviderName} listed={ids.Count} vision={vision.Count} unknown={unknown} [{string.Join(",", vision)}]", opt.ApiKey);
         if (vision.Count == 0)
             throw new AiTagException(
                 $"在 {opt.ProviderName} 返回的 {ids.Count} 个模型里没有探测到支持看图的（其中 {unknown} 个探测失败被跳过）。" +
@@ -551,54 +586,70 @@ public class AiTagService
         return vision;
     }
 
-    /// <summary>GET {base}/models 拉清单：先带分页参数（智谱口径），被拒再退裸路径。</summary>
+    /// <summary>按服务商协议查询模型；Claude 按 after_id 翻页，智谱保留其分页参数。</summary>
     private async Task<(List<string> Ids, Dictionary<string, List<string>> Modalities)> FetchModelIdsAsync(
         AiTagOptions opt, CancellationToken ct)
     {
-        foreach (var url in new[] { opt.BaseUrl + "/models?page=1&size=200", opt.BaseUrl + "/models" })
+        var ids = new List<string>();
+        var modalities = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var seenIds = new HashSet<string>(StringComparer.Ordinal);
+        var seenCursors = new HashSet<string>(StringComparer.Ordinal);
+        var url = opt.BaseUrl + (opt.ProviderId == "zhipu" ? "/models?page=1&size=200"
+            : opt.ProviderId == "anthropic" ? "/models?limit=1000" : "/models");
+        while (true)
         {
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            if (opt.ApiKey.Length > 0)
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", opt.ApiKey);
-            req.Headers.TryAddWithoutValidation("anthropic-version", "2023-06-01");
+            AddAuthentication(req, opt, modelList: true);
             int status; string body;
             try
             {
                 using var resp = await _http.SendAsync(req, ct);
                 status = (int)resp.StatusCode;
-                body = await resp.Content.ReadAsStringAsync(ct);
+                body = RedactKey(await resp.Content.ReadAsStringAsync(ct), opt.ApiKey);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                throw new AiTagException("拉取模型清单超时（30 秒无响应），请检查网络后重试。", "models http timeout");
+                throw new AiTagException("拉取模型清单超时（60 秒无响应），请检查网络后重试。", "models http timeout");
             }
             catch (HttpRequestException ex)
             {
                 throw new AiTagException(
                     "网络请求失败，无法连接到服务商接口。请检查网络连通性（部分境外服务需要代理）。",
-                    $"models http request failed: {ex.Message}");
+                    RedactKey($"models http request failed: {ex.Message}", opt.ApiKey));
             }
             if (status == 401 || status == 403)
                 throw new AiTagException(
                     $"API Key 无效或没有权限（HTTP {status}），无法拉取模型清单。请到设置页核对 Key。",
                     $"models http {status} body={Clip(body, 300)}");
-            if (status != 200) continue; // 分页参数被拒 → 退裸路径
+            if (opt.ProviderId == "zhipu" && url.Contains('?') && status is 400 or 404)
+            { url = opt.BaseUrl + "/models"; continue; }
+            if (status < 200 || status >= 300) throw ExplainHttpError(status, body, opt);
 
             try
             {
                 using var doc = JsonDocument.Parse(body);
-                var ids = new List<string>();
-                var modalities = new Dictionary<string, List<string>>(StringComparer.Ordinal);
                 foreach (var item in doc.RootElement.GetProperty("data").EnumerateArray())
                 {
                     if (item.TryGetProperty("id", out var idEl) && idEl.GetString() is { Length: > 0 } id)
                     {
-                        ids.Add(id);
+                        if (seenIds.Add(id)) ids.Add(id);
                         if (item.TryGetProperty("input_modalities", out var im) && im.ValueKind == JsonValueKind.Array)
                             modalities[id] = im.EnumerateArray()
                                 .Where(e => e.ValueKind == JsonValueKind.String)
                                 .Select(e => e.GetString()!).ToList();
+                        else if (item.TryGetProperty("capabilities", out var caps) && caps.ValueKind == JsonValueKind.Object
+                            && caps.TryGetProperty("image_input", out var image) && image.ValueKind == JsonValueKind.Object
+                            && image.TryGetProperty("supported", out var supported) && supported.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                            modalities[id] = supported.GetBoolean() ? ["text", "image"] : ["text"];
                     }
+                }
+                if (opt.ProviderId == "anthropic" && doc.RootElement.TryGetProperty("has_more", out var more) && more.GetBoolean())
+                {
+                    var cursor = doc.RootElement.GetProperty("last_id").GetString();
+                    if (string.IsNullOrEmpty(cursor) || !seenCursors.Add(cursor))
+                        throw new JsonException("model pagination cursor missing or repeated");
+                    url = opt.BaseUrl + "/models?limit=1000&after_id=" + Uri.EscapeDataString(cursor);
+                    continue;
                 }
                 return (ids, modalities);
             }
@@ -609,9 +660,6 @@ public class AiTagService
                     $"models parse failed: {ex.Message} body={Clip(body, 300)}");
             }
         }
-        throw new AiTagException(
-            "该服务商不支持查询模型清单（HTTP 404）。请直接在设置页手填视觉模型名。",
-            $"models endpoint 404 on both variants, base={opt.BaseUrl}");
     }
 
     private enum ProbeResult { Vision, TextOnly, Unknown }
@@ -621,11 +669,7 @@ public class AiTagService
     {
         try
         {
-            var payload = new
-            {
-                model,
-                max_tokens = 512,
-                messages = new object[]
+            var messages = new object[]
                 {
                     new
                     {
@@ -636,33 +680,31 @@ public class AiTagService
                             new { type = "image_url", image_url = new { url = ProbePngDataUrl } },
                         },
                     },
-                },
             };
-            using var req = new HttpRequestMessage(HttpMethod.Post, opt.BaseUrl + "/chat/completions");
-            req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-            if (opt.ApiKey.Length > 0)
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", opt.ApiKey);
-            req.Headers.TryAddWithoutValidation("anthropic-version", "2023-06-01");
+            using var req = CreateChatRequest(opt with { Model = model }, messages, 512);
 
             using var resp = await _http.SendAsync(req, ct);
             var status = (int)resp.StatusCode;
-            var body = await resp.Content.ReadAsStringAsync(ct);
+            var body = RedactKey(await resp.Content.ReadAsStringAsync(ct), opt.ApiKey);
             if (status >= 200 && status < 300) return ProbeResult.Vision;
-            if (status == 400)
+            if (status == 400 && System.Text.RegularExpressions.Regex.IsMatch(body,
+                @"image.{0,60}(not supported|unsupported)|does not support.{0,30}image|取值范围.{0,20}\['text'\]",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase))
             {
                 // 纯文本模型的典型拒绝（智谱「取值范围 ['text']」/OpenAI「image input not supported」等）
                 return ProbeResult.TextOnly;
             }
-            AiTagService.Log($"vision-models: probe {model} -> http {status} {Clip(MaskKey(body), 160)}");
+            AiTagService.Log($"vision-models: probe {model} -> http {status} {Clip(MaskKey(body), 160)}", opt.ApiKey);
             return ProbeResult.Unknown; // 限流/无权限/暂时不可用：不判死，跳过
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             return ProbeResult.Unknown;
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            AiTagService.Log($"vision-models: probe {model} failed {ex.GetType().Name} {ex.Message}");
+            AiTagService.Log($"vision-models: probe {model} failed {ex.GetType().Name} {ex.Message}", opt.ApiKey);
             return ProbeResult.Unknown;
         }
     }
@@ -722,34 +764,41 @@ public class AiTagService
     // ———— 日志 ————
 
     private static readonly object LogLock = new();
-    public static void Log(string message)
+    public static void Log(string message, string apiKey = "")
     {
         try
         {
             lock (LogLock)
-                File.AppendAllText(LogFilePath, $"[{DateTime.Now:HH:mm:ss.fff}] {MaskKey(message)}\n");
+                File.AppendAllText(LogFilePath, $"[{DateTime.Now:HH:mm:ss.fff}] {RedactKey(message, apiKey)}\n");
         }
         catch { /* 日志失败不影响主流程 */ }
+    }
+
+    /// <summary>先移除本次请求的完整 Key（含 JSON/URL 转义），再屏蔽常见令牌；支持无固定前缀的中转 Key。</summary>
+    public static string RedactKey(string message, string apiKey)
+    {
+        if (!string.IsNullOrEmpty(apiKey))
+        {
+            foreach (var value in new[] { JsonEncodedText.Encode(apiKey).ToString(), Uri.EscapeDataString(apiKey), apiKey }
+                .Distinct().OrderByDescending(v => v.Length))
+                message = message.Replace(value, "***", StringComparison.Ordinal);
+        }
+        return MaskKey(message);
     }
 
     /// <summary>日志脱敏：任何 sk-xxxx 之类的 Key 片段只留前 8 字符。</summary>
     public static string MaskKey(string message)
     {
-        // Bearer 后、或 sk-/AIza 开头的连续 token 打码
-        var parts = message.Split(' ');
-        for (int i = 0; i < parts.Length; i++)
-        {
-            var p = parts[i];
-            var isKey = (p.StartsWith("sk-", StringComparison.Ordinal)
-                         || p.StartsWith("AIza", StringComparison.Ordinal)
-                         || p.StartsWith("Bearer", StringComparison.OrdinalIgnoreCase))
-                        && p.Length > 12;
-            if (isKey) parts[i] = p[..8] + "***";
-        }
-        return string.Join(' ', parts);
+        // 错误响应常把 Key 嵌在 JSON 引号/换行里，不能按空格分词。
+        var options = System.Text.RegularExpressions.RegexOptions.IgnoreCase;
+        var masked = System.Text.RegularExpressions.Regex.Replace(message,
+            @"\bBearer\s+[^\s""'\\,;<>]+", "Bearer ***", options);
+        return System.Text.RegularExpressions.Regex.Replace(masked,
+            @"\b(?:sk-[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]+|[a-f0-9]{32}\.[A-Za-z0-9_-]+)",
+            m => m.Value[..Math.Min(8, m.Value.Length)] + "***", options);
     }
 
     private static string Clip(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 
-    public void Dispose() { if (_ownsHttp) _http.Dispose(); }
+    public void Dispose() => _http.Dispose();
 }

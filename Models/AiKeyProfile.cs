@@ -14,7 +14,13 @@ public class AiKeyProfile
     /// <summary>服务商 id（AiTagService.Providers 的 Id）。</summary>
     public string ProviderId { get; set; } = "";
 
-    public string ApiKey { get; set; } = "";
+    private string _protectedApiKey = "";
+    /// <summary>Windows DPAPI CurrentUser 密文；从不接受或持久化明文 Key。</summary>
+    public string ProtectedApiKey
+    {
+        get => _protectedApiKey;
+        set => _protectedApiKey = Services.ProtectedSecret.IsProtected(value) ? value : "";
+    }
 
     /// <summary>自定义服务商的接口地址（其余服务商为空）。</summary>
     public string BaseUrl { get; set; } = "";
@@ -32,4 +38,12 @@ public class AiKeyProfile
 
     /// <summary>最近一次测试通过时间（建档时必过，重测后刷新）。</summary>
     public DateTime? VerifiedAt { get; set; }
+
+    /// <summary>异步配置写入使用独立快照，避免后续编辑修改排队中的档案。</summary>
+    public AiKeyProfile Capture() => new()
+    {
+        Id = Id, Name = Name, ProviderId = ProviderId, ProtectedApiKey = ProtectedApiKey,
+        BaseUrl = BaseUrl, Model = Model, Effort = Effort,
+        DetectedModels = DetectedModels?.ToList() ?? new(), CreatedAt = CreatedAt, VerifiedAt = VerifiedAt,
+    };
 }

@@ -36,6 +36,19 @@ The fake helper returns only a synthetic key and does not start or debug QQ.
 AI persistence fixtures verify that the active profile restores all working
 configuration fields, ordered saves retain AI profiles and the protected QQ key,
 and an inactive profile does not replace the saved draft.
+AI API fixtures use synthetic keys and an injected HTTP handler, covering OpenAI
+project/service-account key detection, completion budgets, Claude model cursors
+and capability metadata, HTTP errors, cancellation, format retries, diagnostic
+redaction, active model persistence, draft invalidation and isolated cache flushes.
+A hidden WPF window verifies masked key input, password automation protection,
+profile-to-input synchronization, settings refresh, model input before verification,
+late verification replies and suggestions arriving after a different sticker is
+opened. It does not show the app or run the app's startup hooks. Run only these
+35 AI cases by appending `-- --ai-only` to the command above; no API credits are used.
+The 12 storage/security cases can run separately with `-- --ai-security-only`.
+They cover DPAPI profile round trips, memory-only drafts, refusal of old plaintext
+fields, unreadable ciphertext, backup sanitization, interrupted atomic writes,
+request-object formatting, and arbitrary-key redaction in errors and logs.
 Cipher fixtures cover SHA512 and legacy SHA1 page authentication, legacy 48-byte
 cipher trailers with either 48-byte or 80-byte SQLite reserves, wrong keys,
 corrupt pages, mixed-format rejection and committed legacy encrypted WAL.
@@ -90,6 +103,8 @@ bootstrap fixture, append `-- --skip-key-bootstrap` to run every other fixture.
 This excludes exactly one key-acquisition case; it does not disable security or
 skip coexistence/sending checks. The 2026-10-07 pre-push run of the isolated Git
 index snapshot passed 143/143 enabled cases.
+After including the 35 AI cases, a separate pre-push index snapshot passed
+178/178 enabled cases with the same single bootstrap exclusion.
 
 The following diagnostics operate on the current real QQ window and are **opt-in**:
 

@@ -1043,8 +1043,10 @@
                                                     ToolTip="收起"/>
                                         </Grid>
                                         <StackPanel Margin="16,4,16,11">
-                                            <TextBox x:Name="AiKeyBox" Tag="粘贴服务商 API Key"
-                                                     Text="{Binding AiTagApiKey, UpdateSourceTrigger=LostFocus, Delay=200}"/>
+                                            <PasswordBox x:Name="AiKeyBox" PasswordChanged="AiKeyBox_PasswordChanged"
+                                                         Style="{StaticResource ApiKeyPasswordBoxStyle}"
+                                                         ToolTip="粘贴服务商 API Key"
+                                                         AutomationProperties.Name="服务商 API Key"/>
                                             <TextBlock Text="{Binding AiAutoDetectHint}"
                                                        Style="{StaticResource FootnoteTextStyle}"
                                                        Margin="0,6,0,0" TextWrapping="Wrap"/>
@@ -1055,6 +1057,9 @@
                                             <TextBlock Text="服务商" Style="{StaticResource CaptionTextStyle}"/>
                                             <TextBlock x:Name="AiProviderKnownText" Style="{StaticResource BodyTextStyle}"
                                                        Margin="0,4,0,0" TextWrapping="Wrap"/>
+                                            <Button Style="{StaticResource TextButtonStyle}" Content="更换服务商…"
+                                                    HorizontalAlignment="Left" Margin="0,4,0,0" Height="26" FontSize="12"
+                                                    Click="AiChooseProvider_Click"/>
                                         </StackPanel>
                                         <StackPanel x:Name="AiProviderPickSection" Margin="16,0,16,11" Visibility="Collapsed">
                                             <TextBlock Text="选择服务商" Style="{StaticResource CaptionTextStyle}"/>
@@ -1074,7 +1079,7 @@
                                                     Visibility="{Binding AiCustomUrlVisible, Converter={StaticResource BoolToVis}}">
                                             <TextBlock Text="接口地址" Style="{StaticResource CaptionTextStyle}"/>
                                             <TextBox x:Name="AiBaseUrlBox" Margin="0,8,0,0" Tag="https://example.com/v1（OpenAI 兼容）"
-                                                     Text="{Binding AiTagBaseUrl, UpdateSourceTrigger=LostFocus, Delay=200}"/>
+                                                     Text="{Binding AiTagBaseUrl, UpdateSourceTrigger=LostFocus}"/>
                                         </StackPanel>
 
                                         <Grid Margin="16,0,16,11">
@@ -1085,26 +1090,29 @@
                                                     ToolTip="用一张小测试图真实调用一次，验证 Key、模型与网络"/>
                                         </Grid>
 
-                                        <!-- 测试通过后：可用模型 + 思考档位 + 保存 -->
-                                        <StackPanel x:Name="AiVerifiedSection" Visibility="Collapsed">
+                                        <!-- 先选模型再测试：自定义接口和模型权限受限的 Key 也能完成配置。 -->
+                                        <StackPanel x:Name="AiModelConfigurationSection" Visibility="Collapsed">
                                             <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="0,0,0,11"/>
                                             <StackPanel Margin="16,0,16,11">
-                                                <TextBlock Text="可用模型（点击选用）" Style="{StaticResource CaptionTextStyle}"/>
+                                                <TextBlock Text="预设视觉模型（点击选用）" Style="{StaticResource CaptionTextStyle}"/>
                                                 <WrapPanel x:Name="AiModelPresetsPanel" Margin="-2,8,-2,0"/>
                                                 <StackPanel x:Name="AiDetectSection" Margin="0,8,0,0">
                                                     <Button x:Name="AiDetectModelsButton" Style="{StaticResource TextButtonStyle}"
-                                                            Content="检测清单外模型…" FontSize="12" Height="26" Padding="10,0"
+                                                            Content="检测账号可用视觉模型…" FontSize="12" Height="26" Padding="10,0"
                                                             HorizontalAlignment="Left" Click="AiDetectModels_Click"
-                                                            AutomationProperties.Name="检测静态清单外的可用视觉模型"
-                                                            ToolTip="静态清单可能滞后于服务商上新：拉取该 Key 的全部模型并逐个发小图探测（费用可忽略）"/>
+                                                            AutomationProperties.Name="检测账号可用的视觉模型"
+                                                            ToolTip="查询该 Key 的模型列表；未提供图片能力信息的候选会发小图探测，按服务商计费"/>
                                                     <TextBlock x:Name="AiDetectResultText" Style="{StaticResource FootnoteTextStyle}"
                                                                Margin="0,6,0,0" TextWrapping="Wrap" Visibility="Collapsed"/>
                                                     <WrapPanel x:Name="AiDetectedModelsPanel" Margin="-2,6,-2,0"/>
                                                 </StackPanel>
                                                 <TextBox x:Name="AiModelBox" Margin="0,8,0,0" Tag="或直接输入模型名"
-                                                         Text="{Binding AiTagModel, UpdateSourceTrigger=LostFocus, Delay=200}"
+                                                         Text="{Binding AiTagModel, UpdateSourceTrigger=LostFocus}"
                                                          ToolTip="高级：直接填写模型 id；留空使用推荐模型"/>
                                             </StackPanel>
+                                        </StackPanel>
+                                        <!-- 测试通过后才允许保存档案。 -->
+                                        <StackPanel x:Name="AiVerifiedSection" Visibility="Collapsed">
                                             <StackPanel x:Name="AiEffortSection" Margin="16,0,16,11" Visibility="Collapsed">
                                                 <TextBlock Text="思考强度" Style="{StaticResource CaptionTextStyle}"/>
                                                 <TextBlock Text="档位越高越准但越慢；各家合法档位不同，已按接口适配"
