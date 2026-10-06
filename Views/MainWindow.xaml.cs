@@ -1422,12 +1422,23 @@ namespace OICQStickerManager.Views
 
         // ———— 设置页 · AI 识别 ————
 
+        // 检测结果只对发起时的服务商有效：provider 变化即清空
+        private string? _lastAiProviderForDetected;
+
         /// <summary>按当前配置渲染服务商/模型预设胶囊（设置页打开与配置变化时调用）。</summary>
         private void RefreshAiSettingsUi()
         {
             if (DataContext is not MainViewModel vm) return;
             var chip = (Style)FindResource("ChipButtonStyle");
             var chipSel = (Style)FindResource("ChipSelectedButtonStyle");
+
+            // 服务商切换后旧检测结果对不上号：清空（Key/服务商变化走这里，模型点选走 vm.AiTagModel 也重渲染——检测面板保留无妨，但 provider 变了必须清）
+            if (_lastAiProviderForDetected != vm.AiTagProvider)
+            {
+                _lastAiProviderForDetected = vm.AiTagProvider;
+                AiDetectedModelsPanel.Children.Clear();
+                AiDetectResultText.Visibility = Visibility.Collapsed;
+            }
 
             void AddChip(WrapPanel panel, string label, string tip, bool selected, Action onClick)
             {
@@ -1472,6 +1483,49 @@ namespace OICQStickerManager.Views
             {
                 AiTagService.Log($"guide link open failed: {ex.Message}");
                 _ = ShowAlertAsync("无法打开浏览器", $"请手动访问：{vm.AiProviderGuideUrl}", "知道了", showCancel: false);
+            }
+        }
+
+        private async void AiDetectModels_Click(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is not MainViewModel vm) return;
+            try { _ = vm.BuildAiTagOptions(); }
+            catch (AiTagException ex)
+            {
+                _ = ShowAlertAsync("还不能检测", ex.Message, "知道了", showCancel: false);
+                return;
+            }
+
+            AiDetectModelsButton.IsEnabled = false;
+            AiDetectModelsButton.Content = "检测中…";
+            AiDetectedModelsPanel.Children.Clear();
+            AiDetectResultText.Visibility = Visibility.Collapsed;
+            try
+            {
+                var models = await vm.FetchAiVisionModelsAsync();
+                var chip = (Style)FindResource("ChipButtonStyle");
+                foreach (var m in models)
+                {
+                    var model = m;
+                    var b = new Button { Content = model, Style = chip, ToolTip = "点击选用该视觉模型" };
+                    b.Click += (_, _) => { vm.AiTagModel = model; RefreshAiSettingsUi(); };
+                    AiDetectedModelsPanel.Children.Add(b);
+                }
+                var current = vm.AiTagModel.Length > 0 ? vm.AiTagModel : vm.AiSelectedProvider?.DefaultModel ?? "";
+                AiDetectResultText.Text = $"检测到 {models.Count} 个支持看图的模型，点击可选用" +
+                    (models.Contains(current) ? "；当前所选在列 ✓" : "");
+                AiDetectResultText.Visibility = Visibility.Visible;
+            }
+            catch (AiTagException ex)
+            {
+                AiDetectResultText.Text = ex.Message;
+                AiDetectResultText.Visibility = Visibility.Visible;
+                ShowAiFailureAlert(ex);
+            }
+            finally
+            {
+                AiDetectModelsButton.IsEnabled = true;
+                AiDetectModelsButton.Content = "检测可用视觉模型";
             }
         }
 

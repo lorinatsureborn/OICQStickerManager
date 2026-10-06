@@ -897,6 +897,14 @@ public class MainViewModel : ViewModelBase
         return (result, false);
     }
 
+    /// <summary>按当前配置拉取并探测服务商的全部可用视觉模型（设置页「检测可用视觉模型」按钮）。
+    /// 探测会对清单内每个候选发一次 8×8 小图请求（极小开销）；失败抛 AiTagException（Message 面向用户）。</summary>
+    public async Task<List<string>> FetchAiVisionModelsAsync(CancellationToken ct = default)
+    {
+        var opt = BuildAiTagOptions();
+        return await AiTag.ListVisionModelsAsync(opt, ct);
+    }
+
 
     /// <summary>
     /// 执行一次对账：返回发现的孤儿数；-1 = 失败（密钥失效/QQ 结构变化）；-2 = 已有对账在跑（本次跳过）。
