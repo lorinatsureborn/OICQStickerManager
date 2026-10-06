@@ -28,6 +28,7 @@ namespace OICQStickerManager.Views
 
         private readonly DispatcherTimer _closeTimer;
         private readonly MainViewModel _viewModel;
+        private readonly QqCoexistLifetime _coexistLifetime;
         private readonly Size _preferredSize;
         private bool _coexistMode; // 是否由 QQ 表情面板共存触发打开
         private bool _pinned;      // 钉住模式（设置按钮唤出）：不因鼠标离开自动关闭，靠 ✕/热键/再点按钮收起
@@ -46,6 +47,12 @@ namespace OICQStickerManager.Views
             _preferredSize = new Size(Width, Height);
             _viewModel = viewModel;
             DataContext = viewModel;
+            _coexistLifetime = new QqCoexistLifetime((host, reason) =>
+            {
+                QqPanelWatcher.DismissCoexist(host, reason);
+                _viewModel.SetQuickPanelCoexistTarget(IntPtr.Zero);
+                HideImmediately();
+            }, action => Dispatcher.BeginInvoke(DispatcherPriority.Send, action));
 
             // 面板隐藏/关闭时停掉格子内 GIF 动画（Hide 不触发 Unloaded，动画会在幕后空转耗 CPU）
             // 可见性同时镜像给 QqPanelWatcher.CoexistPanelShowing：鼠标钩子在后台线程判断
@@ -55,7 +62,7 @@ namespace OICQStickerManager.Views
             {
                 Volatile.Write(ref QqPanelWatcher.CoexistPanelShowing,
                     (bool)e.NewValue && _coexistMode ? 1 : 0);
-                if (!(bool)e.NewValue) StopPanelGifAnimation();
+                if (!(bool)e.NewValue) { StopPanelGifAnimation(); _coexistLifetime.Stop(); }
             };
 
             _closeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(CloseGraceMs) };
@@ -73,18 +80,19 @@ namespace OICQStickerManager.Views
             // 发送发起瞬间立即收起（对齐 QQ 原生面板"点完即关"；粘贴/剪贴板恢复的等待不拖面板）。
             // 关 QQ 原生表情面板不在这里做：它的 UIA Invoke 会把 QQ 焦点搬到表情按钮上，
             // 与共存发送的焦点修复并发互踩，会把搜狗输入法的上下文搞脱钩（候选框跑屏幕边缘）——
-            // 挪到 CoexistPasteAsync 粘贴落地之后执行。
+            // 由 CoexistPasteAsync 串行完成预关闭、焦点恢复和粘贴。
             viewModel.QuickPanelSendInitiated += OnSendInitiated;
         }
 
         private void OnSendInitiated(object? sender, EventArgs e)
         {
-            HideSoft();
+            HideImmediately();
         }
 
         // VM 是 App 静态单例、面板会随换肤整体重建：不退订的话旧窗体整棵对象图被静态根吊住
         protected override void OnClosed(EventArgs e)
         {
+            _coexistLifetime.Dispose();
             if (_viewModel != null) _viewModel.QuickPanelSendInitiated -= OnSendInitiated;
             base.OnClosed(e);
         }
@@ -141,6 +149,7 @@ namespace OICQStickerManager.Views
         /// <summary>带淡出的收起：动画结束后再真正隐藏窗口。</summary>
         public void HideSoft()
         {
+            _coexistLifetime.Stop();
             QqPanelWatcher.Log($"HideSoft enter: visible={IsVisible}");
             if (!IsVisible)
             {
@@ -173,6 +182,17 @@ namespace OICQStickerManager.Views
         }
 
         // --- 呼出与定位 ---
+
+        internal void HideImmediately()
+        {
+            _closeTimer.Stop(); _hideTimer?.Stop(); _hideTimer = null;
+            _coexistLifetime.Stop();
+            Hide();
+            PanelRoot.BeginAnimation(OpacityProperty, null); PanelRoot.Opacity = 1;
+            PanelScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+            PanelScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+            PanelScale.ScaleX = PanelScale.ScaleY = 1;
+        }
 
         private bool _warmed;
 
@@ -341,6 +361,7 @@ namespace OICQStickerManager.Views
 
         private void OpenNearCursorCore(bool pinned)
         {
+            _coexistLifetime.Stop();
             _coexistMode = false;
             _pinned = pinned;
             _viewModel.SetQuickPanelCoexistTarget(IntPtr.Zero);
@@ -358,7 +379,7 @@ namespace OICQStickerManager.Views
         /// 共存模式：贴靠在 QQ 原生表情面板旁打开（优先左侧，放不下贴右侧），
         /// 并记录 QQ 宿主窗口句柄——发送时需要把焦点还给它的聊天输入框。
         /// </summary>
-        public void OpenForCoexist(Rect qqPanelRect, IntPtr qqHwnd)
+        public void OpenForCoexist(Rect qqPanelRect, IntPtr qqHwnd, Rect buttonRect = default)
         {
             _coexistMode = true;
             _viewModel.SetQuickPanelCoexistTarget(qqHwnd);
@@ -391,6 +412,8 @@ namespace OICQStickerManager.Views
                 Show();
                 PlayShowAnimation();
             }
+            _coexistLifetime.Follow(qqHwnd, new WindowInteropHelper(this).Handle, qqPanelRect,
+                buttonRect.Width > 0 ? buttonRect : QqPanelWatcher.CachedButtonRect(qqHwnd));
         }
 
         // 以物理像素锚点在指定显示器上定位面板；scale 用于物理像素 ↔ DIP 换算

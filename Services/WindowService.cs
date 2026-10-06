@@ -46,7 +46,7 @@ public class WindowService
 
     /// <summary>
     /// 快捷面板发送（QQ 共存模式）：QQ 原生表情面板打开时，聊天输入框会失焦（焦点停在表情按钮/面板搜索框上），
-    /// 直接粘贴会落空。因此先把 QQ 窗口拉回前台，再把焦点还给聊天输入框（ProseMirror 编辑器），然后粘贴。
+    /// 直接粘贴会落空。因此确认目标 QQ 仍在前台，再把焦点还给聊天输入框（ProseMirror 编辑器），然后粘贴。
     /// 旧版 QQ 先关闭原生面板，再等待焦点编排平息；新版通过编辑区点击收起面板。
     /// IME 兼容（搜狗实测 2026-10-02 探针 D:\AsukaProbe）：焦点恢复必须以「放置插入符的点击」完成，绝不能用
     /// UIA SetFocus——UIA 焦点只设置 activeElement 不放置插入符，搜狗对编辑区做布局查询（GetTextExt）
@@ -59,14 +59,15 @@ public class WindowService
     public async Task<SendResult> CoexistPasteAsync(IntPtr qqHwnd, string imagePath, bool restoreClipboard = true)
     {
         var target = CaptureTarget(qqHwnd);
-        var foreground = GetForegroundWindow();
         long closeGeneration = QqPanelWatcher.UserActionGen;
+        long interaction = QqCoexistLifetime.LastInteractionTicks;
+        long editorConfirmedAt = 0;
+        bool CanContinue() => FocusRootIsQq(qqHwnd)
+            && QqPanelWatcher.UserActionGen == closeGeneration
+            && QqCoexistLifetime.LastInteractionTicks == interaction;
         var result = await _sender.SendAsync(target, imagePath, restoreClipboard, async () =>
         {
-            if (GetForegroundWindow() != foreground && !FocusRootIsQq(qqHwnd)) return false;
-            SetForegroundWindow(qqHwnd);
-            await Task.Delay(150);
-            if (!FocusRootIsQq(qqHwnd)) return false;
+            if (!CanContinue()) return false;
 
             // 1.5 旧版先收起 QQ 原生面板再点编辑框：这代 QQ 的面板光灭回收会把焦点从编辑框
             // 抢回表情按钮（2026-10-04 实测：编辑框点击后 35ms 焦点即被抢回，Ctrl+V 落空）——
@@ -83,45 +84,38 @@ public class WindowService
                     () => QqPanelWatcher.LastQqFocusTicks, milliseconds => Task.Delay(milliseconds));
                 QqPanelWatcher.Log($"coexist: focus choreography settled in {Environment.TickCount64 - waitStart} ms");
             }
-            if (!FocusRootIsQq(qqHwnd)) return false;
+            if (!CanContinue()) return false;
 
             // 2. 焦点还给聊天输入框：只允许真实鼠标点击（IME 安全）。定位串失配时退化为窗口相对启发点，
             //    仍然是真实点击——绝不退回 UIA SetFocus（会毒化搜狗候选框锚定且不可自愈）
-            bool clicked = QqPanelWatcher.IsLegacyWindow(qqHwnd)
-                ? await RestoreEditorFocusAsync(() => Task.Run(() => TryClickFocusEditor(qqHwnd)),
-                    () => FocusRootIsQq(qqHwnd) && QqPanelWatcher.UserActionGen == closeGeneration,
+            long sendFocusStarted = Environment.TickCount64;
+            bool clicked = await RestoreEditorFocusAsync(() => Task.Run(() => TryClickFocusEditor(qqHwnd, sendFocusStarted)),
+                    CanContinue,
                     () => WaitForFocusSettlementAsync(() => Environment.TickCount64,
-                        () => QqPanelWatcher.LastQqFocusTicks, milliseconds => Task.Delay(milliseconds)))
-                : await Task.Run(() => TryClickFocusEditor(qqHwnd));
+                        () => QqPanelWatcher.LastQqFocusTicks, milliseconds => Task.Delay(milliseconds)));
             QqPanelWatcher.Log(clicked ? "focus: editor clicked (IME-safe)" : "focus: click paths exhausted (gate on pre-paste focus check)");
-            if (!clicked && QqPanelWatcher.IsLegacyWindow(qqHwnd))
+            if (!clicked)
             {
                 // legacy：编辑框焦点找回失败 = 插入符没回到输入框（粘贴必落空或错位）。
                 // 宁可取消并提示，不静默粘到按钮/面板上（用户实测"焦点不回输入框，表情没上屏"）
                 QqPanelWatcher.Log("send aborted: editor focus not restored (no caret)");
                 return false;
             }
-            await Task.Delay(250);
+            editorConfirmedAt = QqPanelWatcher.EditorFocusEchoTicks(qqHwnd);
+            await Task.Delay(100);
 
             // 2.5 粘贴前最后闸门：Ctrl+V 永远落在本时刻的键盘焦点窗口上。前面校验+等待的秒级空档里
             // 用户切走窗口的话，粘贴会打进别的应用（2026-10-04 实测：发送卡顿期间切窗，表情进了其他软件）。
             // 此时剪贴板尚未写入，取消发送零副作用——错发到别的应用比不发严重得多。
-            if (!FocusRootIsQq(qqHwnd))
+            if (!CanContinue())
             {
                 QqPanelWatcher.Log("send aborted before paste: keyboard focus left QQ");
                 return false;
             }
 
-            return !QqPanelWatcher.IsLegacyWindow(qqHwnd) || QqPanelWatcher.EditorFocusEchoTicks(qqHwnd) > 0;
-        });
-        if (result.Succeeded)
-        {
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(800);
-                QqPanelWatcher.TryCloseQqPanel(closeGeneration, qqHwnd);
-            });
-        }
+            return !QqPanelWatcher.IsLegacyWindow(qqHwnd) || editorConfirmedAt > 0;
+        }, () => CanContinue() && (!QqPanelWatcher.IsLegacyWindow(qqHwnd)
+            || (editorConfirmedAt > 0 && QqPanelWatcher.EditorFocusEchoTicks(qqHwnd) >= editorConfirmedAt)));
         return result;
     }
 
@@ -150,14 +144,14 @@ public class WindowService
     /// 中心点会点到功能条上；② UIA 不可用（树休眠/定位串失配）时按窗口几何取启发点
     /// （水平 62%、距底 6%——NTQQ 输入区恒在聊天窗口右下）。两级都是真实点击。
     /// 每次点击前经 WindowFromPoint 遮挡检查；点后轮询焦点校验（Chromium 焦点传播是异步的，
-    /// 冷启动可达数百 ms，读不到不等于没点上）——键盘焦点若已回到 QQ 窗口即信任点击；
+    /// 冷启动可达数百 ms，读不到不等于没点上）——必须确认焦点属于聊天编辑框；
     /// 校验期间绝不退回 UIA SetFocus（毒化搜狗锚定，见类注释）。
     /// </summary>
-    private static bool TryClickFocusEditor(IntPtr qqHwnd)
+    private static bool TryClickFocusEditor(IntPtr qqHwnd, long sendFocusStarted = 0)
     {
         // ⓪ legacy：优先用焦点事件缓存的输入框矩形（免费且精确——用户点过/编辑过输入框即有缓存）。
         //    剪枝树上 UIA 定位全树扫 ~0.8s、窗口几何启发点随布局可能落偏，都是"焦点不回输入框"的祸源。
-        if (QqPanelWatcher.IsLegacyWindow(qqHwnd) && QqPanelWatcher.TryGetCachedEditorRect(qqHwnd, out var cachedEditor))
+        if (QqPanelWatcher.TryGetCachedEditorRect(qqHwnd, out var cachedEditor))
         {
             try
             {
@@ -166,7 +160,7 @@ public class WindowService
                     X = (int)(cachedEditor.Left + cachedEditor.Width / 2),
                     Y = (int)(cachedEditor.Bottom - Math.Min(25, cachedEditor.Height / 4))
                 };
-                if (IsPointOnQq(editorPt, qqHwnd) && SendClickAndVerify(editorPt, qqHwnd)) return true;
+                if (IsPointOnQq(editorPt, qqHwnd) && SendClickAndVerify(editorPt, qqHwnd, sendFocusStarted)) return true;
             }
             catch { /* 缓存矩形失效（窗口变动/元素重建），走下面的通用路径 */ }
         }
@@ -192,8 +186,8 @@ public class WindowService
                         // 首选隐形点击：向渲染子窗直接投递鼠标消息（光标不动，用户无感），
                         // Chromium 输入管线照常放置插入符，搜狗锚定与真实点击一致；
                         // 消息点击未生效再退回真实点击兜底（光标会动一下，落点已校验）。
-                        if (MessageClickAndVerify(pt, qqHwnd)) return true;
-                        if (SendClickAndVerify(pt, qqHwnd)) return true;
+                        if (MessageClickAndVerify(pt, qqHwnd, sendFocusStarted)) return true;
+                        if (SendClickAndVerify(pt, qqHwnd, sendFocusStarted)) return true;
                     }
                 }
             }
@@ -216,12 +210,12 @@ public class WindowService
             {
                 if (QqPanelWatcher.IsLegacyWindow(qqHwnd))
                 {
-                    if (SendClickAndVerify(pt, qqHwnd)) return true;
+                    if (SendClickAndVerify(pt, qqHwnd, sendFocusStarted)) return true;
                 }
                 else
                 {
-                    if (MessageClickAndVerify(pt, qqHwnd)) return true;
-                    if (SendClickAndVerify(pt, qqHwnd)) return true;
+                    if (MessageClickAndVerify(pt, qqHwnd, sendFocusStarted)) return true;
+                    if (SendClickAndVerify(pt, qqHwnd, sendFocusStarted)) return true;
                 }
             }
         }
@@ -236,7 +230,7 @@ public class WindowService
     /// 渲染层放置插入符并通知 TSF——搜狗锚定行为与物理点击一致（2026-10-02 实测）。
     /// 仅当窗口已在前台/焦点已在 QQ 时使用（共存发送即如此）；发送后轮询焦点校验。
     /// </summary>
-    private static bool MessageClickAndVerify(NativePoint pt, IntPtr qqHwnd)
+    private static bool MessageClickAndVerify(NativePoint pt, IntPtr qqHwnd, long sendFocusStarted = 0)
     {
         try
         {
@@ -263,7 +257,7 @@ public class WindowService
             Thread.Sleep(40);
             PostMessage(target, WM_LBUTTONUP, IntPtr.Zero, lp);
 
-            bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, clickAt);
+            bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, sendFocusStarted > 0 ? sendFocusStarted : clickAt);
             GetCursorPos(out var after);
             if (verified)
             {
@@ -280,16 +274,16 @@ public class WindowService
     }
 
     /// <summary>真实点击兜底：SendInput 物理点击（光标会移动），仅当消息点击未生效时使用。</summary>
-    private static bool SendClickAndVerify(NativePoint pt, IntPtr qqHwnd)
+    private static bool SendClickAndVerify(NativePoint pt, IntPtr qqHwnd, long sendFocusStarted = 0)
     {
         GetCursorPos(out var saved);
         long clickAt = Environment.TickCount64;
         if (!SendClickAt(pt)) return false;
         SetCursorPos(saved.X, saved.Y);
-        bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, clickAt);
+        bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, sendFocusStarted > 0 ? sendFocusStarted : clickAt);
         // legacy：焦点根==QQ 不再单独作为通过条件——焦点停在表情按钮/面板标签上时同样成立，
-        // 正是"表情没上屏"的形态。必须有"晚于本次点击"的编辑框回声（PollFocusVerified legacy 分支）。
-        return QqPanelWatcher.IsLegacyWindow(qqHwnd) ? verified : (verified || focusInQq);
+        // 正是"表情没上屏"的形态。编辑框回声须晚于本轮恢复开始，重试时仍有效。
+        return verified;
     }
 
     // 探测耗时也计入总截止时间，不能给每次跨进程查询重新分配完整超时。
@@ -302,7 +296,8 @@ public class WindowService
         bool verified = PollEditorFocus(remaining =>
         {
             if (!FocusRootIsQq(qqHwnd)) return false;
-            if (QqPanelWatcher.EditorFocusEchoTicks(qqHwnd) > echoAfterTicks) return true;
+            if (EditorEchoBelongsToSend(QqPanelWatcher.EditorFocusEchoTicks(qqHwnd), echoAfterTicks,
+                QqPanelWatcher.LastQqFocusTicks)) return true;
             if (QqPanelWatcher.IsLegacyWindow(qqHwnd)) return false;
             try
             {
@@ -327,6 +322,8 @@ public class WindowService
         }
         return false;
     }
+    internal static bool EditorEchoBelongsToSend(long echo, long sendStarted, long lastFocus) =>
+        echo > 0 && echo > sendStarted && echo >= lastFocus;
 
     /// <summary>键盘焦点所在的根窗口是否为 qqHwnd（GUITHREADINFO，本地调用零跨进程成本）。</summary>
     private static bool FocusRootIsQq(IntPtr qqHwnd)

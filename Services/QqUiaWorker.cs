@@ -60,6 +60,11 @@ internal static class QqUiaWorker
                             if (request.Generation < 0 || request.Generation == QqPanelWatcher.UserActionGen)
                                 response.Value = QqPanelWatcher.TryCloseQqPanelNow(new IntPtr(request.Hwnd));
                             break;
+                        case "dismiss":
+                            QqPanelWatcher.DismissWorkerPanel(new IntPtr(request.Hwnd), request.Generation);
+                            response.Value = true;
+                            break;
+                        case "verify": QqPanelWatcher.VerifyCoexist(new IntPtr(request.Hwnd)); response.Value = true; break;
                         case "dump": await QqPanelWatcher.DumpDiagnosticsNowAsync().ConfigureAwait(false); response.Value = true; break;
                     }
                 }

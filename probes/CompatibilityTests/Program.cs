@@ -21,6 +21,16 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        if (args.Length == 3 && args[0] == "--capture-qq-button" && long.TryParse(args[1], out var captureHost))
+        {
+            var rectangle = args[2].Split(',').Select(double.Parse).ToArray();
+            EmojiButtonTemplate.LogSink = Console.WriteLine;
+            EmojiButtonTemplate.CaptureFromScreen(new IntPtr(captureHost),
+                new Rect(rectangle[0], rectangle[1], rectangle[2], rectangle[3]), "diagnostic", force: true);
+            return 0;
+        }
+        if (args.Length == 3 && args[0] == "--exercise-qq-send" && long.TryParse(args[1], out var sendHost))
+            return QqSendProbe.Run(new IntPtr(sendHost), args[2]);
         if (args.Length == 2 && args[0] == "--inspect-qq-database")
             return QqDatabaseProbe.Run(args[1]);
         if (args.Length == 2 && args[0] == "--inspect-qq-structure" && long.TryParse(args[1], out var hwnd))
@@ -118,6 +128,9 @@ internal static class Program
         tests = tests.Concat(UiaIsolationTests.Cases).ToArray();
         tests = tests.Concat(FocusSettlementTests.Cases).ToArray();
         tests = tests.Concat(LegacyPanelTests.Cases).ToArray();
+        tests = tests.Concat(CoexistTests.Cases).ToArray();
+        if (args.Contains("--qq-core-only")) tests = CoexistTests.Cases.Concat(SendTests.Cases).Concat(FocusSettlementTests.Cases).Concat(LifecycleTests.Cases).Concat(LegacyPanelTests.Cases).ToArray();
+        if (args.Contains("--skip-key-bootstrap")) tests = tests.Where(t => t.Name != "Key helper bootstrap bypasses registry detection and quotes paths safely").ToArray();
         int failed = 0;
         try
         {
@@ -290,7 +303,9 @@ internal static class Program
 
     private static void LegacyTabWithPrunedAncestors()
     {
-        using var source = NewWindow("audit-pruned-tab");
+        // A visible native panel needs a visible host. Keep the fixture off screen.
+        using var source = new HwndSource(new HwndSourceParameters("audit-pruned-tab")
+        { Width = 800, Height = 600, PositionX = -30000, PositionY = -30000, WindowStyle = unchecked((int)0x90000000) });
         var focus = AutomationElement.FromLocalProvider(new FocusProbeProvider(source.Handle,
             "切换默认表情按钮", hasHost: false));
         using var watcher = new QqPanelWatcher(_ => { });

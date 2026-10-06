@@ -4,6 +4,7 @@ namespace OICQStickerManager.Services;
 
 internal static class NativeInput
 {
+    internal static readonly IntPtr InputMarker = new(0x4153554B);
     internal static bool TryPaste()
     {
         if (Down(0x10) || Down(0x12) || Down(0x5B) || Down(0x5C)) return false;
@@ -27,9 +28,9 @@ internal static class NativeInput
         if (width <= 1 || height <= 1) return false;
         var inputs = new[]
         {
-            new Input { Data = new Union { Mouse = new Mouse { X = (int)((long)(x - left) * 65535 / (width - 1)), Y = (int)((long)(y - top) * 65535 / (height - 1)), Flags = 0xC001 } } },
-            new Input { Data = new Union { Mouse = new Mouse { Flags = 0x0002 } } },
-            new Input { Data = new Union { Mouse = new Mouse { Flags = 0x0004 } } },
+            new Input { Data = new Union { Mouse = new Mouse { X = (int)((long)(x - left) * 65535 / (width - 1)), Y = (int)((long)(y - top) * 65535 / (height - 1)), Flags = 0xC001, Extra = InputMarker } } },
+            new Input { Data = new Union { Mouse = new Mouse { Flags = 0x0002, Extra = InputMarker } } },
+            new Input { Data = new Union { Mouse = new Mouse { Flags = 0x0004, Extra = InputMarker } } },
         };
         uint sent = SendInput(3, inputs, Marshal.SizeOf<Input>());
         if (sent == 2) SendInput(1, [inputs[2]], Marshal.SizeOf<Input>());

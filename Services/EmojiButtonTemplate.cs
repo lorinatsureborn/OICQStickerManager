@@ -38,7 +38,7 @@ internal static class EmojiButtonTemplate
 
     private sealed class Data
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public double Scale { get; set; } = 1.0;  // 采集时按钮所在窗口的 DPI 缩放（96 = 100%）
         public int Size { get; set; }             // 模板边长（物理像素，正方形）
         public string? QQVersion { get; set; }
@@ -86,22 +86,32 @@ internal static class EmojiButtonTemplate
 
     /// <summary>树激活路径的顺带采集：按钮矩形缓存建立时调用（后台线程）。同一 DPI 缩放只存一份，
     /// 已存在即跳过；中心点被其他窗口覆盖时放弃（截到别家像素的模板比没有更糟）。</summary>
-    public static void CaptureFromScreen(IntPtr hwnd, Rect absButtonRect, string qqVersion)
+    public static void CaptureFromScreen(IntPtr hwnd, Rect absButtonRect, string qqVersion, bool force = false)
     {
         if (Interlocked.Exchange(ref _capturing, 1) == 1) return;
         try
         {
             var _ = Available; // 确保磁盘状态已知（决定是否需要采集）
             var scale = GetWindowScale(hwnd);
-            if (_disk != null && Math.Abs(_disk.Scale - scale) < 0.01) return; // 该缩放已有模板
+            if (!force && _disk?.Version >= 2 && Math.Abs(_disk.Scale - scale) < 0.01) return;
             int size = Math.Clamp((int)Math.Ceiling(24 * scale) + 16, 40, 72);
             int cx = (int)(absButtonRect.Left + absButtonRect.Width / 2);
             int cy = (int)(absButtonRect.Top + absButtonRect.Height / 2);
+            var region = new Rect(cx - size / 2, cy - size / 2, size, size);
+            // A hover/click cursor can be composited into the GDI capture. Wait for
+            // the user to leave; never move their pointer just to collect a template.
+            long until = Environment.TickCount64 + 5000;
+            while (GetCursorPos(out var cursor) && !CursorClearOfTemplate(region, new(cursor.X, cursor.Y), scale))
+            {
+                if (Environment.TickCount64 >= until) return;
+                Thread.Sleep(100);
+            }
             // 中心点必须仍在宿主窗口上（按钮可见）：被快捷面板/其他窗口盖住就放弃本次采集
             var hit = WindowFromPoint(new POINT { X = cx, Y = cy });
             if (hit != IntPtr.Zero && GetAncestor(hit, GA_ROOT) != hwnd) return;
             var px = CaptureScreenPixels(cx, cy, size, out var stride);
             if (px == null) return;
+            if (GetCursorPos(out var after) && !CursorClearOfTemplate(region, new(after.X, after.Y), scale)) return;
             var data = new Data
             {
                 Scale = scale,
@@ -125,6 +135,13 @@ internal static class EmojiButtonTemplate
         }
         catch (Exception ex) { LogSink?.Invoke("pixel template capture failed: " + ex.Message); }
         finally { Volatile.Write(ref _capturing, 0); }
+    }
+
+    internal static bool CursorClearOfTemplate(Rect region, Point cursor, double scale)
+    {
+        if (region.IsEmpty || !double.IsFinite(scale) || scale <= 0) return false;
+        region.Inflate(64 * scale, 64 * scale);
+        return !region.Contains(cursor);
     }
 
     /// <summary>休眠回退匹配：点击点邻域找按钮模板。命中返回模板尺寸的绝对矩形（物理像素）。
@@ -400,6 +417,7 @@ internal static class EmojiButtonTemplate
     private struct BITMAPINFO { public BITMAPINFOHEADER bmiHeader; public int bmiColors; }
 
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(POINT pt);
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT point);
     [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] private static extern int GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr h);

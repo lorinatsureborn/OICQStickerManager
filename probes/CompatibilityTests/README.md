@@ -19,7 +19,7 @@ profile relocation, custom QQ directories, pending deletion, SQLCipher page
 authentication, committed encrypted WAL, DPAPI protection, owned helper cleanup,
 hardware-debugger restoration, PE layout parsing, physical panel placement,
 blur fallback, clipboard result generations and async command behavior.
-The suite currently contains 127 cases, including pruned UIA ancestor handling,
+The suite includes pruned UIA ancestor handling,
 current editor-focus evidence, bounded focus settlement, guarded recovery,
 legacy tab/toolbar geometry and reclaimable UIA-process lifecycles. Legacy panel
 fixtures cover visible nodes outliving button evidence, hidden nodes overriding
@@ -73,3 +73,36 @@ This is component regression coverage, not a substitute for QQ-version, IME,
 permission, multi-monitor DPI or long-running integration tests.
 The Windows GitHub Actions workflow runs the same commands. Its remote runner
 result must be checked separately; adding the workflow is not a CI pass claim.
+
+QQ coexistence and sending regressions can run separately (39 cases):
+
+```powershell
+dotnet run --project probes\CompatibilityTests\CompatibilityTests.csproj -c Release -p:OutputPath=bin\qq-core\tests\ -- --qq-core-only
+```
+
+These cover native host lifetime, outside clicks, injected editor-click evidence,
+late worker frames after dismissal, QQ's reused panel nodes, missing panel events,
+clipboard retry focus changes, and recovery when an already-focused editor emits
+no second focus event. The test host uses the same DPI manifest as the app.
+
+On a machine whose security software blocks the synthetic PowerShell key-helper
+bootstrap fixture, append `-- --skip-key-bootstrap` to run every other fixture.
+This excludes exactly one key-acquisition case; it does not disable security or
+skip coexistence/sending checks. The 2026-10-07 pre-push run of the isolated Git
+index snapshot passed 143/143 enabled cases.
+
+The following diagnostics operate on the current real QQ window and are **opt-in**:
+
+```powershell
+# Changes the QQ draft using the production send path; never presses Enter.
+dotnet run --project probes\CompatibilityTests\CompatibilityTests.csproj -c Release -p:OutputPath=bin\qq-core\tests\ -- --exercise-qq-send <QQ-window-handle> <image-path>
+
+# Replaces this profile's toolbar template from the currently visible button.
+# Use current observed physical coordinates and keep the pointer away from it.
+dotnet run --project probes\CompatibilityTests\CompatibilityTests.csproj -c Release -p:OutputPath=bin\qq-core\tests\ -- --capture-qq-button <QQ-window-handle> "x,y,width,height"
+```
+
+The draft diagnostic's `Sent` means the production focus/clipboard/input sequence
+was accepted. Confirm actual image insertion in QQ visually; this status alone
+is not QQ's acknowledgement of its document content. These two diagnostics are
+not part of the default fixture run.

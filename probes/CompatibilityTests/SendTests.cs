@@ -11,6 +11,7 @@ internal static class SendTests
         ("Send transaction reports clipboard contention as failure", () => Program.RunAsync(ClipboardContentionFails())),
         ("Send transaction reports rejected input as failure", () => Program.RunAsync(InputRejectionFails())),
         ("Send transactions serialize different images through restoration", () => Program.RunAsync(SendsAreSerialized())),
+        ("QQ focus evidence is rechecked after clipboard contention", () => Program.RunAsync(EditorChangesDuringRetry())),
     ];
 
     private static readonly SendTarget Target = new((IntPtr)42, 123);
@@ -73,6 +74,19 @@ internal static class SendTests
         var results = await Task.WhenAll(first, second);
         Program.Require(results.All(result => result.Succeeded) && environment.Pastes == 2, "queued sends were lost");
         Program.Require(!ClipboardCapture.Suppress, "clipboard capture remained suppressed");
+    }
+
+    private static async Task EditorChangesDuringRetry()
+    {
+        var environment = new FakeEnvironment { FailWrites = 1 };
+        bool editorFocused = true;
+        environment.OnDelay = _ => { editorFocused = false; return Task.CompletedTask; };
+        var overload = typeof(SendCoordinator).GetMethods().FirstOrDefault(m => m.Name == "SendAsync" && m.GetParameters().Length == 5);
+        Program.Require(overload != null, "send cannot recheck editor evidence between preparation and Ctrl+V");
+        var result = await (Task<SendResult>)overload!.Invoke(new SendCoordinator(environment),
+            [Target, Image(), true, (Func<Task<bool>>)(() => Task.FromResult(true)), (Func<bool>)(() => editorFocused)])!;
+        Program.Require(result.Status == SendStatus.FocusUnavailable && environment.Pastes == 0 && environment.Value == "backup",
+            "QQ accepted window focus after its actual editor lost focus");
     }
 
     private sealed class FakeEnvironment : ISendEnvironment

@@ -15,6 +15,7 @@ internal static class FocusSettlementTests
         ("Legacy toolbar anchoring scales and rejects unusable geometry", LegacyToolbarAnchorValidation),
         ("A cold legacy editor gets one guarded focus recovery retry", () => Program.RunAsync(ColdEditorRetry())),
         ("New user activity during focus settlement cancels the retry", () => Program.RunAsync(NewActivityCancelsRetry())),
+        ("An unchanged editor focus remains valid across the recovery click", SameEditorDoesNotNeedAnotherEvent),
     ];
 
     private static async Task EarlierQuietDoesNotSettle()
@@ -129,5 +130,14 @@ internal static class FocusSettlementTests
         clicks = 0;
         result = await Restore(() => { clicks++; return Task.FromResult(true); }, () => false, () => Task.CompletedTask);
         Program.Require(!result && clicks == 0, "an already superseded send still clicked the editor");
+    }
+    private static void SameEditorDoesNotNeedAnotherEvent()
+    {
+        var method = typeof(WindowService).GetMethod("EditorEchoBelongsToSend", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Program.Require(method != null, "focus retry requires a second UIA focus event even when the first click already focused the editor");
+        bool Valid(long echo, long send, long focus) => (bool)method!.Invoke(null, [echo, send, focus])!;
+        Program.Require(Valid(1200, 1000, 1200), "current editor evidence was discarded when a second click emitted no event");
+        Program.Require(!Valid(900, 1000, 900) && !Valid(1200, 1000, 1300) && !Valid(0, 0, 0),
+            "old evidence or a later non-editor focus passed the pre-paste gate");
     }
 }

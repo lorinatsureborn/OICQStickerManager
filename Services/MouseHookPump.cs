@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 
 namespace OICQStickerManager.Services;
 
-internal sealed class MouseHookPump(Func<int, IntPtr, IntPtr, IntPtr> callback, Action<string> log) : IDisposable
+internal sealed class MouseHookPump(Func<int, IntPtr, IntPtr, IntPtr> callback, Action<string> log, int hookId = 14) : IDisposable
 {
     private readonly object _gate = new();
     private readonly TaskCompletionSource<bool> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -25,7 +25,7 @@ internal sealed class MouseHookPump(Func<int, IntPtr, IntPtr, IntPtr> callback, 
                 catch { }
                 return CallNextHookEx(IntPtr.Zero, code, message, data);
             };
-            _thread = new Thread(Run) { IsBackground = true, Name = "AsukaMouseHook" };
+            _thread = new Thread(Run) { IsBackground = true, Name = hookId == 13 ? "AsukaKeyboardHook" : "AsukaMouseHook" };
             _thread.Start();
             return _started.Task;
         }
@@ -39,9 +39,9 @@ internal sealed class MouseHookPump(Func<int, IntPtr, IntPtr, IntPtr> callback, 
             PeekMessage(out _, IntPtr.Zero, 0, 0, 0);
             Volatile.Write(ref _threadId, GetCurrentThreadId());
             if (_disposed) return;
-            hook = SetWindowsHookEx(14, _nativeCallback!, GetModuleHandle(null), 0);
+            hook = SetWindowsHookEx(hookId, _nativeCallback!, GetModuleHandle(null), 0);
             if (hook == IntPtr.Zero) { log("mouse hook install failed: " + Marshal.GetLastWin32Error()); return; }
-            log("mouse hook installed on dedicated native thread");
+            log($"{(hookId == 13 ? "keyboard" : "mouse")} hook installed on dedicated native thread");
             _started.TrySetResult(true);
             while (!_disposed && GetMessage(out var message, IntPtr.Zero, 0, 0) > 0)
             {

@@ -908,7 +908,7 @@ namespace OICQStickerManager.Views
             {
                 if (_lifetime.IsCancellationRequested || !ReferenceEquals(_panelWatcher, watcher)) return;
                 if (_quickPanel == null) _quickPanel = new QuickPanelWindow((MainViewModel)DataContext);
-                _quickPanel.OpenForCoexist(e.PanelRect, e.HostHwnd);
+                _quickPanel.OpenForCoexist(e.PanelRect, e.HostHwnd, e.EmojiButtonRect);
             });
 
             // 按下 QQ 表情按钮的瞬间（乐观路径）：用缓存矩形立即打开，QQ 面板出现后 OpenForCoexist 会以真实矩形自校正；
@@ -921,12 +921,12 @@ namespace OICQStickerManager.Views
                 if (anchor == Rect.Empty)
                 {
                     if (e.EmojiButtonRect == Rect.Empty) return;
-                    // QQ 原生面板标准尺寸 675x506（物理像素），出现在表情按钮上方、右缘对齐按钮右缘
-                    anchor = new Rect(e.EmojiButtonRect.Right - 675, e.EmojiButtonRect.Top - 506, 675, 506);
+                    anchor = QqPanelWatcher.LegacyPanelRectFromButton(e.EmojiButtonRect,
+                        QqPanelWatcher.WindowScale(e.HostHwnd));
                 }
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 if (_quickPanel == null) _quickPanel = new QuickPanelWindow((MainViewModel)DataContext);
-                _quickPanel.OpenForCoexist(anchor, e.HostHwnd);
+                _quickPanel.OpenForCoexist(anchor, e.HostHwnd, e.EmojiButtonRect);
                 QqPanelWatcher.Log($"optimistic panel shown in {sw.ElapsedMilliseconds} ms");
             });
 
@@ -935,7 +935,7 @@ namespace OICQStickerManager.Views
                 if (_lifetime.IsCancellationRequested || !ReferenceEquals(_panelWatcher, watcher)) return;
                 // 仅收起共存模式打开的面板；热键打开的不受影响
                 QqPanelWatcher.Log($"disappeared handler: coexist={_quickPanel?.CoexistMode.ToString() ?? "<null>"}, visible={_quickPanel?.IsVisible.ToString() ?? "<null>"}");
-                if (_quickPanel != null && _quickPanel.CoexistMode) _quickPanel.HideSoft();
+                if (_quickPanel != null && _quickPanel.CoexistMode) _quickPanel.HideImmediately();
                 if (DataContext is MainViewModel vm) vm.SetQuickPanelCoexistTarget(IntPtr.Zero);
             });
 

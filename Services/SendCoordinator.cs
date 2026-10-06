@@ -39,7 +39,8 @@ public sealed class SendCoordinator(ISendEnvironment environment)
 {
     private static readonly SemaphoreSlim SendGate = new(1, 1);
 
-    public async Task<SendResult> SendAsync(SendTarget target, string path, bool restoreClipboard, Func<Task<bool>> prepare)
+    public async Task<SendResult> SendAsync(SendTarget target, string path, bool restoreClipboard, Func<Task<bool>> prepare,
+        Func<bool>? canPaste = null)
     {
         await SendGate.WaitAsync();
         using var suppression = ClipboardCapture.BeginSuppression();
@@ -51,11 +52,13 @@ public sealed class SendCoordinator(ISendEnvironment environment)
             if (!File.Exists(path) || !environment.IsValid(target)) return new(SendStatus.TargetUnavailable);
             if (!await prepare()) return new(SendStatus.FocusUnavailable);
             if (!environment.IsFocused(target)) return new(SendStatus.TargetChanged);
+            if (canPaste?.Invoke() == false) return new(SendStatus.FocusUnavailable);
             backup = restoreClipboard ? environment.CaptureClipboard() : null;
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 if (!environment.IsValid(target)) return new(SendStatus.TargetUnavailable);
                 if (!environment.IsFocused(target)) return new(SendStatus.TargetChanged);
+                if (canPaste?.Invoke() == false) return new(SendStatus.FocusUnavailable);
                 if (environment.TryWriteFile(path))
                 {
                     ownedSequence = environment.ClipboardSequence;
@@ -65,6 +68,7 @@ public sealed class SendCoordinator(ISendEnvironment environment)
             }
             if (ownedSequence == 0) return new(SendStatus.ClipboardBusy);
             if (!environment.IsFocused(target)) return new(SendStatus.TargetChanged);
+            if (canPaste?.Invoke() == false) return new(SendStatus.FocusUnavailable);
             if (environment.ClipboardSequence != ownedSequence) return new(SendStatus.ClipboardChanged);
             pasted = environment.TryPaste(target);
             return new(pasted ? SendStatus.Sent : SendStatus.InputRejected);
