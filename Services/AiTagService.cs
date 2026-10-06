@@ -193,10 +193,23 @@ public class AiTagService
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var (content, status, body) = await PostChatAsync(opt, dataUrl, existingTags, ct);
-            var tags = ParseTags(content, opt, body);
-            Log($"OK {opt.ProviderName} model={opt.Model} img={bytes}B({ext}) {sw.ElapsedMilliseconds}ms tags=[{string.Join(",", tags)}]");
-            return new AiTagResult(tags, opt.ProviderId, opt.Model, DateTime.Now);
+            for (var attempt = 1; ; attempt++)
+            {
+                var (content, status, body) = await PostChatAsync(opt, dataUrl, existingTags, ct);
+                try
+                {
+                    var tags = ParseTags(content, opt, body);
+                    Log($"OK {opt.ProviderName} model={opt.Model} img={bytes}B({ext}) {sw.ElapsedMilliseconds}ms" +
+                        (attempt > 1 ? $" (attempt {attempt})" : "") + $" tags=[{string.Join(",", tags)}]");
+                    return new AiTagResult(tags, opt.ProviderId, opt.Model, DateTime.Now);
+                }
+                catch (AiTagException ex) when (attempt == 1 && IsFormatDrift(ex))
+                {
+                    // 思考型模型偶发把回复漂移成英文图片描述等非 JSON 文本（2026-10-06 智谱实测）：
+                    // 属模型随机性，自动重试一次，不打扰用户
+                    Log($"retry: format drift on attempt 1 ({Clip(ex.Detail, 120)}), retrying");
+                }
+            }
         }
         catch (AiTagException ex)
         {
@@ -236,7 +249,8 @@ public class AiTagService
                                 "要求：\n" +
                                 "- 只输出一个 JSON 字符串数组，格式如 [\"金馆长\",\"大笑\",\"搞笑\"]，不要输出任何其他文字或解释\n" +
                                 "- 每个标签 1~6 个字；涵盖画面主体（人物/动物/物品）、情绪或动作，以及文字梗的核心词\n" +
-                                "- 如果是知名角色/IP/表情包系列，给出它的通用名称"
+                                "- 如果是知名角色/IP/表情包系列，给出它的通用名称\n" +
+                                "- 再次强调：你的完整回复必须只是一个 JSON 数组，禁止任何英文描述、图片分析或数组以外的文字"
                             },
                             new { type = "image_url", image_url = new { url = dataUrl } },
                         },
@@ -324,6 +338,13 @@ public class AiTagService
 
     /// <summary>应用请求的输出预算起步值；各模型有更低硬上限时按 400 报错降档。</summary>
     public const int DefaultMaxTokens = 2000;
+
+    /// <summary>输出格式漂移类失败（可重试）：非 JSON 文本/无法解析/空标签/空内容——区别于网络与鉴权类失败。</summary>
+    private static bool IsFormatDrift(AiTagException ex) =>
+        ex.Detail.StartsWith("unparseable", StringComparison.Ordinal)
+        || ex.Detail.StartsWith("json parse failed", StringComparison.Ordinal)
+        || ex.Detail.StartsWith("empty tag list", StringComparison.Ordinal)
+        || ex.Detail.StartsWith("empty content", StringComparison.Ordinal);
 
     /// <summary>从 400 响应里提取模型的 max_tokens 硬上限（智谱「限制数值范围[1,1024]」/ OpenAI「at most 4096」两种口径）。</summary>
     public static bool TryExtractMaxTokenLimit(string body, out int limit)
