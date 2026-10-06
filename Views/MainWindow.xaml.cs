@@ -362,7 +362,10 @@ namespace OICQStickerManager.Views
         }
 
         private void OpenSettings_Click(object sender, RoutedEventArgs e)
-            => ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+        {
+            RefreshAiSettingsUi(); // AI 识别区的服务商/模型胶囊按当前配置渲染
+            ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+        }
 
         private void CloseSettings_Click(object sender, RoutedEventArgs e)
             => HideOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
@@ -1013,6 +1016,7 @@ namespace OICQStickerManager.Views
                     TagEditorSubtitle.Text = skips.Count > 0 ? $"{summary}（{string.Join("，", skips)}）" : summary;
                     viewModel.StatusText = $"正在为 {_pendingStickers.Count} 个新表情设置标签...";
 
+                    ClearAiSuggestions(); // 新一批导入：上一批的 AI 建议不留存
                     RefreshEditorUI();
                     ShowOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
                     TagInputBox.Focus();
@@ -1065,6 +1069,7 @@ namespace OICQStickerManager.Views
 
             _batchAdjustMode = false;
             _suggestedTag = null;
+            ClearAiSuggestions();
             ClearTagEditorPreview();
             HideOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
         }
@@ -1073,6 +1078,7 @@ namespace OICQStickerManager.Views
         {
             _batchAdjustMode = false;
             _suggestedTag = null;
+            ClearAiSuggestions();
             ClearTagEditorPreview();
             HideOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
         }
@@ -1110,6 +1116,7 @@ namespace OICQStickerManager.Views
             // 💡 统一入口：即使是编辑单个，也放入列表中
             _pendingStickers = new List<StickerModel> { sticker };
             _suggestedTag = null; // 编辑已有表情不提供来源建议
+            ClearAiSuggestions(); // 上一次编辑会话的 AI 建议不留存
 
             // 拷贝标签用于编辑（如果是批量编辑，这里通常取第一张的标签或清空，按需决定）
             _editingTags = new List<string>(sticker.Tags);
@@ -1174,6 +1181,8 @@ namespace OICQStickerManager.Views
                 if (filter.Length > 0 && !tag.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
                 TagPoolPanel.Children.Add(CreateTagButton(tag, chipStyle));
             }
+
+            RefreshAiSuggestChips(); // AI 建议区随已选标签联动（点选过的胶囊即时消失）
         }
 
         // 新增标签输入框文字变化 → 推荐标签实时筛选
@@ -1201,6 +1210,323 @@ namespace OICQStickerManager.Views
             {
                 ShowTagEditor(sticker);
             }
+        }
+
+        // ———— AI 视觉标签建议（用户自备 API Key；配置在设置 → AI 识别）————
+
+        // AI 建议标签（编辑器内点击才加，与 _suggestedTag 同语义但来自视觉模型、可多条）：
+        // 保存/关闭/重开编辑器时清空；已点选的从建议区消失
+        private List<string> _aiSuggestions = new();
+        private string _aiSuggestionsMeta = "";
+
+        /// <summary>把 AI 建议接进当前打开的标签编辑器（过滤已选标签；来自缓存时附说明并亮出「重新识别」）。</summary>
+        private void ApplyAiSuggestionsToEditor(AiTagResult result, bool fromCache)
+        {
+            _aiSuggestions = result.Tags.Where(t => !_editingTags.Contains(t)).ToList();
+            _aiSuggestionsMeta = DescribeAiSource(result, fromCache);
+            AiRefreshInEditorButton.Visibility = Visibility.Visible;
+            RefreshAiSuggestChips();
+        }
+
+        private static string DescribeAiSource(AiTagResult result, bool fromCache)
+        {
+            var who = AiTagService.FindProvider(result.ProviderId)?.Name;
+            if (string.IsNullOrEmpty(who)) who = result.ProviderId.Length > 0 ? result.ProviderId : "AI";
+            return fromCache ? $"{who} · 缓存 · {result.CreatedAt:MM-dd HH:mm}" : $"{who} · 刚刚识别";
+        }
+
+        private void RefreshAiSuggestChips()
+        {
+            AiSuggestPanel.Children.Clear();
+            _aiSuggestions = _aiSuggestions.Where(t => !_editingTags.Contains(t)).ToList();
+            var chipStyle = (Style)FindResource("ChipButtonStyle");
+            foreach (var tag in _aiSuggestions)
+            {
+                var captured = tag;
+                var chip = new Button { Content = captured, Style = chipStyle, ToolTip = "AI 建议标签：点击添加" };
+                chip.Click += (_, _) =>
+                {
+                    if (_editingTags.Contains(captured)) return;
+                    _editingTags.Add(captured);
+                    _aiSuggestions.Remove(captured);
+                    RefreshEditorUI();
+                };
+                AiSuggestPanel.Children.Add(chip);
+            }
+            AiSuggestSection.Visibility = _aiSuggestions.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            AiSuggestMetaText.Text = _aiSuggestionsMeta;
+        }
+
+        private void ClearAiSuggestions()
+        {
+            _aiSuggestions = new List<string>();
+            _aiSuggestionsMeta = "";
+            AiSuggestSection.Visibility = Visibility.Collapsed;
+            AiRefreshInEditorButton.Visibility = Visibility.Collapsed;
+            AiSuggestPanel.Children.Clear();
+        }
+
+        private void SetAiEditorBusy(bool busy)
+        {
+            AiSuggestInEditorButton.IsEnabled = !busy;
+            AiSuggestInEditorButton.Content = busy ? "识别中…" : "AI 建议";
+            AiRefreshInEditorButton.IsEnabled = !busy;
+        }
+
+        /// <summary>AI 未配置时的引导弹窗；返回 true = 用户点了「打开设置」。</summary>
+        private async Task<bool> GuideAiSetupAsync()
+        {
+            return await ShowAlertAsync("先配置 AI 识别",
+                "AI 标签建议需要你自备一个支持「看图」（原生视觉）的大模型 API Key。\n\n" +
+                "到 设置 → AI 识别 粘贴 Key 即可：OpenAI、智谱、Kimi、通义千问、硅基流动、豆包、Gemini、Claude 等主流服务商都支持。" +
+                "填完 Key 自动识别服务商，并给出获取 Key 的逐步引导。",
+                "打开设置", showCancel: false, neutral: "稍后再说");
+        }
+
+        /// <summary>识别失败的统一出口：用户看懂为什么失败 + 完整现场在日志。</summary>
+        private void ShowAiFailureAlert(AiTagException ex)
+        {
+            AiTagService.Log($"ui: failure alert :: {ex.Detail}");
+            _ = ShowAlertAsync("AI 识别失败",
+                ex.Message + "\n\n完整失败原因已写入 %TEMP%\\asuka-aitag.log（设置 → 反馈 → 打开诊断日志文件夹）",
+                "知道了", showCancel: false);
+        }
+
+        // 图库右键 → AI 标签建议：取建议（缓存优先）后打开该表情的编辑器，建议以胶囊呈现、点选才加
+        private async void AiSuggest_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as MenuItem)?.DataContext is not StickerModel sticker) return;
+            if (DataContext is not MainViewModel vm) return;
+
+            if (!vm.AiTagConfigured)
+            {
+                if (await GuideAiSetupAsync())
+                    ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+                return;
+            }
+
+            try
+            {
+                vm.StatusText = "AI 识别中…";
+                var (result, fromCache) = await vm.GetAiSuggestionsAsync(sticker);
+                ShowTagEditor(sticker);
+                ApplyAiSuggestionsToEditor(result, fromCache);
+                vm.StatusText = "AI 标签建议已就绪，点击胶囊即可添加";
+            }
+            catch (AiTagException ex)
+            {
+                vm.StatusText = "AI 识别未完成";
+                ShowAiFailureAlert(ex);
+            }
+        }
+
+        private async void AiSuggestInEditor_Click(object sender, RoutedEventArgs e)
+            => await RunEditorAiAsync(forceRefresh: false);
+
+        private async void AiRefreshInEditor_Click(object sender, RoutedEventArgs e)
+            => await RunEditorAiAsync(forceRefresh: true);
+
+        /// <summary>编辑器内取 AI 建议：单张=本图建议；多张=逐张识别（并发 2、全部缓存）合并为整批候选。</summary>
+        private async Task RunEditorAiAsync(bool forceRefresh)
+        {
+            if (DataContext is not MainViewModel vm || _pendingStickers == null || _pendingStickers.Count == 0) return;
+            if (!vm.AiTagConfigured)
+            {
+                // 设置 sheet 在 Z 序上盖过标签编辑器（XAML 顺序），关掉设置即回到编辑继续，不丢已点标签
+                if (await GuideAiSetupAsync())
+                    ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+                return;
+            }
+
+            if (_pendingStickers.Count > 3 && !forceRefresh && !AiTagCache.WouldAllHitCache(_pendingStickers))
+            {
+                var ok = await ShowAlertAsync("批量 AI 识别",
+                    $"将为 {_pendingStickers.Count} 张图片分别调用 AI（约 {_pendingStickers.Count} 次请求，消耗 API 额度；已识别过的图走缓存、不重复计费），结果合并为整批候选标签。继续？",
+                    "继续", cancel: "先不了");
+                if (!ok) return;
+            }
+
+            SetAiEditorBusy(true);
+            var stickers = _pendingStickers.ToList();
+            try
+            {
+                if (stickers.Count == 1)
+                {
+                    vm.StatusText = "AI 识别中…";
+                    var (result, fromCache) = await vm.GetAiSuggestionsAsync(stickers[0], forceRefresh);
+                    ApplyAiSuggestionsToEditor(result, fromCache);
+                    vm.StatusText = "AI 标签建议已就绪，点击胶囊即可添加";
+                }
+                else
+                {
+                    var union = new List<string>();
+                    AiTagException? firstError = null;
+                    var failed = 0;
+                    var anyCache = false;
+                    AiTagResult? source = null;
+                    var done = 0;
+                    using var gate = new SemaphoreSlim(2);
+                    var tasks = stickers.Select(async st =>
+                    {
+                        await gate.WaitAsync();
+                        try
+                        {
+                            var (result, fromCache) = await vm.GetAiSuggestionsAsync(st, forceRefresh);
+                            lock (union)
+                            {
+                                foreach (var t in result.Tags) if (!union.Contains(t)) union.Add(t);
+                                anyCache |= fromCache;
+                                source ??= result;
+                            }
+                        }
+                        catch (AiTagException ex)
+                        {
+                            lock (union) { firstError ??= ex; failed++; }
+                        }
+                        finally { gate.Release(); Interlocked.Increment(ref done); }
+                    }).ToList();
+                    _ = Task.Run(async () =>
+                    {
+                        while (done < tasks.Count)
+                        {
+                            var d = Math.Min(done, tasks.Count);
+                            var total = tasks.Count;
+                            _ = Dispatcher.BeginInvoke(() =>
+                            {
+                                if (TagEditorOverlay.Visibility == Visibility.Visible)
+                                    vm.StatusText = $"AI 识别中 {d}/{total}…";
+                            });
+                            await Task.Delay(150);
+                        }
+                    });
+                    await Task.WhenAll(tasks);
+
+                    if (TagEditorOverlay.Visibility != Visibility.Visible) return; // 期间编辑器被关掉：结果已进缓存
+                    if (union.Count == 0 && firstError != null) { ShowAiFailureAlert(firstError); return; }
+                    ApplyAiSuggestionsToEditor(
+                        new AiTagResult(union, source?.ProviderId ?? "", source?.Model ?? "", DateTime.Now), anyCache);
+                    vm.StatusText = failed > 0
+                        ? $"AI 建议已就绪（{stickers.Count - failed}/{stickers.Count} 张成功，失败详情见 %TEMP%\\asuka-aitag.log）"
+                        : "AI 标签建议已就绪，点击胶囊即可添加";
+                }
+            }
+            catch (AiTagException ex)
+            {
+                ShowAiFailureAlert(ex);
+            }
+            finally
+            {
+                SetAiEditorBusy(false);
+            }
+        }
+
+        // ———— 设置页 · AI 识别 ————
+
+        /// <summary>按当前配置渲染服务商/模型预设胶囊（设置页打开与配置变化时调用）。</summary>
+        private void RefreshAiSettingsUi()
+        {
+            if (DataContext is not MainViewModel vm) return;
+            var chip = (Style)FindResource("ChipButtonStyle");
+            var chipSel = (Style)FindResource("ChipSelectedButtonStyle");
+
+            void AddChip(WrapPanel panel, string label, string tip, bool selected, Action onClick)
+            {
+                var b = new Button { Content = label, Style = selected ? chipSel : chip, ToolTip = tip };
+                b.Click += (_, _) => { onClick(); RefreshAiSettingsUi(); };
+                panel.Children.Add(b);
+            }
+
+            AiProviderChipsPanel.Children.Clear();
+            AddChip(AiProviderChipsPanel, "自动识别", "根据 API Key 前缀自动判断服务商", vm.AiTagProvider == "auto",
+                () => vm.AiTagProvider = "auto");
+            foreach (var p in AiTagService.Providers)
+            {
+                var id = p.Id;
+                AddChip(AiProviderChipsPanel, p.Name, p.Guide, vm.AiTagProvider == id,
+                    () => vm.AiTagProvider = id);
+            }
+
+            AiModelPresetsPanel.Children.Clear();
+            var effective = vm.AiTagModel.Length > 0 ? vm.AiTagModel : vm.AiSelectedProvider?.DefaultModel ?? "";
+            foreach (var m in vm.AiModelPresets)
+            {
+                var model = m;
+                var isDefault = model == vm.AiSelectedProvider?.DefaultModel;
+                AddChip(AiModelPresetsPanel, isDefault ? model + "（推荐）" : model,
+                    isDefault ? "点击选用该服务商的推荐视觉模型" : "点击选用该视觉模型", model == effective,
+                    () => vm.AiTagModel = model);
+            }
+        }
+
+        private void AiGuideLink_Click(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is not MainViewModel vm || vm.AiProviderGuideUrl.Length == 0) return;
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(vm.AiProviderGuideUrl)
+                {
+                    UseShellExecute = true,
+                });
+            }
+            catch (Exception ex)
+            {
+                AiTagService.Log($"guide link open failed: {ex.Message}");
+                _ = ShowAlertAsync("无法打开浏览器", $"请手动访问：{vm.AiProviderGuideUrl}", "知道了", showCancel: false);
+            }
+        }
+
+        private async void AiTest_Click(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is not MainViewModel vm) return;
+            AiTagOptions opt;
+            try { opt = vm.BuildAiTagOptions(); }
+            catch (AiTagException ex)
+            {
+                _ = ShowAlertAsync("还不能测试", ex.Message, "知道了", showCancel: false);
+                return;
+            }
+
+            AiTestButton.IsEnabled = false;
+            AiTestButton.Content = "测试中…";
+            try
+            {
+                var testImage = await BuildAiTestImageAsync();
+                var result = await vm.AiTag.SuggestTagsAsync(testImage, opt, Array.Empty<string>());
+                _ = ShowAlertAsync("连接成功",
+                    $"{opt.ProviderName} · {opt.Model}\n模型返回标签：{string.Join("、", result.Tags)}\n\n配置可用：图库里右键任意表情 →「AI 标签建议」。",
+                    "好", showCancel: false);
+            }
+            catch (AiTagException ex)
+            {
+                ShowAiFailureAlert(ex);
+            }
+            finally
+            {
+                AiTestButton.IsEnabled = true;
+                AiTestButton.Content = "测试连接";
+            }
+        }
+
+        /// <summary>生成 64×64 纯色 PNG 测试图（真实走一遍图片编码与视觉链路）。</summary>
+        private static async Task<string> BuildAiTestImageAsync()
+        {
+            return await Task.Run(() =>
+            {
+                var path = Path.Combine(Path.GetTempPath(), "asuka-aitag-test.png");
+                var bmp = new System.Windows.Media.Imaging.WriteableBitmap(64, 64, 96, 96,
+                    System.Windows.Media.PixelFormats.Bgra32, null);
+                var pixels = new byte[64 * 64 * 4];
+                for (int i = 0; i < pixels.Length; i += 4)
+                {
+                    pixels[i] = 0x50; pixels[i + 1] = 0xA0; pixels[i + 2] = 0xF0; pixels[i + 3] = 0xFF;
+                }
+                bmp.WritePixels(new System.Windows.Int32Rect(0, 0, 64, 64), pixels, 64 * 4, 0);
+                var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                using var fs = File.Create(path);
+                encoder.Save(fs);
+                return path;
+            });
         }
 
         private async void DeleteSticker_Click(object sender, RoutedEventArgs e)
@@ -1433,6 +1759,7 @@ namespace OICQStickerManager.Views
             TagEditorSubtitle.Text = $"「{tagName}」下共 {stickers.Count} 张图片；已预填全部图片共有的标签，" +
                                      "保存时只应用你的增删改动，各图片独有的标签会保留";
             SetTagEditorPreview(stickers[0]);
+            ClearAiSuggestions();
             RefreshEditorUI();
             ShowOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
             TagInputBox.Focus();
@@ -2093,6 +2420,7 @@ namespace OICQStickerManager.Views
                 if (unsupported > 0) skips.Add($"{unsupported} 张 WebP 暂不支持");
                 TagEditorSubtitle.Text = skips.Count > 0 ? $"{summary}（{string.Join("，", skips)}）" : summary;
 
+                ClearAiSuggestions(); // 新一批导入：上一批的 AI 建议不留存
                 RefreshEditorUI();
                 ShowOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
                 TagInputBox.Focus();

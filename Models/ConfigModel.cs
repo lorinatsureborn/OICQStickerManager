@@ -70,4 +70,17 @@ public class AppConfig
     // "最近置顶"的张数（1-20，默认 5）：最近发送的图会高频连发，置顶便于快速再找
     public int RecentPinnedCount { get; set; } = 5;
 
+    // ———— AI 视觉标签建议（用户自备 API Key，见设置 → AI 识别）————
+    // Key 明文存本机 config.json（与 QqDbKey 同口径），不上传任何服务器
+    public string AiTagApiKey { get; set; } = "";
+
+    // 服务商 id：auto=按 Key 前缀自动识别；其余见 AiTagService.Providers
+    public string AiTagProvider { get; set; } = "auto";
+
+    // 模型名：空=用服务商默认视觉模型
+    public string AiTagModel { get; set; } = "";
+
+    // 自定义服务商的接口地址（OpenAI 兼容 /chat/completions 根，如 https://xxx/v1）
+    public string AiTagBaseUrl { get; set; } = "";
+
 }

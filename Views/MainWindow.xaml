@@ -40,6 +40,7 @@
                 <Border.ContextMenu>
                     <ContextMenu>
                         <MenuItem Header="编辑标签" Click="EditTag_Click"/>
+                        <MenuItem Header="AI 标签建议" Click="AiSuggest_Click"/>
                         <Separator/>
                         <MenuItem Header="删除表情" Foreground="{DynamicResource DangerBrush}"
                                   Click="DeleteSticker_Click"/>
@@ -544,6 +545,19 @@
                             <TextBlock x:Name="NoTagsHint" Text="暂无标签，输入新标签或从下方选择"
                                        Style="{StaticResource CaptionTextStyle}" Margin="0,2,0,4"/>
 
+                            <!-- AI 视觉模型建议（点 AI 建议按钮后出现，点击即加；缓存结果可「重新识别」强刷） -->
+                            <StackPanel x:Name="AiSuggestSection" Visibility="Collapsed" Margin="0,10,0,0">
+                                <Grid>
+                                    <TextBlock Text="AI 建议（点击添加）" Style="{StaticResource CaptionTextStyle}"
+                                               VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="AiSuggestMetaText" HorizontalAlignment="Right"
+                                               Style="{StaticResource CaptionTextStyle}" TextWrapping="Wrap"
+                                               MaxWidth="300" TextAlignment="Right"
+                                               Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                </Grid>
+                                <WrapPanel x:Name="AiSuggestPanel" Margin="-2,6,-2,0"/>
+                            </StackPanel>
+
                             <TextBlock Text="新增标签（回车或点击添加）" Style="{StaticResource CaptionTextStyle}"
                                        Margin="0,14,0,0"/>
                             <Grid Margin="0,7,0,0">
@@ -557,8 +571,22 @@
                                         Content="添加" MinWidth="60" Margin="8,0,0,0" Click="AddTagButton_Click"/>
                             </Grid>
 
-                            <TextBlock Text="推荐标签（点击添加）" Style="{StaticResource CaptionTextStyle}"
-                                       Margin="0,16,0,0"/>
+                            <Grid Margin="0,16,0,0">
+                                <TextBlock Text="推荐标签（点击添加）" Style="{StaticResource CaptionTextStyle}"
+                                           VerticalAlignment="Center"/>
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
+                                            VerticalAlignment="Center">
+                                    <Button x:Name="AiSuggestInEditorButton" Style="{StaticResource TextButtonStyle}"
+                                            Content="AI 建议" FontSize="12" Height="26" Padding="10,0"
+                                            Click="AiSuggestInEditor_Click" AutomationProperties.Name="获取 AI 标签建议"
+                                            ToolTip="调用 AI 视觉模型为当前表情生成标签建议；结果会缓存，同一张图不会重复请求"/>
+                                    <Button x:Name="AiRefreshInEditorButton" Style="{StaticResource TextButtonStyle}"
+                                            Content="重新识别" FontSize="12" Height="26" Padding="10,0" Margin="6,0,0,0"
+                                            Visibility="Collapsed" Click="AiRefreshInEditor_Click"
+                                            AutomationProperties.Name="让 AI 重新识别当前表情"
+                                            ToolTip="忽略缓存，强制让 AI 重新识别当前表情"/>
+                                </StackPanel>
+                            </Grid>
                             <ScrollViewer MaxHeight="128" Margin="0,7,0,0"
                                           VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                 <WrapPanel x:Name="TagPoolPanel" Margin="-2,0,-2,0"/>
@@ -965,6 +993,71 @@
                                               IsChecked="{Binding EnableGifHoverPreview}"
                                               VerticalAlignment="Center"/>
                                 </Grid>
+                            </Border>
+
+                            <!-- ———— AI 识别（用户自备 API Key 的视觉大模型）———— -->
+                            <TextBlock Text="AI 识别" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>
+                            <Border Style="{StaticResource SettingsGroupStyle}">
+                                <StackPanel>
+                                    <Grid Margin="16,11">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="AI 视觉标签建议" Style="{StaticResource BodyTextStyle}"/>
+                                            <TextBlock Text="{Binding AiStatusText}"
+                                                       Style="{StaticResource FootnoteTextStyle}"
+                                                       Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <Button x:Name="AiTestButton" Grid.Column="1" Style="{StaticResource TextButtonStyle}"
+                                                Content="测试连接" FontSize="12" Height="26" Padding="10,0"
+                                                VerticalAlignment="Center" Margin="10,0,0,0" Click="AiTest_Click"
+                                                AutomationProperties.Name="测试 AI 识别连接"
+                                                ToolTip="用一张小测试图真实调用一次接口，验证 Key、模型与网络是否可用"/>
+                                    </Grid>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <StackPanel Margin="16,11">
+                                        <TextBlock Text="API Key" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBox x:Name="AiKeyBox" Margin="0,8,0,0" Tag="粘贴服务商 API Key"
+                                                 Text="{Binding AiTagApiKey, UpdateSourceTrigger=LostFocus, Delay=200}"/>
+                                        <TextBlock Text="{Binding AiAutoDetectHint}"
+                                                   Style="{StaticResource FootnoteTextStyle}"
+                                                   Margin="0,6,0,0" TextWrapping="Wrap"/>
+                                    </StackPanel>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <StackPanel Margin="16,11">
+                                        <TextBlock Text="服务商" Style="{StaticResource BodyTextStyle}"/>
+                                        <WrapPanel x:Name="AiProviderChipsPanel" Margin="-2,8,-2,0"/>
+                                        <TextBlock x:Name="AiGuideText" Style="{StaticResource FootnoteTextStyle}"
+                                                   Margin="0,8,0,0" TextWrapping="Wrap"
+                                                   Text="{Binding AiProviderGuide}"
+                                                   Visibility="{Binding AiProviderGuideVisible, Converter={StaticResource BoolToVis}}"/>
+                                        <Button x:Name="AiGuideLink" Style="{StaticResource TextButtonStyle}"
+                                                Content="打开获取 Key 的控制台" FontSize="12" Height="26" Padding="10,0"
+                                                HorizontalAlignment="Left" Margin="0,6,0,0"
+                                                Visibility="{Binding AiProviderGuideVisible, Converter={StaticResource BoolToVis}}"
+                                                Click="AiGuideLink_Click"
+                                                AutomationProperties.Name="打开获取 API Key 的控制台"/>
+                                    </StackPanel>
+                                    <StackPanel Margin="16,0,16,11" Visibility="{Binding AiCustomUrlVisible, Converter={StaticResource BoolToVis}}">
+                                        <TextBlock Text="接口地址" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBox x:Name="AiBaseUrlBox" Margin="0,8,0,0" Tag="https://example.com/v1（OpenAI 兼容）"
+                                                 Text="{Binding AiTagBaseUrl, UpdateSourceTrigger=LostFocus, Delay=200}"/>
+                                    </StackPanel>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <StackPanel Margin="16,11">
+                                        <TextBlock Text="模型（须支持视觉/看图）" Style="{StaticResource BodyTextStyle}"/>
+                                        <TextBox x:Name="AiModelBox" Margin="0,8,0,0" Tag="留空使用推荐模型"
+                                                 Text="{Binding AiTagModel, UpdateSourceTrigger=LostFocus, Delay=200}"/>
+                                        <WrapPanel x:Name="AiModelPresetsPanel" Margin="-2,6,-2,0"/>
+                                    </StackPanel>
+                                    <Border Height="1" Background="{DynamicResource SeparatorBrush}" Margin="16,0"/>
+                                    <Grid Margin="16,11">
+                                        <TextBlock Text="Key 仅保存在本机 config.json，不上传；识别结果按图缓存，可用「重新识别」强制刷新"
+                                                   Style="{StaticResource FootnoteTextStyle}" TextWrapping="Wrap"/>
+                                    </Grid>
+                                </StackPanel>
                             </Border>
 
                             <TextBlock Text="资源库" Style="{StaticResource CaptionTextStyle}" Margin="2,18,0,9"/>

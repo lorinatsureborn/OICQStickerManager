@@ -713,6 +713,191 @@ public class MainViewModel : ViewModelBase
         return _deepSync;
     }
 
+    // ———— AI 视觉标签建议（用户自备 API Key；配置入口在设置 → AI 识别）————
+
+    /// <summary>共享识别客户端（用户手动触发的低频调用，无需连接池调优）。</summary>
+    public AiTagService AiTag { get; } = new();
+
+    private string _aiTagApiKey = "";
+    /// <summary>服务商 API Key（明文本机存储，与 QqDbKey 同口径；不上传任何服务器）。</summary>
+    public string AiTagApiKey
+    {
+        get => _aiTagApiKey;
+        set
+        {
+            value = value?.Trim() ?? "";
+            if (_aiTagApiKey == value) return;
+            _aiTagApiKey = value;
+            OnPropertyChanged();
+            NotifyAiConfigState();
+            _ = SaveConfigAsync();
+        }
+    }
+
+    private string _aiTagProvider = "auto";
+    /// <summary>服务商 id：auto=按 Key 前缀自动识别；其余见 AiTagService.Providers。</summary>
+    public string AiTagProvider
+    {
+        get => _aiTagProvider;
+        set
+        {
+            value = string.IsNullOrEmpty(value) ? "auto" : value!;
+            if (_aiTagProvider == value) return;
+            _aiTagProvider = value;
+            OnPropertyChanged();
+            NotifyAiConfigState();
+            _ = SaveConfigAsync();
+        }
+    }
+
+    private string _aiTagModel = "";
+    /// <summary>模型名：空 = 用服务商默认视觉模型。</summary>
+    public string AiTagModel
+    {
+        get => _aiTagModel;
+        set
+        {
+            value = value?.Trim() ?? "";
+            if (_aiTagModel == value) return;
+            _aiTagModel = value;
+            OnPropertyChanged();
+            _ = SaveConfigAsync();
+        }
+    }
+
+    private string _aiTagBaseUrl = "";
+    /// <summary>自定义服务商的接口地址（OpenAI 兼容 /chat/completions 根，如 https://xxx/v1）。</summary>
+    public string AiTagBaseUrl
+    {
+        get => _aiTagBaseUrl;
+        set
+        {
+            value = value?.Trim() ?? "";
+            if (_aiTagBaseUrl == value) return;
+            _aiTagBaseUrl = value;
+            OnPropertyChanged();
+            _ = SaveConfigAsync();
+        }
+    }
+
+    /// <summary>配置变更后需要联动刷新的派生显示（状态行/引导/预设），统一补通知。</summary>
+    private void NotifyAiConfigState()
+    {
+        OnPropertyChanged(nameof(AiSelectedProvider));
+        OnPropertyChanged(nameof(AiStatusText));
+        OnPropertyChanged(nameof(AiProviderGuide));
+        OnPropertyChanged(nameof(AiProviderGuideUrl));
+        OnPropertyChanged(nameof(AiProviderGuideVisible));
+        OnPropertyChanged(nameof(AiModelPresets));
+        OnPropertyChanged(nameof(AiCustomUrlVisible));
+        OnPropertyChanged(nameof(AiAutoDetectHint));
+        OnPropertyChanged(nameof(AiTagConfigured));
+    }
+
+    /// <summary>当前生效的服务商定义：auto 时按 Key 识别，识别不出为 null（需手动选）。</summary>
+    public AiProviderDef? AiSelectedProvider
+    {
+        get
+        {
+            var id = _aiTagProvider == "auto"
+                ? AiTagService.DetectProviderId(_aiTagApiKey) ?? ""
+                : _aiTagProvider;
+            return AiTagService.FindProvider(id);
+        }
+    }
+
+    public string AiStatusText
+    {
+        get
+        {
+            if (_aiTagApiKey.Trim().Length == 0 && _aiTagProvider != "ollama")
+                return "未配置：填入 API Key 即可启用";
+            var p = AiSelectedProvider;
+            if (p == null) return "已填 Key：无法识别服务商，请在下方手动选择";
+            var model = _aiTagModel.Length > 0 ? _aiTagModel : p.DefaultModel;
+            return $"已就绪：{p.Name} · {model}";
+        }
+    }
+
+    /// <summary>具体服务商的引导文案（auto/未配置时隐藏，避免噪音）。</summary>
+    public string AiProviderGuide => _aiTagProvider == "auto" ? "" : AiSelectedProvider?.Guide ?? "";
+    public string AiProviderGuideUrl => _aiTagProvider == "auto" ? "" : AiSelectedProvider?.GuideUrl ?? "";
+    public bool AiProviderGuideVisible => _aiTagProvider != "auto" && AiSelectedProvider != null;
+    public bool AiCustomUrlVisible => _aiTagProvider == "custom";
+    public string[] AiModelPresets => _aiTagProvider == "auto" ? Array.Empty<string>() : AiSelectedProvider?.Models ?? Array.Empty<string>();
+
+    /// <summary>AI 识别是否已可使用（有 Key，或选择了免 Key 的本地服务商）。</summary>
+    public bool AiTagConfigured => _aiTagApiKey.Trim().Length > 0 || _aiTagProvider == "ollama";
+
+    /// <summary>自动识别一行说明：识别成功报哪家；sk- 开头各家通用识别不出时请用户手动挑。</summary>
+    public string AiAutoDetectHint
+    {
+        get
+        {
+            if (_aiTagProvider != "auto") return "";
+            if (_aiTagApiKey.Trim().Length == 0) return "填入 Key 后自动识别所属服务商";
+            var p = AiSelectedProvider;
+            return p != null ? $"已根据 Key 自动识别：{p.Name}" : "常见 sk- 开头的 Key 各服务商通用，无法自动识别——请在下方选择";
+        }
+    }
+
+    /// <summary>把当前设置解析成一次识别请求的完整参数；未配置/不完整时抛 AiTagException（Message 面向用户）。</summary>
+    public AiTagOptions BuildAiTagOptions()
+    {
+        var id = _aiTagProvider;
+        if (id == "auto")
+        {
+            if (_aiTagApiKey.Trim().Length == 0)
+                throw new AiTagException(
+                    "还没有配置 AI 识别：请到 设置 → AI 识别 填入 API Key。",
+                    "auto+empty key");
+            id = AiTagService.DetectProviderId(_aiTagApiKey) ?? throw new AiTagException(
+                "无法从 API Key 识别服务商：请到 设置 → AI 识别 手动选择 Key 所属的服务商。",
+                $"auto detect failed keylen={_aiTagApiKey.Length}");
+        }
+        return AiTagService.BuildOptions(id, _aiTagApiKey, _aiTagModel, _aiTagBaseUrl);
+    }
+
+    /// <summary>确保表情 Md5 就绪（旧数据惰性补算的即时版；AI 缓存键靠它区分同图副本）。</summary>
+    public async Task EnsureMd5Async(StickerModel sticker)
+    {
+        if (!string.IsNullOrEmpty(sticker.Md5) || !File.Exists(sticker.FullPath)) return;
+        try
+        {
+            sticker.Md5 = await ComputeMd5Async(sticker.FullPath);
+            _ = SaveDatabaseAsync();
+        }
+        catch { /* 文件恰好被占用：缓存退化用路径键，不影响识别 */ }
+    }
+
+    /// <summary>
+    /// 取 AI 标签建议：缓存优先（同 Md5 只识别一次，除非 forceRefresh）；
+    /// 未命中才发起网络请求并写缓存。识别失败抛 AiTagException（Message 面向用户）。
+    /// </summary>
+    public async Task<(AiTagResult Result, bool FromCache)> GetAiSuggestionsAsync(
+        StickerModel sticker, bool forceRefresh = false, CancellationToken ct = default)
+    {
+        if (!forceRefresh)
+        {
+            var hit = AiTagCache.Get(AiTagCache.CacheKey(sticker));
+            if (hit != null)
+                return (new AiTagResult(hit.Tags, hit.ProviderId, hit.Model, hit.CreatedAt), true);
+        }
+        await EnsureMd5Async(sticker);
+        var key = AiTagCache.CacheKey(sticker); // Md5 补算后键可能从路径键升级为内容键
+        if (!forceRefresh)
+        {
+            var hit = AiTagCache.Get(key);
+            if (hit != null)
+                return (new AiTagResult(hit.Tags, hit.ProviderId, hit.Model, hit.CreatedAt), true);
+        }
+        var opt = BuildAiTagOptions();
+        var result = await AiTag.SuggestTagsAsync(sticker.FullPath, opt, AllExistingTags, ct);
+        AiTagCache.Put(key, result.Tags, result.ProviderId, result.Model);
+        return (result, false);
+    }
+
+
     /// <summary>
     /// 执行一次对账：返回发现的孤儿数；-1 = 失败（密钥失效/QQ 结构变化）；-2 = 已有对账在跑（本次跳过）。
     /// 结果写入 _deepSyncSummary 反映到设置页状态行（2026-09-30 用户反馈"开了却没标记也没说法"）。
@@ -1354,7 +1539,11 @@ public class MainViewModel : ViewModelBase
                 EnableGifHoverPreview = this.EnableGifHoverPreview,
                 QqBindings = new List<QqBindingInfo>(this._qqBindings),
                 QqPromptDismissedUins = new List<string>(this._qqPromptDismissedUins),
-                WebpNoticeDismissed = this._webpNoticeDismissed
+                WebpNoticeDismissed = this._webpNoticeDismissed,
+                AiTagApiKey = this._aiTagApiKey,
+                AiTagProvider = this._aiTagProvider,
+                AiTagModel = this._aiTagModel,
+                AiTagBaseUrl = this._aiTagBaseUrl
             };
             var configJson = JsonSerializer.Serialize(config);
             await WriteJsonWithBackupAsync(_configPath, configJson, _configWriteLock);
@@ -2267,6 +2456,11 @@ public class MainViewModel : ViewModelBase
                     InitializeQqBindings(config.QqBindings ?? new List<QqBindingInfo>(),
                         config.QqPromptDismissedUins ?? new List<string>());
                     this._webpNoticeDismissed = config.WebpNoticeDismissed;
+                    // AI 识别配置：按配置恢复（Key/服务商/模型/自定义地址）
+                    this._aiTagApiKey = config.AiTagApiKey ?? "";
+                    this._aiTagProvider = string.IsNullOrEmpty(config.AiTagProvider) ? "auto" : config.AiTagProvider;
+                    this._aiTagModel = config.AiTagModel ?? "";
+                    this._aiTagBaseUrl = config.AiTagBaseUrl ?? "";
                     // 触发 UI 绑定更新
                     OnPropertyChanged(nameof(IsSingleClick));
                     OnPropertyChanged(nameof(IsDoubleClick));
@@ -2294,6 +2488,7 @@ public class MainViewModel : ViewModelBase
                     OnPropertyChanged(nameof(IsPanelSortRecent));
                     OnPropertyChanged(nameof(IsPanelSortScore));
                     OnPropertyChanged(nameof(IsPanelSortName));
+                    NotifyAiConfigState();
                 }
             }
             catch { /* 如果配置损坏则使用默认值 */ }
