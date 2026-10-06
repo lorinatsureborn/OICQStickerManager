@@ -270,6 +270,38 @@
         <Setter Property="Height" Value="30"/>
     </Style>
 
+    <Style x:Key="ApiKeyPasswordBoxStyle" TargetType="PasswordBox">
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="CaretBrush" Value="{DynamicResource AccentBrush}"/>
+        <Setter Property="SelectionBrush" Value="{DynamicResource AccentBrush}"/>
+        <Setter Property="SelectionOpacity" Value="0.25"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Height" Value="30"/>
+        <Setter Property="Padding" Value="10,0"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="PasswordBox">
+                    <Grid>
+                        <Border Background="{DynamicResource FieldBrush}" CornerRadius="9"/>
+                        <Border x:Name="Ring" BorderBrush="{DynamicResource AccentBrush}"
+                                BorderThickness="2" CornerRadius="9" Opacity="0"/>
+                        <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"
+                                      VerticalAlignment="Center"/>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                            <Setter TargetName="Ring" Property="Opacity" Value="0.4"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.5"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <!-- iOS 胶囊搜索框：放大镜 + 占位文字 + 一键清空（Tag 为占位文案） -->
     <Style x:Key="SearchBoxStyle" TargetType="TextBox" BasedOn="{StaticResource TextBoxBaseStyle}">
         <Setter Property="Height" Value="30"/>

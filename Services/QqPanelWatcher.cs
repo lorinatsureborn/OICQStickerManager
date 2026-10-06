@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
 
@@ -23,16 +24,13 @@ public class QqPanelEventArgs : EventArgs
 
 /// <summary>
 /// 监听 QQ 聊天窗口内原生表情面板（UIA 标识：Window Class='sticker-panel'）的出现与消失，
-/// 驱动快捷面板的共存模式。纯事件驱动，零常驻成本：
+/// 驱动快捷面板的共存模式。UIA 订阅、扫描和事件读取运行在可回收的辅助进程，
+/// 主进程只接收窗口、矩形和焦点时刻；辅助进程使用心跳及独立操作截止时间。
 /// - 打开：低级鼠标钩子在按下表情按钮的物理瞬间乐观打开。点击先经三重校验（窗口相对矩形
 ///   按当前位置重算 + WindowFromPoint 根窗口一致 + 进程一致），防陈旧矩形对任意窗口/应用误触发；
 ///   焦点命中按钮仅作钩子没覆盖的点击的兜底（见 OnFocusChanged）。
 /// - 关闭：与打开对称的乐观路径——面板开着时完整点击按钮（down+up 都落在按钮上）立即收起；
 ///   焦点进入聊天输入框也立即收起（面板浮在输入框上层，焦点能到输入框 = 面板已被 QQ 收起）。
-///   面板开着时落在 QQ 窗口内的其他点击（面板自带 X 关闭、表情发送、面板内浏览）是既有信号
-///   的盲区：新版武装补验尾迹由真实扫描裁决；旧版（剪枝树，无扫描）对落在推断面板矩形内的
-///   点击把锚信念窗降到宽限档，无锚续期即时间确认收起。焦点离开 QQ 立即收起共存面板
-///   （Topmost 面板不得悬浮在非宿主应用之上；新版切回后扫描重报 APPEARED 自愈）。
 ///   乐观误判可自愈：尾迹验证发现 QQ 面板仍在则重新报 APPEARED，OpenForCoexist 的淡出中重开接住。
 ///   另有 QQ 窗口的 UIA 结构变化事件（节流后验证）与点击后的补验尾迹兜底。
 /// 轮询保底（可选设置项，默认关）：事件在个别 QQ 版本上失灵时的兜底，常开会持续查询 QQ。
@@ -56,10 +54,10 @@ public class QqPanelWatcher : IDisposable
     private const string EmojiButtonClass = "icon-item";
     private const string PanelClassName = "sticker-panel";
 
-    // 旧版 NTQQ（9.9.19/9.9.21 实测）：表情工具栏按钮不可聚焦，点开后焦点落进面板底部分类标签
+    // 9.9.21 点开后焦点可能落进面板底部分类标签；9.9.19 的标签续期并不可靠。
     // （如「切换默认表情按钮」）；且该代 Chromium 对 UIA 客户端只暴露剪枝树
     // （diag visited≈17，仅窗口骨架），sticker-panel 全树扫描必扑空。
-    // 故旧版把「焦点命中面板标签」也计作表情按钮信号，面板可见性走 ScanQqWindows 里的标签元素兜底。
+    // 标签信号仍作回退；9.9.19 优先缓存与打开操作关联的结构事件面板节点。
     private static readonly HashSet<string> LegacyPanelTabNames = new()
     {
         "切换默认表情按钮", "切换GIF热图按钮", "切换我的收藏按钮",
@@ -87,19 +85,6 @@ public class QqPanelWatcher : IDisposable
     // 关闭（快捷面板"弹出后 ~1s 消失"，2026-10-04 日志实锤）。与编辑框光灭的同名保护窗同值。
     internal const int OpenChoreographyGuardMs = 1500;
 
-    // 面板区域点击的宽限档：面板开着时点击落在 QQ 面板矩形内（X 关闭/表情发送/面板内搜索框），
-    // 此类点击不经过表情按钮、焦点也不进编辑框（X 关闭后焦点停在面板内部元素上），是纯事件
-    // 驱动的盲区。旧版把锚信念窗降到本档——点击后 2.5s 内无锚续期（TAB 命中/编辑框光灭/
-    // 按钮 toggle）即由时间确认收起；TAB 命中照常把 TTL 续回长档，滞留 TAB（Chromium 焦点
-    // 事件可迟到数秒）最坏自愈为关→弹一次。新版无需此档：真实扫描在尾迹里 ~350ms 检出关闭。
-    internal const int PanelClickGraceTtlMs = 2500;
-
-    // QQ 原生面板标准尺寸（物理像素），出现在表情按钮上方、右缘对齐按钮右缘。
-    // 乐观打开的合成锚点与旧版"面板区域点击"的矩形推断共用同一几何（DPI>100% 时真实面板
-    // 更大、本矩形是其右下子集，X 按钮恰在共享的右上角附近，推断矩形仍覆盖）。
-    internal const double PanelStdWidthPx = 675;
-    internal const double PanelStdHeightPx = 506;
-
     /// <summary>「面板开着 + 焦点命中表情按钮」的语义分级：距面板 APPEARED 超过保护窗才算
     /// toggle 关闭证据（QQ 真关闭面板后焦点落回按钮）；窗口内是开面板的焦点编排回声。</summary>
     internal static bool IsLegacyButtonCloseEvidence(bool panelOpen, long appearedTicks, long nowTicks) =>
@@ -108,9 +93,13 @@ public class QqPanelWatcher : IDisposable
     private IntPtr _legacyTabHwnd;
     private long _legacyTabShownTicks;
     private int _legacyOpenTtlMs = LegacyButtonHitTtlMs; // 最近一次锚刷新采用的 TTL
-    private Rect _legacyAnchorRect = Rect.Empty;     // 命中时刻光标附近的小矩形：剪枝树读不到元素矩形，用光标点定位
+    private volatile bool _legacyButtonOpenLatched; // Verified native button gesture; lifetime guard owns dismissal when UIA omits events.
+    private Rect _legacyAnchorRect = Rect.Empty;     // 默认标签推导的面板矩形；无几何证据时退化为光标附近小矩形
     private bool _legacyFallbackLogged;              // 兜底首次生效打点（防刷屏）
-    private bool _legacyMode;                        // 一旦观测到全扫阻塞（剪枝树特征，实测 ~35s）即闩死：此后完全跳过全扫
+    private sealed record LegacyPanelReference(AutomationElement Element, IntPtr Hwnd, long Generation);
+    private LegacyPanelReference? _legacyPanelReference;
+    private int _legacyPanelProbeRunning;
+    private readonly QqProcessCapabilities _capabilities = new();
     private const string EditorClassKey = "ExEditor-qq-msg-editor";
 
     // 无障碍树主动激活：WM_GETOBJECT/OBJID_CLIENT 是屏幕阅读器的标准查询
@@ -146,6 +135,53 @@ public class QqPanelWatcher : IDisposable
     private int _consecutiveErrors;
     private bool _degraded;
     private bool _disposed;
+    private QqUiaWorkerClient? _worker;
+    private long _workerGenerationBase;
+    private long _dismissedWorkerGeneration = -1;
+    private long _lastWorkerGeneration = -1;
+    private long _dismissedActionGeneration = -1;
+
+    internal static void DismissCoexist(IntPtr host, string reason)
+    {
+        var watcher = _active;
+        if (watcher == null || watcher._disposed) return;
+        if (watcher._worker == null) { watcher.OptimisticClosePanel(reason); return; }
+        long generation;
+        lock (watcher._gate)
+        {
+            generation = UserActionGen - watcher._workerGenerationBase;
+            watcher._dismissedWorkerGeneration = Math.Max(watcher._dismissedWorkerGeneration, generation);
+            watcher._panelOpen = false;
+        }
+        Log("native coexist dismissed: " + reason);
+        _ = watcher._worker.RequestAsync(new() { Kind = "request", Command = "dismiss",
+            Hwnd = host.ToInt64(), Generation = generation }, TimeSpan.FromSeconds(2));
+    }
+
+    internal static void DismissWorkerPanel(IntPtr host, long generation)
+    {
+        var watcher = _active;
+        if (watcher == null || generation != UserActionGen) return;
+        if (host != watcher._legacyTabHwnd && host != watcher._lastPanelRectHwnd && host != watcher._emojiBtnHwnd) return;
+        watcher.OptimisticClosePanel("native lifetime guard");
+    }
+
+    internal static void VerifyCoexist(IntPtr host)
+    {
+        var watcher = _active;
+        if (watcher == null || watcher._disposed) return;
+        if (watcher._worker == null)
+        {
+            // QQ can hide/reuse its panel without another UIA event. A click on X,
+            // a native sticker or a tab gets a bounded visibility tail, not a TTL
+            // dismissal: browsing a still-visible panel must not close coexist.
+            watcher.ArmTailVerify();
+            watcher.CheckNow();
+            return;
+        }
+        _ = watcher._worker.RequestAsync(new() { Kind = "request", Command = "verify", Hwnd = host.ToInt64() },
+            TimeSpan.FromSeconds(2));
+    }
 
     public bool PollingEnabled { get; private set; }
     public bool Running { get; private set; }
@@ -159,7 +195,6 @@ public class QqPanelWatcher : IDisposable
     public QqPanelWatcher(Action<string> status)
     {
         _status = status;
-        _mouseHookProc = MouseHookProc; // 提前物化并终身持有，防止钩子委托被 GC 回收
         EmojiButtonTemplate.LogSink = Log; // 像素回退的采集/匹配诊断汇入同一份 asuka-watcher.log
         _active = this;
     }
@@ -167,13 +202,23 @@ public class QqPanelWatcher : IDisposable
     // 当前活动实例：快捷面板共存发送后"同步关闭 QQ 原生面板"经此转发（2026-10-01 用户定案）
     private static QqPanelWatcher? _active;
 
-    // 旧版闩锁的进程级快照（WindowService 发送链路用）：闩上后 FocusedElement 查询只回顶层窗口根、
-    // 全树扫描必然昂贵——发送链路据此跳过编辑器 UIA 定位（实测 ~0.8s）、焦点校验改用键盘焦点根窗口
-    // 判定（剪枝树上类名校验必失败，2×600ms 纯空等，2026-10-04 实测发送卡 2–3s 的主项）。
-    // 静态不随 watcher 重建复位：QQ 升级后残留只会让发送链路继续走启发点（本就可靠），可接受。
-    private static int _legacyScanModeLatch;
-    internal static bool LegacyScanMode => Volatile.Read(ref _legacyScanModeLatch) == 1;
-    private static void LatchLegacyScanMode() => Interlocked.Exchange(ref _legacyScanModeLatch, 1);
+    internal static bool IsLegacyWindow(IntPtr hwnd)
+    {
+        GetWindowThreadProcessId(hwnd, out var pid);
+        if (pid == 0) return false;
+        var active = _active;
+        if (active != null && !active._disposed) return active._capabilities.IsLegacy((int)pid);
+        var capabilities = new QqProcessCapabilities();
+        capabilities.Refresh(QqProcessCapabilities.Collect());
+        return capabilities.IsLegacy((int)pid);
+    }
+
+    private HashSet<int> RefreshProcesses()
+    {
+        var processes = QqProcessCapabilities.Collect();
+        _capabilities.Refresh(processes);
+        return processes.Select(p => p.Pid).ToHashSet();
+    }
 
     // 用户表情按钮激活代数：每次按下 QQ 表情按钮自增（鼠标钩子乐观路径 + 焦点命中兜底路径）。
     // 共存发送的"延迟关 QQ 面板"凭发送时刻的代数守卫——用户已开始新一轮操作就放弃关闭，
@@ -187,7 +232,7 @@ public class QqPanelWatcher : IDisposable
     /// 面板已被认为关闭、按钮找不到/对不上（窗口移动、树懒加载）都静默放弃，
     /// 由既有的关闭跟随兜底。UIA 调用在后台线程执行，不占 UI。
     /// expectedGen = 发送时刻的 UserActionGen；此后用户若又按过表情按钮则放弃关闭。</summary>
-    public static void TryCloseQqPanel(long expectedGen)
+    public static void TryCloseQqPanel(long expectedGen, IntPtr expectedHwnd = default)
     {
         var w = _active;
         if (w == null || !w._panelOpen) return; // 面板已关就别点按钮了——toggle 会把它重新打开
@@ -205,7 +250,7 @@ public class QqPanelWatcher : IDisposable
                     Log("close-q skipped in-flight: newer user interaction since send");
                     return;
                 }
-                w.TryInvokeEmojiButtonCore();
+                w.TryInvokeEmojiButtonCore(expectedHwnd);
             }
             catch (Exception ex) { Log("close-q failed: " + ex.Message); }
         });
@@ -217,15 +262,14 @@ public class QqPanelWatcher : IDisposable
     /// 编辑框点击后没有光灭可抢，焦点才稳。调用时机是用户刚点完表情的发送流程，无需代数守卫。
     /// 成功后立即把状态校正为"关"并武装回声抑制：否则锚 TTL 窗口内延迟的 800ms 补关
     /// （TryCloseQqPanel）会误判面板仍开、invoke 把刚关的面板再弹开。</summary>
-    public static bool TryCloseQqPanelNow()
+    public static bool TryCloseQqPanelNow(IntPtr expectedHwnd = default)
     {
         var w = _active;
-        if (w == null || !w._panelOpen) return false;
-        w._panelOpen = false; // 先校正状态：防后续补关误判 + 钩子路径把本次关闭当"面板开着"
-        w._openMisses = 0;
-        w._legacyAnchorRect = Rect.Empty;
-        Volatile.Write(ref _legacyOptimisticCloseUntil, Environment.TickCount64 + 1500);
-        bool ok = w.TryInvokeEmojiButtonCore();
+        if (w == null || w._disposed || !w._panelOpen) return false;
+        if (expectedHwnd != IntPtr.Zero && w._emojiBtnHwnd != expectedHwnd && w._tabRectHwnd != expectedHwnd) return false;
+        if (w._worker != null) return w.RequestWorkerClose(expectedHwnd);
+        w.OptimisticClosePanel("send closes native panel before editor focus");
+        bool ok = w.TryInvokeEmojiButtonCore(expectedHwnd);
         Log(ok ? "close-now: panel closed by send flow (state corrected)" : "close-now: invoke/click failed, watcher state reset anyway");
         return ok;
     }
@@ -239,7 +283,8 @@ public class QqPanelWatcher : IDisposable
         var rel = _tabRectRel;
         if (hwnd != IntPtr.Zero && !rel.IsEmpty && rel.Width > 0 && GetWindowRect(hwnd, out var wr))
         {
-            rect = new Rect(wr.Left + rel.Left - 9, wr.Top + rel.Top + 45, rel.Width, rel.Height);
+            double scale = Math.Max(96u, GetDpiForWindow(hwnd)) / 96.0;
+            rect = new Rect(wr.Left + rel.Left - 9 * scale, wr.Top + rel.Top + 45 * scale, rel.Width, rel.Height);
             return true;
         }
         rect = Rect.Empty;
@@ -247,12 +292,28 @@ public class QqPanelWatcher : IDisposable
     }
 
     /// <summary>invoke 表情按钮的核心（同步、调用线程执行 UIA 跨进程调用）。</summary>
-    private bool TryInvokeEmojiButtonCore()
+    private bool TryInvokeEmojiButtonCore(IntPtr expectedHwnd = default)
     {
+        if (_worker != null) return RequestWorkerClose(expectedHwnd);
+        using var lease = QqUiaWorker.Lease();
         try
         {
             if (!TryResolveButtonRectForClose(out var rect)) { Log("close-q: no cached button/tab rect"); return false; }
             var pt = new System.Windows.Point(rect.Left + rect.Width / 2.0, rect.Top + rect.Height / 2.0);
+            if (_disposed || (expectedHwnd != IntPtr.Zero
+                && RootWindowFromPoint(new POINT { X = (int)pt.X, Y = (int)pt.Y }) != expectedHwnd)) return false;
+            var host = expectedHwnd != IntPtr.Zero ? expectedHwnd : RootWindowFromPoint(new POINT { X = (int)pt.X, Y = (int)pt.Y });
+            if (GetAncestor(GetForegroundWindow(), 2) != host) return false;
+            if (IsLegacyWindow(host)) return ClickButton();
+            bool ClickButton()
+            {
+                if (GetAncestor(GetForegroundWindow(), 2) != host || RootWindowFromPoint(new POINT { X = (int)pt.X, Y = (int)pt.Y }) != host) return false;
+                GetCursorPos(out var saved);
+                bool sent = NativeInput.TryClick((int)pt.X, (int)pt.Y);
+                SetCursorPos(saved.X, saved.Y);
+                Log(sent ? "close-q: button click accepted" : "close-q: button click rejected");
+                return sent;
+            }
             var el = System.Windows.Automation.AutomationElement.FromPoint(pt);
             // 矩形中心常命中按钮内部的 svg 图标（/q-svg-icon q-icon），沿控制树向上回溯找
             // 表情按钮本体（与面板检测的祖先回溯同款手法，≤12 级封顶）
@@ -289,9 +350,7 @@ public class QqPanelWatcher : IDisposable
             {
                 Log("close-q invoke failed, SendInput fallback: " + ex.Message);
             }
-            SendClickAt(new POINT { X = (int)pt.X, Y = (int)pt.Y });
-            Log("close-q: emoji button clicked via SendInput fallback");
-            return true;
+            return ClickButton();
         }
         catch (Exception ex) { Log("close-q failed: " + ex.Message); return false; }
     }
@@ -303,38 +362,32 @@ public class QqPanelWatcher : IDisposable
     {
         editorRect = Rect.Empty;
         var w = _active;
-        if (w == null || w._editorRectRel.IsEmpty || w._editorRectRel.Width <= 0) return false;
-        if (!GetWindowRect(qqHwnd, out var wr)) return false;
-        var rel = w._editorRectRel;
-        editorRect = new Rect(wr.Left + rel.Left, wr.Top + rel.Top, rel.Width, rel.Height);
-        return true;
-    }
-
-    /// <summary>真实点击（SendInput）：UIA Invoke 不可用时的关闭兜底，与 WindowService 同款实现。</summary>
-    private static void SendClickAt(POINT pt)
-    {
-        const uint MOUSEEVENTF_MOVE = 0x0001, MOUSEEVENTF_ABSOLUTE = 0x8000,
-                   MOUSEEVENTF_VIRTUALDESK = 0x4000, MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
-        int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);
-        int vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-        var move = new INPUT { type = 0 };
-        move.mi = new MOUSEINPUT { dx = (pt.X - vx) * 65536 / vw, dy = (pt.Y - vy) * 65536 / vh, dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK };
-        var down = new INPUT { type = 0 };
-        down.mi = new MOUSEINPUT { dwFlags = MOUSEEVENTF_LEFTDOWN };
-        var up = new INPUT { type = 0 };
-        up.mi = new MOUSEINPUT { dwFlags = MOUSEEVENTF_LEFTUP };
-        SendInput(1, new[] { move }, Marshal.SizeOf<INPUT>());
-        Thread.Sleep(60);
-        SendInput(1, new[] { down }, Marshal.SizeOf<INPUT>());
-        Thread.Sleep(40);
-        SendInput(1, new[] { up }, Marshal.SizeOf<INPUT>());
+        if (w == null) return false;
+        lock (w._gate)
+        {
+            if (w._disposed || qqHwnd == IntPtr.Zero || qqHwnd != w._editorHwnd
+                || w._editorRectRel.IsEmpty || w._editorRectRel.Width <= 0) return false;
+            GetWindowThreadProcessId(qqHwnd, out var pid);
+            if (pid == 0 || pid != (uint)w._editorPid || !GetWindowRect(qqHwnd, out var wr)) return false;
+            var rel = w._editorRectRel;
+            editorRect = new Rect(wr.Left + rel.Left, wr.Top + rel.Top, rel.Width, rel.Height);
+            return true;
+        }
     }
 
     public void Start()
     {
-        if (Running) return;
-        _qqPids = CollectQqPids();
+        if (_disposed || Running) return;
+        _qqPids = RefreshProcesses();
         Running = true;
+        if (!QqUiaWorker.IsWorker)
+        {
+            _worker = new QqUiaWorkerClient(
+                () => QqUiaWorker.StartInfo("--qq-uia-worker", PollingEnabled.ToString(), Environment.ProcessId.ToString()),
+                HandleWorkerFrame, _status);
+            _worker.Start();
+            return;
+        }
         // 环境上下文随日志落盘：裸日志脱离反馈表单也能对上号（Issue #2 的反馈附了裸日志，
         // 应用版本错报、Win11 与 Win10 的 UIA 差异都得靠 issue 正文才拼得出来）
         var asmVer = Assembly.GetEntryAssembly()?.GetName().Version;
@@ -342,34 +395,15 @@ public class QqPanelWatcher : IDisposable
 
         // 低级鼠标钩子装在专用消息泵线程上：LL 钩子对响应超时零容忍，
         // 装在 UI 线程会因预热等卡顿被 Windows 静默摘除（实测发生过），专用线程永不超时。
-        _hookThread = new Thread(() =>
+        _hookPump = new MouseHookPump(MouseHookProc, Log);
+        _ = _hookPump.StartAsync();
+        QueueSubscription(() =>
         {
-            _hookThreadId = (uint)Environment.CurrentManagedThreadId;
-            _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookProc, GetModuleHandle(null), 0);
-            if (_mouseHook == IntPtr.Zero)
-            {
-                Log("mouse hook install FAILED: " + Marshal.GetLastWin32Error());
-                return;
-            }
-            Log("mouse hook installed on dedicated thread");
-            _hookAliveLogged = false;
-            while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
-            {
-                TranslateMessage(ref msg);
-                DispatchMessage(ref msg);
-            }
-            Log("mouse hook thread exited");
-        })
-        {
-            IsBackground = true,
-            Name = "AsukaMouseHook"
-        };
-        _hookThread.Start();
-        Task.Run(() =>
-        {
+            if (_disposed) return;
             try
             {
                 Automation.AddAutomationFocusChangedEventHandler(OnFocusChanged);
+                _focusRegistered = true;
                 Log("focus handler registered");
             }
             catch (Exception ex)
@@ -388,6 +422,7 @@ public class QqPanelWatcher : IDisposable
         // 订阅与 warmup 全部落空，而懒订阅/焦点 warmup 都以"焦点事件携带有效 QQ 元素"
         // 为前提——a11y 壳层状态下点击信号永远不产生，链路死锁且零报错（2026-10-04 实证）。
         StartQqMonitorLoop();
+        if (PollingEnabled) StartPollLoop();
 
         // 主动预热探测：跑一次 CheckNow。新版 QQ 上它毫秒级返回并确认 sticker-panel 检测可用；
         // 旧版 NTQQ 上这次全扫会阻塞 6–35s 然后闩进旧版快路径（_legacyMode）——若不做，
@@ -400,13 +435,6 @@ public class QqPanelWatcher : IDisposable
                 if (_disposed || !Running) return;
                 // 版本闸门先于 CheckNow：已知剪枝树代（9.9.19–9.9.2x 实测）直接预闩、完全跳过阻塞全扫——
                 // 否则启动初期的结构事件会引发阻塞扫描连锁，UIA 管线整体堵死、焦点命中全丢（9.9.21 实测）。
-                if (IsLegacyQqBuild())
-                {
-                    _legacyMode = true;
-                    LatchLegacyScanMode();
-                    Log("legacy scan mode latched (QQ version gate)");
-                    return;
-                }
                 CheckNow();
             }
             catch { }
@@ -433,7 +461,7 @@ public class QqPanelWatcher : IDisposable
                 {
                     await Task.Delay(5000, ct);
                     if (_disposed) break;
-                    var pids = CollectQqPids();
+                    var pids = RefreshProcesses();
                     var fresh = pids.Where(p => !knownPids.Contains(p)).ToList();
                     if (fresh.Count > 0)
                         Log($"qq monitor: process appeared (pid={string.Join(',', fresh)})");
@@ -453,12 +481,12 @@ public class QqPanelWatcher : IDisposable
                         firstScan = false;
                         Log($"qq monitor active (pid=[{string.Join(',', pids)}], windows={windows.Count}, scan every 5s)");
                     }
-                    if (_legacyMode && windows.Count > 0)
+                    if (_capabilities.HasLegacy && windows.Count > 0)
                         ProbeTreeLiveness();
                     if (fresh.Count > 0 || unsubscribed.Count > 0)
                         PruneSubscriptions();
                     knownPids = pids;
-                    if (pids.Count > 0) _qqPids = pids;
+                    _qqPids = pids;
                 }
                 catch (OperationCanceledException) { break; }
                 catch { /* 轮询兜底自身不许抛 */ }
@@ -538,50 +566,31 @@ public class QqPanelWatcher : IDisposable
         WarmUpAccessibility(hwnd);
     }
 
-    /// <summary>QQ 版本早于 9.9.30 视为剪枝树代（9.9.19/9.9.21 实测剪枝；9.9.36 实测完整树）。</summary>
-    private static bool IsLegacyQqBuild()
-    {
-        try
-        {
-            var core = FeedbackService.GetQqVersion().Split('-')[0];
-            var parts = core.Split('.');
-            if (parts.Length >= 3
-                && int.TryParse(parts[0], out var a) && int.TryParse(parts[1], out var b) && int.TryParse(parts[2], out var c))
-            {
-                return a < 9 || (a == 9 && (b < 9 || (b == 9 && c < 30)));
-            }
-        }
-        catch { }
-        return false;
-    }
-
     public void Dispose()
     {
-        if (!Running) return;
-        Running = false;
+        if (_disposed) return;
         _disposed = true;
         if (_active == this) _active = null;
+        Running = false;
+        if (_worker != null)
+        {
+            _worker.Dispose();
+            _worker = null;
+            Log("isolated watcher disposed");
+            return;
+        }
         StopQqMonitorLoop();
         StopPollLoop();
-        if (_mouseHook != IntPtr.Zero)
+        _hookPump?.Dispose();
+        QueueSubscription(() =>
         {
-            try { UnhookWindowsHookEx(_mouseHook); } catch { }
-            _mouseHook = IntPtr.Zero;
-        }
-        if (_hookThread != null)
-        {
-            try { PostThreadMessage(_hookThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero); } catch { }
-            try { _hookThread.Join(1000); } catch { }
-            _hookThread = null;
-        }
-        // RemoveAllEventHandlers 会同步等所有在途回调完成，实测耗时 0s/1s/3min/永不 不等——
-        // 在 UI 线程上调用它会把自己挂死（窗口关了进程不退，僵尸还握着单实例互斥锁，
-        // 之后所有新启动都拉不起来）。挪到后台 MTA 线程异步拆，不等待；_disposed 已置位，
-        // 拆卸完成前漏进来的残留事件会被各处理器入口的守卫丢弃，进程退出兜底清理。
-        // 已知竞态：Dispose 后极快重建新 watcher 时，旧拆卸可能误删新注册——现实中只有
-        // 设置开关"QQ 表情面板共存"会重建，人手速度远慢于拆卸，接受此权衡。
-        _ = Task.Run(() => { try { Automation.RemoveAllEventHandlers(); } catch { } });
-        lock (_gate) _subscribed.Clear();
+            if (_focusRegistered)
+                try { Automation.RemoveAutomationFocusChangedEventHandler(OnFocusChanged); } catch { }
+            List<AutomationElement> elements;
+            lock (_gate) { elements = _subscribed.Values.ToList(); _subscribed.Clear(); _pendingSubscriptions.Clear(); }
+            foreach (var element in elements)
+                try { Automation.RemoveStructureChangedEventHandler(element, OnStructureChanged); } catch { }
+        });
         Log("watcher disposed");
     }
 
@@ -590,6 +599,11 @@ public class QqPanelWatcher : IDisposable
     {
         PollingEnabled = enabled;
         if (!Running) return;
+        if (_worker != null)
+        {
+            _ = _worker.RequestAsync(new() { Kind = "request", Command = "poll", Value = enabled }, TimeSpan.FromSeconds(5));
+            return;
+        }
         if (enabled) StartPollLoop(); else StopPollLoop();
         Log("polling fallback = " + enabled);
     }
@@ -651,9 +665,10 @@ public class QqPanelWatcher : IDisposable
     private void OnFocusChanged(object? sender, AutomationFocusChangedEventArgs e)
     {
         if (_disposed || !Running) return;
+        using var lease = QqUiaWorker.Lease();
         try
         {
-            // 事件自带的 sender 才是真正聚焦的元素。旧版 NTQQ（9.9.19/9.9.21 实测）剪枝树下
+            // 事件自带的 sender 才是真正聚焦的元素。旧版 NTQQ（9.9.21 实测）剪枝树下
             // FocusedElement 查询只返回顶层窗口根（name="QQ"），内容元素必须从事件取。
             var el = sender as AutomationElement ?? AutomationElement.FocusedElement;
             if (el == null) return;
@@ -662,31 +677,16 @@ public class QqPanelWatcher : IDisposable
 
             if (!_qqPids.Contains(pid))
             {
-                // 焦点离开 QQ（点了桌面/其他应用/本应用主窗）：QQ 面板大概率已被关掉。
-                // 即便新版 QQ 保留面板，共存快捷面板是 Topmost，宿主失焦后继续悬浮在
-                // 其他应用之上也是错误状态——立即收起，不等验证（旧版此路径本就清锚即收）。
-                // 误收自愈：若 QQ 面板其实还开着，切回 QQ 后的焦点验证会重新报 APPEARED，
-                // OpenForCoexist 接住（新版真实扫描可自愈；旧版锚已清不重弹，与改动前一致）。
-                // 不走 OptimisticClosePanel：它武装的尾迹在新版上会立刻扫出"面板还开着"
-                // 把面板弹回来，恰好抵消本次收起。
+                // 焦点离开 QQ（点了桌面/其他应用）：QQ 面板大概率已被关掉，验证一次
+                if (_panelOpen) ScheduleThrottledVerify();
                 _legacyTabElement = null;  // 旧版兜底锚同步失效：切走即收，缓解面板滞留
                 _legacyAnchorRect = Rect.Empty;
-                if (_panelOpen || Volatile.Read(ref CoexistPanelShowing) == 1)
-                {
-                    _optimisticPending = false;
-                    _panelOpen = false;
-                    _openMisses = 0;
-                    Log("focus left QQ: dismiss coexist panel");
-                    Task.Run(() =>
-                    {
-                        try { PanelDisappeared?.Invoke(this, EventArgs.Empty); }
-                        catch (Exception ex) { Log("focus-out dismiss dispatch failed: " + ex.Message); }
-                    });
-                }
+                _legacyButtonOpenLatched = false;
                 return;
             }
 
             Volatile.Write(ref _lastQqFocusTicks, Environment.TickCount64);
+            var focusHost = ResolveFocusHost(el, pid);
 
             // 树活性证据（ProbeTreeLiveness 判据）由两处写入：按钮/标签命中（本分支顶部）与
             // 编辑框锚点 rectOk=True（下方 editorConfirmed 块）。二者都要求真实 web 内容元素
@@ -702,7 +702,7 @@ public class QqPanelWatcher : IDisposable
             catch { }
 
             // 用户正在交互 = 即将需要 DOM（表情按钮焦点命中/面板扫描）：确保无障碍树已激活
-            try { WarmUpAccessibility(GetTopWindowHwnd(el)); } catch { }
+            try { WarmUpAccessibility(focusHost); } catch { }
 
             string name = SafeName(el);
             string cls = SafeClass(el);
@@ -735,7 +735,7 @@ public class QqPanelWatcher : IDisposable
                     try
                     {
                         var br = el.Current.BoundingRectangle;
-                        var topHwnd = GetTopWindowHwnd(el);
+                        var topHwnd = focusHost;
                         if (topHwnd == IntPtr.Zero) topHwnd = _lastPanelRectHwnd; // 走查失败时用面板检测已确认的 QQ 顶层窗口兜底
                         if (br.Width > 0)
                         {
@@ -760,22 +760,22 @@ public class QqPanelWatcher : IDisposable
                 }
 
                 // TAB 命中（面板内部标签）不缓存按钮矩形（会覆盖真按钮矩形、破坏钩子校验），
-                // 但要单独记 TAB 矩形：面板经 TAB 路径打开时按钮从未获得焦点，close-q（发送预关闭）
-                // 靠它推导按钮位置（按钮恒在 TAB 左 9px、下 45px，实测多轮一致）。
+                // 单独记归一化后的默认 TAB 矩形：GIF/收藏标签不能直接套默认标签的按钮偏移。
                 // 否则预关闭失败 → 编辑框点击触发面板光灭 → 焦点被编排抢回按钮 → Ctrl+V 落空。
                 if (legacyTab)
                 {
                     try
                     {
                         var tbr = el.Current.BoundingRectangle;
-                        var guiT = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
-                        IntPtr troot = IntPtr.Zero;
-                        if (GetGUIThreadInfo(0, ref guiT) && guiT.hwndFocus != IntPtr.Zero)
-                            troot = GetAncestor(guiT.hwndFocus, GA_ROOT);
+                        IntPtr troot = focusHost;
                         if (tbr.Width > 0 && troot != IntPtr.Zero && GetWindowRect(troot, out var twr))
                         {
-                            _tabRectRel = new Rect(tbr.Left - twr.Left, tbr.Top - twr.Top, tbr.Width, tbr.Height);
-                            _tabRectHwnd = troot;
+                            var normalized = NormalizeLegacyTabRect(name.Trim(), tbr, Math.Max(96u, GetDpiForWindow(troot)) / 96.0);
+                            if (!normalized.IsEmpty)
+                            {
+                                _tabRectRel = new Rect(normalized.Left - twr.Left, normalized.Top - twr.Top, normalized.Width, normalized.Height);
+                                _tabRectHwnd = troot;
+                            }
                         }
                     }
                     catch { }
@@ -798,13 +798,12 @@ public class QqPanelWatcher : IDisposable
                 // 这种非点击命中若刷新锚/时间戳，轮询与验证会立即把面板报出来——故面板关着
                 // 且无点击证据的按钮命中只记元素引用，不碰任何锚状态。
                 _legacyTabElement = el;
-                _legacyTabHwnd = GetTopWindowHwnd(el);
+                _legacyTabHwnd = focusHost;
                 if (legacyTab)
                 {
                     _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyTabHitTtlMs;
-                    // TAB 在面板内部，其矩形会把快捷面板带进面板里，锚保留光标近似。
-                    TrySetLegacyAnchorFromCursor();
+                    if (!TrySetLegacyAnchorFromTab() && !TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
                 }
                 else if (IsLegacyButtonCloseEvidence(_panelOpen, _lastPanelAppearedTicks, Environment.TickCount64))
                 {
@@ -813,8 +812,7 @@ public class QqPanelWatcher : IDisposable
                     // 保护窗内的焦点编排回声不算关闭证据（见 IsLegacyButtonCloseEvidence）。
                     _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyCloseEvidenceTtlMs;
-                    if (_emojiBtnRect.Width > 0) _legacyAnchorRect = _emojiBtnRect;
-                    else TrySetLegacyAnchorFromCursor();
+                    if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
                     ArmTailVerify();
                 }
                 else if (FocusPathClickIsOnButton())
@@ -823,12 +821,11 @@ public class QqPanelWatcher : IDisposable
                     // 与下方焦点兜底开面板同源）= 打开证据：用户刚点了按钮、面板正在打开（含开面板
                     // 保护窗内的快速第二击——保护窗挡住它被误判为关闭，此处按打开证据续期保持面板）。
                     // 与钩子打开同级，用长 TTL 等 TAB 续期（短 TTL 会在 TAB 迟到时误判关闭→闪烁重开）。
-                    // 锚直接用按钮矩形（精确、确定性；光标在合成点击/焦点事件异步处理时可能错位——
+                    // 锚由按钮推导面板边界（光标在合成点击/焦点事件异步处理时可能错位——
                     // 实测 18:52 锚跑到 800px 外）。
                     _legacyTabShownTicks = Environment.TickCount64;
                     _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
-                    if (_emojiBtnRect.Width > 0) _legacyAnchorRect = _emojiBtnRect;
-                    else TrySetLegacyAnchorFromCursor();
+                    if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
                 }
                 // else：非点击性按钮焦点（窗口恢复/切回/程序性聚焦）——不刷锚、不刷时间戳。
 
@@ -840,7 +837,7 @@ public class QqPanelWatcher : IDisposable
                 // 就会被误判成点击而弹面板（实测误触发源）。
                 if (Running && IsLeftButtonDown() && !HookCoveredLastMouseDown())
                 {
-                    var hostHwnd = GetTopWindowHwnd(el);
+                    var hostHwnd = focusHost;
                     if (hostHwnd != IntPtr.Zero && FocusPathClickIsOnButton())
                     {
                         var cachedRect = hostHwnd == _lastPanelRectHwnd ? _lastPanelRect : Rect.Empty;
@@ -866,11 +863,6 @@ public class QqPanelWatcher : IDisposable
 
                 if (editorLike)
                 {
-                    // 编辑框焦点回声：发送链路找回焦点后的正向验证信号（要求晚于点击到达，
-                    // 见 PollFocusVerified；剪枝树上 caret 恒为系统零值、类名不可读，
-                    // 这是唯一可观测的"焦点真的回到输入框"证据）
-                    Volatile.Write(ref _editorFocusEchoTicks, Environment.TickCount64);
-
                     // 编辑区证据判定 + 锚点缓存：焦点所在根窗口用 GUITHREADINFO 取（纯本地，
                     // UIA 走查在基本模式会失败）。锚点优先元素矩形（完全模式，权威），
                     // 退化用光标位置（用户点编辑框时焦点事件必伴随光标在编辑区内）。
@@ -887,12 +879,13 @@ public class QqPanelWatcher : IDisposable
                         var guiF = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
                         if (GetGUIThreadInfo(0, ref guiF) && guiF.hwndFocus != IntPtr.Zero)
                             eroot = GetAncestor(guiF.hwndFocus, GA_ROOT);
-                        if (eroot != IntPtr.Zero && GetWindowRect(eroot, out var gwr))
+                        GetWindowThreadProcessId(eroot, out var rootPid);
+                        if (eroot != IntPtr.Zero && rootPid == (uint)pid && GetWindowRect(eroot, out var gwr))
                         {
                             try
                             {
                                 var r = el.Current.BoundingRectangle;
-                                if (r.Width > 0)
+                                if (r.Width > 0 && r.Height > 0)
                                 {
                                     anchor.X = (int)(r.Left + r.Width / 2);
                                     anchor.Y = (int)(r.Bottom - Math.Min(25, r.Height / 4));
@@ -900,10 +893,20 @@ public class QqPanelWatcher : IDisposable
                                 }
                             }
                             catch { }
-                            if (!rectOk && GetCursorPos(out var cp)) { anchor.X = cp.X; anchor.Y = cp.Y; }
-
-                            if (anchor.X >= 0 && anchor.Y > gwr.Top + (gwr.Bottom - gwr.Top) * 0.55
-                                && (rectOk || _emojiBtnRect.Width <= 0 || anchor.Y > _emojiBtnRect.Bottom + 10))
+                            // The injected click may already have restored the cursor when UIA
+                            // delivers this event. Use the recorded click rather than its current position.
+                            var clickPoint = _lastMouseDownPt;
+                            var clickTicks = Volatile.Read(ref _lastMouseDownTicks);
+                            if (Volatile.Read(ref _lastInjectedClickTicks) > clickTicks)
+                            { clickPoint = _lastInjectedClickPt; clickTicks = Volatile.Read(ref _lastInjectedClickTicks); }
+                            bool clickOk = !rectOk && clickTicks > 0 && Environment.TickCount64 - clickTicks < 1000
+                                && RootWindowFromPoint(clickPoint) == eroot;
+                            if (clickOk) anchor = clickPoint;
+                            var button = _emojiBtnHwnd == eroot && TryResolveEmojiButtonRect(out var currentButton)
+                                ? currentButton : Rect.Empty;
+                            if ((rectOk || clickOk) && anchor.X >= gwr.Left && anchor.X < gwr.Right
+                                && anchor.Y > gwr.Top + (gwr.Bottom - gwr.Top) * 0.55 && anchor.Y < gwr.Bottom
+                                && (cls.Contains(EditorClassKey) || button.IsEmpty || anchor.Y > button.Bottom + 10))
                             {
                                 // 缓存 40x20 的点击区（窗口相对）：发送链路按此找回焦点
                                 erel = new Rect(anchor.X - gwr.Left - 20, anchor.Y - gwr.Top - 10, 40, 20);
@@ -935,9 +938,13 @@ public class QqPanelWatcher : IDisposable
 
                         if (rectOk) Volatile.Write(ref _lastLiveSignalTicks, Environment.TickCount64); // 树活性证据：编辑框元素矩形可读 = web 内容在场
 
-                        _editorHwnd = eroot;
-                        _editorPid = pid;
-                        _editorRectRel = erel;
+                        lock (_gate)
+                        {
+                            _editorHwnd = eroot;
+                            _editorPid = pid;
+                            _editorRectRel = erel;
+                            Volatile.Write(ref _editorFocusEchoTicks, Environment.TickCount64);
+                        }
                         var logKey = $"{eroot}:{(int)erel.Left},{(int)erel.Top}";
                         if (_editorRectLogKey != logKey)
                         {
@@ -977,7 +984,86 @@ public class QqPanelWatcher : IDisposable
             }
         }
 
+        var host = _legacyTabHwnd;
+        if (sender is AutomationElement element && !_legacyAnchorRect.IsEmpty && IsLegacyWindow(host)
+            && Interlocked.CompareExchange(ref _legacyPanelProbeRunning, 1, 0) == 0)
+        {
+            var generation = UserActionGen;
+            _ = Task.Run(() =>
+            {
+                using var lease = QqUiaWorker.Lease(1500);
+                try { TryObserveLegacyPanel(element, host, generation); }
+                catch { /* An unrelated or unavailable event is not visibility evidence. */ }
+                finally { Volatile.Write(ref _legacyPanelProbeRunning, 0); }
+            });
+        }
         ScheduleThrottledVerify();
+    }
+
+    private static AutomationElement ReadLegacyPanelProperties(AutomationElement element)
+    {
+        var request = new CacheRequest { TreeScope = TreeScope.Element, AutomationElementMode = AutomationElementMode.None };
+        request.Add(AutomationElement.ProcessIdProperty);
+        request.Add(AutomationElement.BoundingRectangleProperty);
+        request.Add(AutomationElement.IsOffscreenProperty);
+        return element.GetUpdatedCache(request);
+    }
+
+    private bool TryObserveLegacyPanel(AutomationElement element, IntPtr host, long generation)
+    {
+        if (_disposed || host != _legacyTabHwnd || generation != UserActionGen || _legacyAnchorRect.IsEmpty) return false;
+        var expected = _legacyAnchorRect;
+        if (expected.Width < 100 || expected.Height < 100 || !double.IsFinite(expected.Width)
+            || !double.IsFinite(expected.Height) || !double.IsFinite(expected.Left) || !double.IsFinite(expected.Top))
+            return false;
+        var snapshot = ReadLegacyPanelProperties(element).Cached;
+        GetWindowThreadProcessId(host, out var pid);
+        var rect = snapshot.BoundingRectangle;
+        double tolerance = 6 * expected.Width / 450;
+        if (pid == 0 || snapshot.ProcessId != pid || snapshot.IsOffscreen || rect.IsEmpty
+            || Math.Abs(rect.Left - expected.Left) > tolerance || Math.Abs(rect.Top - expected.Top) > tolerance
+            || Math.Abs(rect.Width - expected.Width) > tolerance || Math.Abs(rect.Height - expected.Height) > tolerance)
+            return false;
+        lock (_gate)
+        {
+            if (_disposed || host != _legacyTabHwnd || generation != UserActionGen || _legacyAnchorRect.IsEmpty) return false;
+            if (_legacyPanelReference == null) Log($"legacy panel structure evidence captured hwnd={host} rect={rect}");
+            _legacyPanelReference = new(element, host, generation);
+        }
+        return true;
+    }
+
+    private bool? ReadObservedLegacyPanel(IntPtr host, out Rect rect)
+    {
+        rect = Rect.Empty;
+        var reference = Volatile.Read(ref _legacyPanelReference);
+        if (reference == null || reference.Hwnd != host) return null;
+        long generation = UserActionGen;
+        bool reused = reference.Generation != generation;
+        if (reused && generation <= Volatile.Read(ref _dismissedActionGeneration)) return null;
+        try
+        {
+            var snapshot = ReadLegacyPanelProperties(reference.Element).Cached;
+            GetWindowThreadProcessId(host, out var pid);
+            rect = snapshot.BoundingRectangle;
+            if (!ReferenceEquals(reference, Volatile.Read(ref _legacyPanelReference)) || generation != UserActionGen)
+                return null;
+            bool visible = pid != 0 && snapshot.ProcessId == pid && !snapshot.IsOffscreen
+                && !rect.IsEmpty && !_legacyAnchorRect.IsEmpty
+                && Math.Abs(rect.Width - _legacyAnchorRect.Width) <= 6 * _legacyAnchorRect.Width / 450
+                && Math.Abs(rect.Height - _legacyAnchorRect.Height) <= 6 * _legacyAnchorRect.Width / 450;
+            // Chromium can reuse this exact node without another structure event. A new
+            // button operation may rebind it only after it has native panel geometry again.
+            // A still-hidden old node says nothing about an opening still in progress.
+            if (reused)
+            {
+                if (!visible) return null;
+                Interlocked.CompareExchange(ref _legacyPanelReference, new(reference.Element, host, generation), reference);
+            }
+            return visible;
+        }
+        catch (ElementNotAvailableException) { return reused ? null : false; }
+        catch { return null; }
     }
 
     private void ScheduleThrottledVerify()
@@ -1065,6 +1151,10 @@ public class QqPanelWatcher : IDisposable
     public static Task DumpDiagnosticsNowAsync()
     {
         var w = _active;
+        if (!QqUiaWorker.IsWorker)
+            return w?._worker != null
+                ? w._worker.RequestAsync(new() { Kind = "request", Command = "dump" }, TimeSpan.FromSeconds(6))
+                : QqUiaWorker.QueryAsync("dump");
         if (w != null) return w.DumpQqTreeDiagnosticsCoreAsync("manual dump from settings", force: true);
         return DumpQqTreeWalkAsync("manual dump from settings (watcher off)", cancelled: null);
     }
@@ -1086,6 +1176,7 @@ public class QqPanelWatcher : IDisposable
     {
         return Task.Run(() =>
         {
+            using var lease = QqUiaWorker.Lease(5000);
             try
             {
                 var pids = CollectQqPids();
@@ -1263,10 +1354,8 @@ public class QqPanelWatcher : IDisposable
                 }
                 else
                 {
-                    _openMisses = 0;
-                    _panelOpen = false;
                     Log("panel DISAPPEARED (time-confirmed)");
-                    PanelDisappeared?.Invoke(this, EventArgs.Empty);
+                    OptimisticClosePanel("native panel no longer visible (time-confirmed)");
                 }
             }
             return _panelOpen;
@@ -1292,6 +1381,21 @@ public class QqPanelWatcher : IDisposable
     /// 发送链路验证"焦点真的回到输入框"用：回声必须晚于点击派发时刻才算数。</summary>
     public static long EditorFocusEchoTicks() => Volatile.Read(ref _editorFocusEchoTicks);
 
+    internal static long LastQqFocusTicks => Volatile.Read(ref _lastQqFocusTicks);
+
+    internal static long EditorFocusEchoTicks(IntPtr qqHwnd)
+    {
+        var w = _active;
+        if (w == null) return 0;
+        lock (w._gate)
+        {
+            if (w._disposed || qqHwnd == IntPtr.Zero || w._editorHwnd != qqHwnd) return 0;
+            GetWindowThreadProcessId(qqHwnd, out var pid);
+            var echo = Volatile.Read(ref _editorFocusEchoTicks);
+            return pid == (uint)w._editorPid && echo >= Volatile.Read(ref _lastQqFocusTicks) ? echo : 0;
+        }
+    }
+
     /// <summary>QQ 内最近一次焦点事件距今是否已静默 minQuietMs 以上。
     /// QQ 收面板会连续 ~0.8s 回摆焦点（按钮→标签→编辑框→按钮），发送预关闭后
     /// 必须等这套编排平息再点编辑框，否则编辑框焦点会被随后的回摆覆盖（表情不落框）。</summary>
@@ -1303,14 +1407,14 @@ public class QqPanelWatcher : IDisposable
         if (_qqPids.Contains(focusedPid)) return;
         if ((DateTime.Now - _lastPidRefresh).TotalMilliseconds < 2000) return;
         _lastPidRefresh = DateTime.Now;
-        _qqPids = CollectQqPids();
+        _qqPids = RefreshProcesses();
     }
 
     private void RefreshPidsIfNeeded()
     {
         if ((DateTime.Now - _lastPidRefresh).TotalMilliseconds < 2000) return;
         _lastPidRefresh = DateTime.Now;
-        _qqPids = CollectQqPids();
+        _qqPids = RefreshProcesses();
         PruneSubscriptions();
     }
 
@@ -1320,20 +1424,40 @@ public class QqPanelWatcher : IDisposable
     {
         lock (_gate)
         {
-            if (_subscribed.ContainsKey(hwnd)) return;
+            if (_disposed || _subscribed.ContainsKey(hwnd) || !_pendingSubscriptions.Add(hwnd)) return;
+        }
+        QueueSubscription(() =>
+        {
             try
             {
+                if (_disposed) return;
                 var el = AutomationElement.FromHandle(hwnd);
                 Automation.AddStructureChangedEventHandler(el, TreeScope.Descendants, OnStructureChanged);
-                _subscribed[hwnd] = el;
+                lock (_gate) _subscribed[hwnd] = el;
                 Log($"structure events subscribed hwnd={hwnd}");
             }
             catch (Exception ex)
             {
                 Log($"subscribe failed hwnd={hwnd}: {ex.Message}");
             }
-        }
+            finally { lock (_gate) _pendingSubscriptions.Remove(hwnd); }
+        });
         WarmUpAccessibility(hwnd);
+    }
+
+    private readonly object _subscriptionQueueGate = new();
+    private readonly HashSet<IntPtr> _pendingSubscriptions = new();
+    private Task _subscriptionTail = Task.CompletedTask;
+    private bool _focusRegistered;
+    private void QueueSubscription(Action action)
+    {
+        lock (_subscriptionQueueGate)
+            _subscriptionTail = _subscriptionTail.ContinueWith(_ =>
+            {
+                using var lease = QqUiaWorker.Lease(8000);
+                try { action(); } catch { }
+            },
+                CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
     }
 
     /// <summary>主动激活 QQ 的无障碍树：向 QQ 顶层窗口发一次 MSAA WM_GETOBJECT(OBJID_CLIENT)。
@@ -1344,7 +1468,7 @@ public class QqPanelWatcher : IDisposable
     /// 60s 节流；SMTO_ABORTIFHUNG：目标窗口卡死时 500ms 内放弃，不拖累调用线程。</summary>
     private void WarmUpAccessibility(IntPtr topHwnd)
     {
-        if (topHwnd == IntPtr.Zero) return;
+        if (_disposed || topHwnd == IntPtr.Zero) return;
         var now = Environment.TickCount64;
         bool firstTime;
         lock (_gate)
@@ -1391,7 +1515,7 @@ public class QqPanelWatcher : IDisposable
                     _emojiBtnRect = Rect.Empty;
                     _emojiBtnRectRel = Rect.Empty;
                 }
-                _ = Task.Run(() =>
+                QueueSubscription(() =>
                 {
                     try { Automation.RemoveStructureChangedEventHandler(element, OnStructureChanged); }
                     catch { /* 元素已失效 = 订阅已随进程/窗口消亡 */ }
@@ -1426,23 +1550,28 @@ public class QqPanelWatcher : IDisposable
     private static long _editorFocusEchoTicks;   // 最近一次"编辑框系元素获得焦点"的时刻：发送链路找回焦点的正向验证信号
     private static long _legacyOptimisticCloseUntil; // 乐观关闭的焦点回声抑制窗：关闭点击/收面板编排的焦点回声，窗口内不得把状态翻回"开"
     private bool _closePending;                  // 仅钩子线程读写：面板开着时按下了按钮，等 mouseup 也落在按钮上（完整点击）再乐观关闭
+    private bool _buttonOpenPending;
+    private readonly object _buttonGestureGate = new();
+    private long _lastButtonMouseUpTicks;
+    private POINT _lastButtonMouseUpPoint;
     private static long _lastMouseDownTicks;     // 钩子记录的全局最近一次左键按下时刻：焦点兜底路径把焦点信号和真实点击对上号
     private static POINT _lastMouseDownPt;
+    private static long _lastInjectedClickTicks;
+    private static POINT _lastInjectedClickPt;
     private static long _lastHookFireTicks;      // 钩子最近一次乐观开/关触发时刻：焦点路径据此识别"本次点击钩子已处理"，不重复发事件
     // 快捷面板「共存模式可见」镜像（QuickPanelWindow 在 UI 线程经 IsVisibleChanged 维护，钩子线程只读）：
     // 钩子判断开/关不能只看 _panelOpen——QQ 面板出现要等 mouse-up 后 UIA 扫描确认（几十~几百 ms），
     // 快速双击的第二下常落在确认之前，_panelOpen 仍为 false，会误走乐观打开分支把面板又"开"一遍；
     // 此时共存面板明明已经显示着，物理点击就是 toggle 关闭（2026-10-05 用户实测"双击后面板很久不收"）。
     internal static int CoexistPanelShowing; // 0/1，经 Volatile.Read/Write 跨线程访问
-    private IntPtr _mouseHook;
-    private readonly LowLevelMouseProc _mouseHookProc; // 必须持有委托强引用，否则 GC 回收后钩子回调访问已释放 thunk → 闪退
-    private Thread? _hookThread;
-    private uint _hookThreadId;
+    private MouseHookPump? _hookPump;
     private bool _hookAliveLogged;
 
     private (bool open, IntPtr hwnd, Rect rect) ScanQqWindows(HashSet<int> pids, bool missCacheable)
     {
-        var myPid = Environment.ProcessId;
+        using var lease = QqUiaWorker.Lease();
+        var myPid = QqUiaWorker.UiOwnerPid;
+        if (UserActionGen <= Volatile.Read(ref _dismissedActionGeneration)) return (false, IntPtr.Zero, Rect.Empty);
 
         // 快路径：上次的面板元素仍有效时只读单个元素 + 命中测试（毫秒级），不做全树遍历
         var cached = _cachedPanel;
@@ -1467,15 +1596,20 @@ public class QqPanelWatcher : IDisposable
             }
         }
 
-        // 旧版 NTQQ 快路径（必须在全扫之前）：剪枝树下全树 FindFirst 会阻塞数十秒（实测 ~35s）
-        // 且必然扑空。闩进旧版模式后完全跳过全扫：锚信号新鲜 = 面板开着；过期 = 关着
-        // （时间确认在 CheckNow 里走 _openMisses 常规收起）。必须以 _legacyMode 闩死为前提——
-        // 锚信号在剪枝树不可探测的新版上也会被焦点命中写入，无闩门会污染新版的 sticker-panel 精准检测。
+        // 9.9.19 exposes its unnamed panel in structure events, but not in point hit tests.
+        // Once correlated to this host/button operation, read that exact node rather than expiring
+        // visibility with the button TTL. Full-tree searches remain disabled for slow legacy trees.
         var nowTicksL = Environment.TickCount64;
         bool legacySignalFresh = !_legacyAnchorRect.IsEmpty && nowTicksL - _legacyTabShownTicks < _legacyOpenTtlMs;
-        if (_legacyMode)
+        if (IsLegacyWindow(_legacyTabHwnd))
         {
-            if (legacySignalFresh)
+            if (!_legacyAnchorRect.IsEmpty && IsWindowVisible(_legacyTabHwnd))
+            {
+                var observed = ReadObservedLegacyPanel(_legacyTabHwnd, out var observedRect);
+                if (observed.HasValue) return (observed.Value, _legacyTabHwnd, observedRect);
+            }
+            if ((legacySignalFresh || (_legacyButtonOpenLatched && !_legacyAnchorRect.IsEmpty))
+                && IsWindowVisible(_legacyTabHwnd) && !IsIconic(_legacyTabHwnd))
             {
                 var hwndL = _legacyTabHwnd;
                 if (hwndL == IntPtr.Zero)
@@ -1484,6 +1618,7 @@ public class QqPanelWatcher : IDisposable
                 }
                 if (hwndL != IntPtr.Zero)
                 {
+                    if (_tabRectHwnd == hwndL) TrySetLegacyAnchorFromTab();
                     if (!_legacyFallbackLogged)
                     {
                         _legacyFallbackLogged = true;
@@ -1493,7 +1628,6 @@ public class QqPanelWatcher : IDisposable
                     return (true, hwndL, _legacyAnchorRect);
                 }
             }
-            return (false, IntPtr.Zero, Rect.Empty); // 闩锁后无论锚新鲜与否都不做全扫（全扫在此树上=阻塞数十秒的毒药）
         }
 
         // 负缓存：最近一次全扫就没找到面板、且本轮无强制信号（点击重试/关闭确认）→ 直接报未开。
@@ -1502,9 +1636,11 @@ public class QqPanelWatcher : IDisposable
         if (missCacheable && nowTicks - _lastFullScanMissTicks < FullScanMissTtlMs)
             return (false, IntPtr.Zero, Rect.Empty);
 
-        var scanStart = Environment.TickCount64;
         foreach (var hwnd in GetVisibleWindowsOf(pids))
         {
+            GetWindowThreadProcessId(hwnd, out var pid);
+            if (_capabilities.IsLegacy((int)pid)) continue;
+            var scanStart = Environment.TickCount64;
             try
             {
                 var root = AutomationElement.FromHandle(hwnd);
@@ -1523,16 +1659,18 @@ public class QqPanelWatcher : IDisposable
                 return (true, hwnd, rect);
             }
             catch { /* 单个窗口失败（树未激活/元素失效）不影响整体 */ }
+            finally
+            {
+                if (Environment.TickCount64 - scanStart > 3000)
+                {
+                    _capabilities.MarkTreeUnavailable((int)pid);
+                    Log($"slow UIA tree: geometric fallback enabled for pid={pid}");
+                }
+            }
         }
         _lastFullScanMissTicks = Environment.TickCount64; // 完整扫过且未命中，才开始计时
         // 剪枝树特征：全扫未命中且耗时超过数秒（实测旧版 ~35s，新版 18–66ms）→ 闩进旧版模式，
         // 此后本函数走顶部的旧版快路径，不再做全扫（新版正常环境永不触发）。
-        if (Environment.TickCount64 - scanStart > 3000)
-        {
-            _legacyMode = true;
-            LatchLegacyScanMode();
-            Log($"legacy scan mode latched (full scan took {Environment.TickCount64 - scanStart} ms, pruned a11y tree)");
-        }
         return (false, IntPtr.Zero, Rect.Empty);
     }
 
@@ -1562,8 +1700,7 @@ public class QqPanelWatcher : IDisposable
         }
     }
 
-    private static HashSet<int> CollectQqPids() =>
-        Process.GetProcessesByName("QQ").Select(p => p.Id).ToHashSet();
+    private static HashSet<int> CollectQqPids() => QqProcessCapabilities.Collect().Select(p => p.Pid).ToHashSet();
 
     private static IEnumerable<IntPtr> GetVisibleWindowsOf(HashSet<int> pids)
     {
@@ -1591,6 +1728,93 @@ public class QqPanelWatcher : IDisposable
         catch { }
     }
 
+    internal static QqWorkerState? ActiveState() => _active?.ExportState();
+
+    internal QqWorkerState ExportState()
+    {
+        lock (_gate) return new()
+        {
+            EditorHwnd = _editorHwnd.ToInt64(), EditorPid = _editorPid, EditorRect = PixelRect.From(_editorRectRel),
+            EditorEcho = Volatile.Read(ref _editorFocusEchoTicks), FocusTicks = Volatile.Read(ref _lastQqFocusTicks),
+            Generation = UserActionGen, PanelOpen = _panelOpen,
+            ButtonHwnd = _emojiBtnHwnd.ToInt64(), ButtonPid = _emojiBtnPid, ButtonRect = PixelRect.From(_emojiBtnRectRel),
+            TabHwnd = _tabRectHwnd.ToInt64(), TabRect = PixelRect.From(_tabRectRel),
+            LegacyPids = _qqPids.Where(_capabilities.IsLegacy).ToArray()
+        };
+    }
+
+    private void HandleWorkerFrame(string line)
+    {
+        if (_disposed) return;
+        var frame = JsonSerializer.Deserialize<QqWorkerFrame>(line);
+        if (frame == null) return;
+        if (frame.Kind == "reset")
+        {
+            lock (_gate)
+            {
+                _workerGenerationBase = Interlocked.Increment(ref _userActionGen);
+                _dismissedWorkerGeneration = -1;
+                _lastWorkerGeneration = -1;
+                _panelOpen = false;
+                _editorHwnd = _emojiBtnHwnd = _tabRectHwnd = IntPtr.Zero;
+                _editorRectRel = _emojiBtnRectRel = _tabRectRel = Rect.Empty;
+                Volatile.Write(ref _editorFocusEchoTicks, 0);
+                Volatile.Write(ref _lastQqFocusTicks, 0);
+            }
+            PanelDisappeared?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+        if (frame.State is { } state)
+        {
+            lock (_gate)
+            {
+                if (state.Generation < _lastWorkerGeneration) return;
+                _lastWorkerGeneration = state.Generation;
+                if (frame.Kind == "disappeared")
+                {
+                    if (state.PanelOpen) return;
+                    _dismissedWorkerGeneration = Math.Max(_dismissedWorkerGeneration, state.Generation);
+                }
+                _panelOpen = state.PanelOpen && state.Generation > _dismissedWorkerGeneration;
+                _editorHwnd = new(state.EditorHwnd); _editorPid = state.EditorPid;
+                _editorRectRel = state.EditorRect?.ToRect() ?? Rect.Empty;
+                _emojiBtnHwnd = new(state.ButtonHwnd); _emojiBtnPid = state.ButtonPid;
+                _emojiBtnRectRel = state.ButtonRect?.ToRect() ?? Rect.Empty;
+                _tabRectHwnd = new(state.TabHwnd); _tabRectRel = state.TabRect?.ToRect() ?? Rect.Empty;
+                Volatile.Write(ref _editorFocusEchoTicks, state.EditorEcho);
+                Volatile.Write(ref _lastQqFocusTicks, state.FocusTicks);
+                Interlocked.Exchange(ref _userActionGen, _workerGenerationBase + state.Generation);
+                if ((DateTime.Now - _lastPidRefresh).TotalSeconds >= 2)
+                {
+                    _lastPidRefresh = DateTime.Now;
+                    _qqPids = RefreshProcesses();
+                }
+                foreach (var pid in state.LegacyPids) _capabilities.MarkTreeUnavailable(pid);
+            }
+        }
+        var args = new QqPanelEventArgs(new(frame.Hwnd), frame.Rect?.ToRect() ?? Rect.Empty, frame.ButtonRect?.ToRect() ?? Rect.Empty);
+        if (frame.Kind == "appeared" && frame.State?.PanelOpen == false) return;
+        if ((frame.Kind is "appeared" or "clicked") && frame.State?.Generation <= _dismissedWorkerGeneration) return;
+        switch (frame.Kind)
+        {
+            case "appeared": PanelAppeared?.Invoke(this, args); break;
+            case "clicked": EmojiButtonClicked?.Invoke(this, args); break;
+            case "disappeared": PanelDisappeared?.Invoke(this, EventArgs.Empty); break;
+            case "status": _status(frame.Text); break;
+        }
+    }
+
+    private bool RequestWorkerClose(IntPtr hwnd)
+    {
+        long generation;
+        lock (_gate) generation = UserActionGen - _workerGenerationBase;
+        var json = _worker!.RequestAsync(new()
+        {
+            Kind = "request", Command = "close", Hwnd = hwnd.ToInt64(), Generation = generation
+        }, TimeSpan.FromSeconds(3)).GetAwaiter().GetResult();
+        return json != null && JsonSerializer.Deserialize<QqWorkerFrame>(json)?.Value == true;
+    }
+
     /// <summary>OS 友好名 + 版本：NT 内核在 Win11 上仍报 10.0，须按 build 号（≥22000）区分。</summary>
     private static string OsTag()
     {
@@ -1601,6 +1825,53 @@ public class QqPanelWatcher : IDisposable
 
     // --- 名称/类名/矩形安全读取（Chromium 树里部分元素属性不可读） ---
 
+    internal static Rect NormalizeLegacyTabRect(string name, Rect tab, double scale)
+    {
+        if (tab.IsEmpty || !double.IsFinite(scale) || scale <= 0) return Rect.Empty;
+        int column = name switch
+        {
+            "切换默认表情按钮" => 0,
+            "切换我的收藏按钮" => 1,
+            "切换GIF热图按钮" => 2,
+            _ => -1
+        };
+        return column < 0 ? Rect.Empty : new Rect(tab.Left - column * 54 * scale, tab.Top, tab.Width, tab.Height);
+    }
+
+    // Observed 9.9.21 geometry; this is a layout fallback, not authoritative UIA bounds.
+    internal static Rect LegacyPanelRectFromTab(Rect defaultTab, double scale)
+        => defaultTab.IsEmpty || !double.IsFinite(scale) || scale <= 0 ? Rect.Empty
+            : new Rect(defaultTab.Left - 24 * scale, defaultTab.Top - 300 * scale, 450 * scale, 336 * scale);
+
+    // Observed 9.9.19 toolbar-to-popup geometry; the toolbar button itself is not a panel bound.
+    internal static Rect LegacyPanelRectFromButton(Rect button, double scale)
+        => button.IsEmpty || button.Width <= 0 || button.Height <= 0 || !double.IsFinite(scale) || scale <= 0 ? Rect.Empty
+            : new Rect(button.Left + button.Width / 2 - 27 * scale,
+                button.Top + button.Height / 2 - 356 * scale, 450 * scale, 336 * scale);
+
+    internal static Rect ResolveCoexistAnchor(Rect observed, Rect button, double scale, bool legacy)
+    {
+        if (!observed.IsEmpty && observed.Width >= 100 && observed.Height >= 100) return observed;
+        // Complete UIA trees provide the real popup bounds shortly after mouse-up.
+        // Only a pruned/slow tree needs the measured old-layout approximation.
+        return legacy ? LegacyPanelRectFromButton(button, scale) : Rect.Empty;
+    }
+
+    private bool TrySetLegacyAnchorFromButton()
+    {
+        if (!TryResolveEmojiButtonRect(out var button)) return false;
+        _legacyAnchorRect = LegacyPanelRectFromButton(button, Math.Max(96u, GetDpiForWindow(_emojiBtnHwnd)) / 96.0);
+        return !_legacyAnchorRect.IsEmpty;
+    }
+
+    private bool TrySetLegacyAnchorFromTab()
+    {
+        if (_tabRectHwnd == IntPtr.Zero || _tabRectRel.IsEmpty || !GetWindowRect(_tabRectHwnd, out var window)) return false;
+        var tab = new Rect(window.Left + _tabRectRel.Left, window.Top + _tabRectRel.Top, _tabRectRel.Width, _tabRectRel.Height);
+        _legacyAnchorRect = LegacyPanelRectFromTab(tab, Math.Max(96u, GetDpiForWindow(_tabRectHwnd)) / 96.0);
+        return !_legacyAnchorRect.IsEmpty;
+    }
+
     private static string SafeName(AutomationElement e) { try { var n = e.Current.Name; return n ?? ""; } catch { return ""; } }
     private static string SafeClass(AutomationElement e) { try { var c = e.Current.ClassName; return c ?? ""; } catch { return ""; } }
 
@@ -1610,7 +1881,27 @@ public class QqPanelWatcher : IDisposable
         catch { return false; }
     }
 
-    // 从焦点元素向上找顶层 Window 元素，取其 hwnd（Chromium 的子元素 NativeWindowHandle 不可信）
+    private IntPtr ResolveFocusHost(AutomationElement element, int pid)
+    {
+        var gui = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+        if (GetGUIThreadInfo(0, ref gui) && MatchesProcess(gui.hwndFocus, out var focusRoot)) return focusRoot;
+        try
+        {
+            if (MatchesProcess((IntPtr)element.Current.NativeWindowHandle, out var nativeRoot)) return nativeRoot;
+        }
+        catch { }
+        // Legacy trees may omit the Window ancestor entirely or block walking to it.
+        return _capabilities.IsLegacy(pid) ? IntPtr.Zero : GetTopWindowHwnd(element);
+
+        bool MatchesProcess(IntPtr hwnd, out IntPtr root)
+        {
+            root = hwnd == IntPtr.Zero ? IntPtr.Zero : GetAncestor(hwnd, GA_ROOT);
+            GetWindowThreadProcessId(root, out var owner);
+            return root != IntPtr.Zero && owner == (uint)pid;
+        }
+    }
+
+    // 从焦点元素向上找顶层 Window 元素，仅供本地句柄不可用的新版树。
     private static IntPtr GetTopWindowHwnd(AutomationElement start)
     {
         // 实测 NTQQ 从按钮到根 Window 约 20+ 级（中间经过 Chrome_RenderWidgetHostHWND/多层 View），深度须给足
@@ -1660,6 +1951,14 @@ public class QqPanelWatcher : IDisposable
         return true;
     }
 
+    internal static Rect CachedButtonRect(IntPtr host)
+    {
+        var watcher = _active;
+        return watcher != null && watcher._emojiBtnHwnd == host && watcher.TryResolveEmojiButtonRect(out var rect)
+            ? rect : Rect.Empty;
+    }
+    internal static double WindowScale(IntPtr host) => Math.Max(96u, GetDpiForWindow(host)) / 96.0;
+
     /// <summary>兜底锚退化为光标近似（按钮/TAB 矩形不可用时）：32x32 光标中心块。</summary>
     private void TrySetLegacyAnchorFromCursor()
     {
@@ -1669,27 +1968,6 @@ public class QqPanelWatcher : IDisposable
                 _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
         }
         catch { }
-    }
-
-    /// <summary>由按钮/锚矩形推断 QQ 原生面板矩形（物理像素）：面板在锚上方、右缘对齐锚右缘，
-    /// 标准尺寸见 PanelStdWidthPx/PanelStdHeightPx。anchorRect 为 Empty 或无面积时返回 Empty。</summary>
-    internal static Rect InferPanelRectFromAnchor(Rect anchorRect)
-    {
-        if (anchorRect.IsEmpty || anchorRect.Width <= 0 || double.IsNaN(anchorRect.Right)) return Rect.Empty;
-        return new Rect(anchorRect.Right - PanelStdWidthPx, anchorRect.Top - PanelStdHeightPx,
-            PanelStdWidthPx, PanelStdHeightPx);
-    }
-
-    /// <summary>点击点是否落在推断面板矩形内（含 16px 容差）：面板区域点击判定的纯几何部分，
-    /// 静态可测。QQ 高版会把面板翻到按钮下方（空间不足时），此时推断矩形落在按钮上方的空白区，
-    /// X 点击不命中——退化为改动前行为（锚 TTL 到期后才收），与乐观打开合成锚点是同一已知局限。</summary>
-    internal static bool IsPointInInferredPanelRect(double x, double y, Rect anchorRect)
-    {
-        var r = InferPanelRectFromAnchor(anchorRect);
-        if (r.IsEmpty) return false;
-        const double tol = 16;
-        return x >= r.Left - tol && x <= r.Right + tol
-            && y >= r.Top - tol && y <= r.Bottom + tol;
     }
 
     /// <summary>点击点是否真的落在（当前位置重算后的）表情按钮上：矩形包含 + 命中点的根窗口
@@ -1737,60 +2015,40 @@ public class QqPanelWatcher : IDisposable
     private void OptimisticClosePanel(string reason)
     {
         _panelOpen = false;
+        _optimisticPending = false;
+        _buttonOpenPending = false;
+        Volatile.Write(ref _dismissedActionGeneration, UserActionGen);
         _openMisses = 0;
-        if (_legacyMode)
-        {
-            // 旧版的"开"状态就是锚本身：乐观关闭必须连锚一起清，否则下一次验证又把面板报回来
-            _legacyAnchorRect = Rect.Empty;
-        }
+        _legacyTabElement = null;
+        _legacyTabShownTicks = 0;
+        _legacyButtonOpenLatched = false;
+        _cachedPanel = null;
+        _legacyAnchorRect = Rect.Empty;
+        // Retain only the node identity for QQ's next open; the cleared anchor and
+        // action barrier prevent it from reviving this dismissed operation.
         // 回声抑制窗：关闭动作自己的焦点回声（mousedown 送焦点回按钮、QQ 收面板编排回摆）
         // 会在随后 ~1s 内到达，若照常刷新锚会立刻把状态翻回"开"→ 关了又弹（实测闪烁形态）。
         Volatile.Write(ref _legacyOptimisticCloseUntil, Environment.TickCount64 + 1200);
         Log($"optimistic panel close ({reason})");
+        long closedGeneration = UserActionGen;
         Task.Run(() =>
         {
+            if (UserActionGen != closedGeneration || _panelOpen) return;
             try { PanelDisappeared?.Invoke(this, EventArgs.Empty); }
             catch (Exception ex) { Log("optimistic close dispatch failed: " + ex.Message); }
         });
         ArmTailVerify();
     }
 
-    /// <summary>钩子线程的廉价判定（零 UIA）：面板开着（或共存面板可见）时，点击落在 QQ 进程
-    /// 窗口内且未命中表情按钮——候选的「面板区域点击」。本应用自己的窗口（快捷面板 NOACTIVATE、
-    /// 主窗）与其他应用天然被进程判定排除。</summary>
-    private bool PanelAreaClickCandidate(POINT pt)
+    private void PublishOptimisticOpen(IntPtr host, Rect panel, Rect button)
     {
-        if (!_panelOpen && Volatile.Read(ref CoexistPanelShowing) != 1) return false;
-        var root = RootWindowFromPoint(pt);
-        if (root == IntPtr.Zero) return false;
-        GetWindowThreadProcessId(root, out var pid);
-        return _qqPids.Count > 0 && _qqPids.Contains((int)pid);
-    }
-
-    /// <summary>面板区域点击的处理：此类点击（X 关闭/表情发送/面板内浏览）不产生任何既有
-    /// 关闭路径能识别的信号——按钮 toggle 走钩子按钮分支，编辑框光灭走焦点路径，而 X 关闭后
-    /// 焦点停在面板内部元素（剪枝树上空类名、非编辑区证据被拒），透明隐藏也不派发结构事件。
-    /// 新版：武装补验尾迹即可，真实扫描是权威判定——真关闭 ~350ms 内被命中测试检出，
-    /// 误武装（面板其实还开着，如点标题栏拖动）扫描报 open 无动作，自愈。
-    /// 旧版：无真实扫描可用（全扫=阻塞毒药），锚是「面板开着」的唯一信念。点击落在推断面板
-    /// 矩形内才动信念窗：X 关闭/表情发送后无锚续期 → 2.5s 宽限后时间确认收起；TAB 命中照常
-    /// 续回长档（浏览分类不受影响）；面板矩形外的点击（标题栏拖动/消息区）不碰——旧版无扫描
-    /// 无法自愈，误收的代价是共存对失联，宁可滞留到锚 TTL 自然过期。</summary>
-    private void OnPanelAreaMouseDown(POINT pt)
-    {
-        BumpUserAction(); // 面板内点击是真实用户操作：在途的发送预关闭（close-q）必须让位
-        if (!_legacyMode)
+        long generation = UserActionGen;
+        _ = Task.Run(() =>
         {
-            ArmTailVerify();
-            Log("panel area mousedown: tail verify armed (non-legacy)");
-            return;
-        }
-        var anchorRect = _emojiBtnRect.Width > 0 ? _emojiBtnRect : _legacyAnchorRect;
-        if (!IsPointInInferredPanelRect(pt.X, pt.Y, anchorRect)) return;
-        _legacyOpenTtlMs = PanelClickGraceTtlMs;
-        _legacyTabShownTicks = Environment.TickCount64;
-        ArmTailVerify();
-        Log("panel area mousedown inside inferred rect: anchor TTL → grace (legacy)");
+            if (_disposed || UserActionGen != generation || generation <= Volatile.Read(ref _dismissedActionGeneration)) return;
+            try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(host, panel, button)); }
+            catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
+        });
     }
 
     private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1807,6 +2065,44 @@ public class QqPanelWatcher : IDisposable
             {
                 var s = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                 var msg = wParam.ToInt32();
+                if (msg == WM_LBUTTONUP && s.dwExtraInfo != NativeInput.InputMarker)
+                {
+                    lock (_buttonGestureGate)
+                    {
+                        _lastButtonMouseUpPoint = s.pt;
+                        _lastButtonMouseUpTicks = Environment.TickCount64;
+                        if (_buttonOpenPending)
+                        {
+                            _buttonOpenPending = false;
+                            if (!IsEmojiButtonClick(s.pt, out _))
+                            {
+                                OptimisticClosePanel("opening button gesture released elsewhere");
+                                return IntPtr.Zero;
+                            }
+                        }
+                    }
+                }
+                if ((s.flags & 3) != 0)
+                {
+                    if (s.dwExtraInfo == NativeInput.InputMarker && msg == WM_LBUTTONDOWN)
+                    {
+                        _lastInjectedClickPt = s.pt;
+                        Volatile.Write(ref _lastInjectedClickTicks, Environment.TickCount64);
+                    }
+                    if (s.dwExtraInfo != NativeInput.InputMarker && msg == WM_LBUTTONDOWN
+                        && !IsEmojiButtonClick(s.pt, out _) && PixelFallbackEligible(s.pt))
+                    {
+                        var candidate = s.pt;
+                        var gestureAt = Environment.TickCount64;
+                        _ = Task.Run(() => PixelFallbackOpen(candidate, gestureAt));
+                    }
+                    // Accessibility tools can click the actual toolbar button too. Only
+                    // independently validated button input can toggle; arbitrary injected
+                    // input must never manufacture editor evidence or an opening gesture.
+                    if (s.dwExtraInfo == NativeInput.InputMarker
+                        || (msg is not (WM_LBUTTONDOWN or WM_LBUTTONUP))
+                        || !IsEmojiButtonClick(s.pt, out _)) return IntPtr.Zero;
+                }
 
                 if (msg == WM_LBUTTONDOWN)
                 {
@@ -1818,9 +2114,9 @@ public class QqPanelWatcher : IDisposable
                     if (IsEmojiButtonClick(s.pt, out var rectNow))
                     {
                         _emojiBtnRect = rectNow; // 跟随窗口当前位置刷新：合成锚点/close-q 点按不再陈旧
-                        if (_legacyMode)
+                        if (IsLegacyWindow(_emojiBtnHwnd))
                         {
-                            if (_panelOpen || Volatile.Read(ref CoexistPanelShowing) == 1)
+                            if (_panelOpen || _optimisticPending || Volatile.Read(ref CoexistPanelShowing) == 1)
                             {
                                 // 旧版语义：面板开着时点按钮 = toggle 关闭。锚 TTL 砍到关闭证据级并保持尾迹，
                                 // 让"开着"状态尽快解除（否则无轮询/无事件时过期永不被发现，状态卡死，
@@ -1832,7 +2128,7 @@ public class QqPanelWatcher : IDisposable
                                 // 把面板重新锚定、随后又无人关闭（2026-10-05 "双击后面板很久不收"）。
                                 _legacyOpenTtlMs = LegacyCloseEvidenceTtlMs;
                                 _legacyTabShownTicks = Environment.TickCount64;
-                                _legacyAnchorRect = new Rect(s.pt.X - 16, s.pt.Y - 16, 32, 32);
+                                if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
                                 _closePending = true;
                                 Volatile.Write(ref _legacyOptimisticCloseUntil, Environment.TickCount64 + 1000);
                                 BumpUserAction();
@@ -1849,22 +2145,20 @@ public class QqPanelWatcher : IDisposable
                                 _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
                                 _legacyTabShownTicks = Environment.TickCount64;
                                 _legacyTabHwnd = hwnd;
-                                _legacyAnchorRect = new Rect(s.pt.X - 16, s.pt.Y - 16, 32, 32);
+                                _legacyButtonOpenLatched = true;
+                                if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
                                 var crect = _lastPanelRectHwnd == hwnd ? _lastPanelRect : Rect.Empty;
                                 _optimisticPending = true;
+                                _buttonOpenPending = true;
                                 ArmTailVerify();
                                 BumpUserAction();
                                 Volatile.Write(ref _lastHookFireTicks, Environment.TickCount64);
                                 Log($"mouse hook: emoji button clicked (optimistic, resolvedRect={rectNow}, cachedRect={crect})");
-                                Task.Run(() =>
-                                {
-                                    try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hwnd, crect, rectNow)); }
-                                    catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
-                                });
+                                PublishOptimisticOpen(hwnd, crect, rectNow);
                                 _ = VerifyWithOpenRetriesAsync();
                             }
                         }
-                        else if (_panelOpen || Volatile.Read(ref CoexistPanelShowing) == 1)
+                        else if (_panelOpen || _optimisticPending || Volatile.Read(ref CoexistPanelShowing) == 1)
                         {
                             // 新版 toggle 关闭：QQ 在 mouse-up 才动作，先记 pending 等 mouseup 也落在
                             // 按钮上（完整点击）再乐观关闭——按住拖走（aborted click）QQ 不 toggle。
@@ -1883,24 +2177,14 @@ public class QqPanelWatcher : IDisposable
                             var hwnd = _emojiBtnHwnd;
                             var crect = _lastPanelRectHwnd == hwnd ? _lastPanelRect : Rect.Empty;
                             _optimisticPending = true;
+                            _buttonOpenPending = true;
                             ArmTailVerify();
                             BumpUserAction();
                             Volatile.Write(ref _lastHookFireTicks, Environment.TickCount64);
                             Log($"mouse hook: emoji button clicked (optimistic, resolvedRect={rectNow}, cachedRect={crect})");
-                            Task.Run(() =>
-                            {
-                                try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(hwnd, crect, rectNow)); }
-                                catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
-                            });
+                            PublishOptimisticOpen(hwnd, crect, rectNow);
                             _ = VerifyWithOpenRetriesAsync();
                         }
-                    }
-                    else if (PanelAreaClickCandidate(s.pt))
-                    {
-                        // 面板开着时点击 QQ 窗口内非按钮区域：X 关闭/表情发送/面板内点击的
-                        // 关闭候选。纯事件驱动的盲区（不经过按钮、焦点不进编辑框、透明隐藏
-                        // 不派发结构事件）——此前这类关闭全靠锚 TTL 自然过期，快捷面板滞留。
-                        OnPanelAreaMouseDown(s.pt);
                     }
                     else if (PixelFallbackEligible(s.pt))
                     {
@@ -1908,7 +2192,8 @@ public class QqPanelWatcher : IDisposable
                         // 焦点命中永不出现、按钮矩形缓存永远建不起来）。钩子线程只做廉价资格审查，
                         // 截屏 + 模板匹配放后台——LL 钩子回调里任何慢操作都会拖累全系统鼠标。
                         var ptPx = s.pt;
-                        Task.Run(() => PixelFallbackOpen(ptPx));
+                        var gestureAt = Environment.TickCount64;
+                        Task.Run(() => PixelFallbackOpen(ptPx, gestureAt));
                     }
                 }
                 else if (msg == WM_LBUTTONUP && _closePending)
@@ -1923,7 +2208,7 @@ public class QqPanelWatcher : IDisposable
             }
             catch { }
         }
-        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        return IntPtr.Zero; // The owning message pump always forwards the hook chain.
     }
 
     // --- a11y 树休眠回退：像素模板识别表情按钮（配套 Services/EmojiButtonTemplate.cs）---
@@ -1939,20 +2224,19 @@ public class QqPanelWatcher : IDisposable
     /// 模板缺失/缩放不符时 Available=false，行为与无回退时完全一致。</summary>
     private bool PixelFallbackEligible(POINT pt)
     {
-        if (!_legacyMode) return false;
         if (!EmojiButtonTemplate.Available) return false;
         if (_emojiBtnHwnd != IntPtr.Zero && TryResolveEmojiButtonRect(out _)) return false; // 树恢复或上次像素匹配已重建缓存：常规三重校验路径接住
         if (_qqPids.Count == 0) return false;
         var root = RootWindowFromPoint(pt);
         if (root == IntPtr.Zero) return false;
         GetWindowThreadProcessId(root, out var pid);
-        return _qqPids.Contains((int)pid);
+        return _qqPids.Contains((int)pid) && _capabilities.IsLegacy((int)pid);
     }
 
     /// <summary>休眠回退的打开路径（后台线程）：点击点邻域模板匹配 → 重建按钮几何缓存（与焦点命中
     /// 路径同一组字段、同一写序）→ 复用钩子旧版乐观打开链路（锚/尾迹/验证/事件逐行同构）。
     /// 不进 UIA：一次 GDI 屏幕读取（模板+2×半径 见方）+ 有早退的 SAD 搜索，毫秒级。</summary>
-    private void PixelFallbackOpen(POINT pt)
+    private void PixelFallbackOpen(POINT pt, long gestureAt)
     {
         if (Interlocked.Exchange(ref _pixelWorker, 1) == 1) return;
         try
@@ -1971,27 +2255,29 @@ public class QqPanelWatcher : IDisposable
                 }
                 return;
             }
-            _emojiBtnRect = rect;
-            _emojiBtnHwnd = root;
-            _emojiBtnPid = (int)pid;
-            _emojiBtnRectRel = ToWindowRelative(root, rect);
-            // —— 以下与 MouseHookProc 旧版乐观打开分支逐行同构 ——
-            _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
-            _legacyTabShownTicks = Environment.TickCount64;
-            _legacyTabHwnd = root;
-            _legacyAnchorRect = new Rect(pt.X - 16, pt.Y - 16, 32, 32);
-            var crect = _lastPanelRectHwnd == root ? _lastPanelRect : Rect.Empty;
-            _optimisticPending = true;
-            ArmTailVerify();
-            BumpUserAction();
-            Volatile.Write(ref _lastHookFireTicks, Environment.TickCount64);
-            Log($"pixel fallback: emoji button matched rect={rect}, optimistic open (pixel anchor, a11y-independent)");
-            Task.Run(() =>
+            lock (_buttonGestureGate)
             {
-                try { EmojiButtonClicked?.Invoke(this, new QqPanelEventArgs(root, crect, rect)); }
-                catch (Exception ex) { Log("optimistic open failed: " + ex.Message); }
-            });
-            _ = VerifyWithOpenRetriesAsync();
+                if (_lastButtonMouseUpTicks >= gestureAt && !rect.Contains(new Point(_lastButtonMouseUpPoint.X, _lastButtonMouseUpPoint.Y)))
+                    return; // Recognition finished after a cancelled click; do not publish an open.
+                _buttonOpenPending = _lastButtonMouseUpTicks < gestureAt;
+                _emojiBtnRect = rect;
+                _emojiBtnHwnd = root;
+                _emojiBtnPid = (int)pid;
+                _emojiBtnRectRel = ToWindowRelative(root, rect);
+                _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
+                _legacyTabShownTicks = Environment.TickCount64;
+                _legacyTabHwnd = root;
+                _legacyButtonOpenLatched = true;
+                if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
+                var crect = _lastPanelRectHwnd == root ? _lastPanelRect : Rect.Empty;
+                _optimisticPending = true;
+                ArmTailVerify();
+                BumpUserAction();
+                Volatile.Write(ref _lastHookFireTicks, Environment.TickCount64);
+                Log($"pixel fallback: emoji button matched rect={rect}, optimistic open (pixel anchor, a11y-independent)");
+                PublishOptimisticOpen(root, crect, rect);
+                _ = VerifyWithOpenRetriesAsync();
+            }
             if (!_pixelFallbackOpenedLogged)
             {
                 _pixelFallbackOpenedLogged = true;
@@ -2036,6 +2322,9 @@ public class QqPanelWatcher : IDisposable
     private static extern short GetAsyncKeyState(int vKey);
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")]
@@ -2096,33 +2385,11 @@ public class QqPanelWatcher : IDisposable
     private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO gui);
 
     [DllImport("user32.dll")]
-    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-    [DllImport("user32.dll")]
-    private static extern int GetSystemMetrics(int nIndex);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct INPUT
-    {
-        public uint type;
-        public MOUSEINPUT mi;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MOUSEINPUT
-    {
-        public int dx;
-        public int dy;
-        public uint mouseData;
-        public uint dwFlags;
-        public uint time;
-        public IntPtr dwExtraInfo;
-    }
-
-    [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hwnd);
 }

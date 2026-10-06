@@ -60,7 +60,7 @@ public class AppConfig
     // 孤儿处理策略：0=仅标记 1=同步删除 2=挪入图库
     public int QqSyncStrategy { get; set; } = 0;
 
-    // emoji.db 密钥（16 字符，官方脚本提取；QQ 大版本更新后可能失效需重新引导）
+    // emoji.db 密钥的 DPAPI CurrentUser 密文（QQ 大版本更新后可能失效需重新引导）
     public string QqDbKey { get; set; } = "";
 
     // 排序模式（图库 / 快捷面板各自独立）：0=前 N 张最近置顶+其余热度，1=全部热度，2=全部按名称
@@ -71,8 +71,7 @@ public class AppConfig
     public int RecentPinnedCount { get; set; } = 5;
 
     // ———— AI 视觉标签建议（用户自备 API Key，见设置 → AI 识别）————
-    // Key 明文存本机 config.json（与 QqDbKey 同口径），不上传任何服务器
-    public string AiTagApiKey { get; set; } = "";
+    // Key 只在 AiKeyProfiles 中以 DPAPI CurrentUser 密文保存；草稿 Key 不落盘。
 
     // 服务商 id：auto=按 Key 前缀自动识别；其余见 AiTagService.Providers
     public string AiTagProvider { get; set; } = "auto";

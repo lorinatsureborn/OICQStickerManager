@@ -4,8 +4,9 @@ namespace OICQStickerManager.Models;
 public class QqAccountScanResult
 {
     public string Uin { get; set; } = "";
+    public string AccountDirectory { get; set; } = "";
 
-    /// <summary>personal_emoji\Ori 目录；该账号从未收藏过表情时为空串。</summary>
+    /// <summary>personal_emoji\Ori 目录；首次收藏前可以尚未存在。</summary>
     public string OriDir { get; set; } = "";
 
     public int StickerCount { get; set; }

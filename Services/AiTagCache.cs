@@ -24,20 +24,22 @@ public static class AiTagCache
     private static readonly SemaphoreSlim WriteLock = new(1, 1);
     private static Dictionary<string, AiTagCacheEntry>? _entries;
     private static bool _dirty;
+    private static string? _loadedPath;
+    private static Task _pendingSave = Task.CompletedTask;
 
     /// <summary>缓存上限：LRU 按时间淘汰，防无限增长。</summary>
     private const int MaxEntries = 2000;
 
-    public static string FilePath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-        "OICQStickerManager", "ai-tag-cache.json");
+    public static string FilePath => Path.Combine(AppDataDirectory.Root, "ai-tag-cache.json");
 
     public static string CacheKey(Models.StickerModel sticker) =>
         string.IsNullOrEmpty(sticker.Md5) ? "path:" + sticker.FullPath.ToLowerInvariant() : "md5:" + sticker.Md5;
 
     private static Dictionary<string, AiTagCacheEntry> Load()
     {
-        if (_entries != null) return _entries;
+        var path = FilePath;
+        if (_entries != null && _loadedPath == path) return _entries;
+        _loadedPath = path;
         try
         {
             if (File.Exists(FilePath))
@@ -75,7 +77,6 @@ public static class AiTagCache
     /// <summary>写入/覆盖一条缓存并异步落盘（fire-and-forget 安全：写锁串行化 + 原子替换）。</summary>
     public static void Put(string key, IReadOnlyList<string> tags, string providerId, string model)
     {
-        List<Task>? pending;
         lock (Gate)
         {
             var store = Load();
@@ -89,9 +90,8 @@ public static class AiTagCache
             };
             _dirty = true;
             if (store.Count > MaxEntries) EvictOldest(store);
-            pending = SaveIfDirtyCore();
+            _ = SaveIfDirtyCore();
         }
-        if (pending != null) Task.WhenAll(pending).ContinueWith(_ => { }, TaskScheduler.Default);
     }
 
     public static void Remove(string key)
@@ -105,7 +105,7 @@ public static class AiTagCache
     /// <summary>测试与退出清理用：等落盘完成。</summary>
     public static Task FlushAsync()
     {
-        lock (Gate) { var t = SaveIfDirtyCore(); return t == null ? Task.CompletedTask : Task.WhenAll(t); }
+        lock (Gate) { return SaveIfDirtyCore(); }
     }
 
     public static void ResetForTests()
@@ -114,6 +114,7 @@ public static class AiTagCache
         {
             _entries = new Dictionary<string, AiTagCacheEntry>(StringComparer.Ordinal);
             _dirty = false;
+            _loadedPath = FilePath;
         }
     }
 
@@ -124,32 +125,35 @@ public static class AiTagCache
             store.Remove(k);
     }
 
-    /// <summary>锁内调用。有脏数据则启动落盘；返回进行中的写任务（无则 null）。</summary>
-    private static List<Task>? SaveIfDirtyCore()
+    /// <summary>锁内调用。有脏数据则按序启动落盘，返回全部已排队写入的完成任务。</summary>
+    private static Task SaveIfDirtyCore()
     {
-        if (!_dirty) return null;
+        if (!_dirty) return _pendingSave;
         _dirty = false;
         var snapshot = new Dictionary<string, AiTagCacheEntry>(Load(), StringComparer.Ordinal);
-        return new List<Task> { SaveCoreAsync(snapshot) };
+        var path = FilePath;
+        _pendingSave = _pendingSave.ContinueWith(_ => SaveCoreAsync(path, snapshot),
+            CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
+        return _pendingSave;
     }
 
-    private static async Task SaveCoreAsync(Dictionary<string, AiTagCacheEntry> snapshot)
+    private static async Task SaveCoreAsync(string path, Dictionary<string, AiTagCacheEntry> snapshot)
     {
         try
         {
-            var dir = Path.GetDirectoryName(FilePath)!;
+            var dir = Path.GetDirectoryName(path)!;
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
             var json = JsonSerializer.Serialize(snapshot);
-            await WriteLock.WaitAsync();
+            await WriteLock.WaitAsync().ConfigureAwait(false);
             try
             {
-                var tmp = FilePath + ".tmp";
-                await File.WriteAllTextAsync(tmp, json);
+                var tmp = path + ".tmp";
+                await File.WriteAllTextAsync(tmp, json).ConfigureAwait(false);
                 await Task.Run(() =>
                 {
-                    try { if (File.Exists(FilePath)) File.Copy(FilePath, FilePath + ".bak", overwrite: true); } catch { }
-                    File.Move(tmp, FilePath, overwrite: true);
-                });
+                    try { if (File.Exists(path)) File.Copy(path, path + ".bak", overwrite: true); } catch { }
+                    File.Move(tmp, path, overwrite: true);
+                }).ConfigureAwait(false);
             }
             finally { WriteLock.Release(); }
         }

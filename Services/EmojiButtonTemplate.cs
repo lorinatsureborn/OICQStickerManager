@@ -38,7 +38,7 @@ internal static class EmojiButtonTemplate
 
     private sealed class Data
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public double Scale { get; set; } = 1.0;  // 采集时按钮所在窗口的 DPI 缩放（96 = 100%）
         public int Size { get; set; }             // 模板边长（物理像素，正方形）
         public string? QQVersion { get; set; }
@@ -57,7 +57,7 @@ internal static class EmojiButtonTemplate
     private static int _capturing;
 
     private static string StorePath() =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "OICQStickerManager", FileName);
+        Path.Combine(AppDataDirectory.Root, FileName);
 
     /// <summary>磁盘上是否存在可用模板（懒加载一次；钩子线程每击调用，必须零 IO）。</summary>
     public static bool Available
@@ -86,22 +86,32 @@ internal static class EmojiButtonTemplate
 
     /// <summary>树激活路径的顺带采集：按钮矩形缓存建立时调用（后台线程）。同一 DPI 缩放只存一份，
     /// 已存在即跳过；中心点被其他窗口覆盖时放弃（截到别家像素的模板比没有更糟）。</summary>
-    public static void CaptureFromScreen(IntPtr hwnd, Rect absButtonRect, string qqVersion)
+    public static void CaptureFromScreen(IntPtr hwnd, Rect absButtonRect, string qqVersion, bool force = false)
     {
         if (Interlocked.Exchange(ref _capturing, 1) == 1) return;
         try
         {
             var _ = Available; // 确保磁盘状态已知（决定是否需要采集）
             var scale = GetWindowScale(hwnd);
-            if (_disk != null && Math.Abs(_disk.Scale - scale) < 0.01) return; // 该缩放已有模板
+            if (!force && _disk?.Version >= 2 && Math.Abs(_disk.Scale - scale) < 0.01) return;
             int size = Math.Clamp((int)Math.Ceiling(24 * scale) + 16, 40, 72);
             int cx = (int)(absButtonRect.Left + absButtonRect.Width / 2);
             int cy = (int)(absButtonRect.Top + absButtonRect.Height / 2);
+            var region = new Rect(cx - size / 2, cy - size / 2, size, size);
+            // A hover/click cursor can be composited into the GDI capture. Wait for
+            // the user to leave; never move their pointer just to collect a template.
+            long until = Environment.TickCount64 + 5000;
+            while (GetCursorPos(out var cursor) && !CursorClearOfTemplate(region, new(cursor.X, cursor.Y), scale))
+            {
+                if (Environment.TickCount64 >= until) return;
+                Thread.Sleep(100);
+            }
             // 中心点必须仍在宿主窗口上（按钮可见）：被快捷面板/其他窗口盖住就放弃本次采集
             var hit = WindowFromPoint(new POINT { X = cx, Y = cy });
             if (hit != IntPtr.Zero && GetAncestor(hit, GA_ROOT) != hwnd) return;
             var px = CaptureScreenPixels(cx, cy, size, out var stride);
             if (px == null) return;
+            if (GetCursorPos(out var after) && !CursorClearOfTemplate(region, new(after.X, after.Y), scale)) return;
             var data = new Data
             {
                 Scale = scale,
@@ -127,13 +137,20 @@ internal static class EmojiButtonTemplate
         finally { Volatile.Write(ref _capturing, 0); }
     }
 
+    internal static bool CursorClearOfTemplate(Rect region, Point cursor, double scale)
+    {
+        if (region.IsEmpty || !double.IsFinite(scale) || scale <= 0) return false;
+        region.Inflate(64 * scale, 64 * scale);
+        return !region.Contains(cursor);
+    }
+
     /// <summary>休眠回退匹配：点击点邻域找按钮模板。命中返回模板尺寸的绝对矩形（物理像素）。
     /// 零 UIA；一次 GDI 屏幕读取（模板+2×半径 见方）+ 带安全剪枝的 SAD 搜索，毫秒级。</summary>
     public static bool TryMatch(int clickX, int clickY, IntPtr rootHwnd, out Rect matched)
     {
         matched = Rect.Empty;
         if (!Available) return false;
-        Data disk;
+        Data? disk;
         lock (Gate) { disk = _disk; }
         if (disk?.PngBase64 == null) return false;
         var scale = GetWindowScale(rootHwnd);
@@ -150,15 +167,13 @@ internal static class EmojiButtonTemplate
 
         SearchBest(tpl, buf, region, stride, out var best, out var bx, out var by);
         if (bx < 0 || best > XorThreshold) return false;
-        int cx = rx + region / 2 - s / 2 + bx + s / 2;
-        int cy = ry + region / 2 - s / 2 + by + s / 2;
-        matched = new Rect(cx - s / 2.0, cy - s / 2.0, s, s);
+        matched = new Rect(rx + bx, ry + by, s, s);
         return true;
     }
 
     /// <summary>二值形状全搜（±SearchRadius）：模板与候选各自相对背景中位色二值化，输出最小异或距离
-    /// 与模板左上偏移（可为负）。哨兵用 bestX&lt;0 且仅在未找到时设置（匹配位置常在点击点左侧，
-    /// 拿负 offset 当"未找到"会把正确命中当失败丢弃——实测教训）。剪枝：距离只增不减，已超
+    /// 与模板在采样区域内的左上坐标（非负）。bestX&lt;0 仅表示未找到。
+    /// 剪枝：距离只增不减，已超
     /// 当前最优的部分候选可放弃。</summary>
     private static void SearchBest(Scaled tpl, byte[] region, int regionSize, int stride, out double bestScore, out int bestX, out int bestY)
     {
@@ -197,7 +212,7 @@ internal static class EmojiButtonTemplate
                 if (complete && mismatch < bestMismatch)
                 {
                     bestMismatch = mismatch;
-                    bestX = dx; bestY = dy;
+                    bestX = rxc; bestY = ry;
                     found = true;
                 }
             }
@@ -215,7 +230,7 @@ internal static class EmojiButtonTemplate
         var img = new byte[w * h * 4];
         frame.CopyPixels(img, w * 4, 0);
         var _ = Available; // 确保磁盘模板已加载
-        Data disk;
+        Data? disk;
         lock (Gate) { disk = _disk; }
         if (disk?.PngBase64 == null) return "NO TEMPLATE (load " + StorePath() + " first)";
         // 目标缩放取模板自身：自测的是匹配核心（1:1），不是跨 DPI 缩放
@@ -235,14 +250,15 @@ internal static class EmojiButtonTemplate
                 int sy = cy - region / 2 + y;
                 if (sy < 0 || sy >= h) continue;
                 int sx = cx - region / 2;
-                int copyW = Math.Min(region, w - Math.Max(0, sx));
-                if (copyW <= 0) continue;
                 int srcX = Math.Max(0, sx);
                 int dstX = srcX - sx;
+                int copyW = Math.Min(region - dstX, w - srcX);
+                if (copyW <= 0) continue;
                 Buffer.BlockCopy(img, (sy * w + srcX) * 4, buf, (y * region + dstX) * 4, copyW * 4);
             }
             SearchBest(tpl, buf, region, region * 4, out var score, out var bx, out var by);
-            sb.AppendLine($"click=({cx},{cy}) xor={score:F3} offset=({bx},{by}) => {(score <= XorThreshold ? "HIT" : "miss")}");
+            int centerOffset = region / 2 - s / 2;
+            sb.AppendLine($"click=({cx},{cy}) xor={score:F3} offset=({bx - centerOffset},{by - centerOffset}) => {(score <= XorThreshold ? "HIT" : "miss")}");
         }
         return sb.ToString();
     }
@@ -401,6 +417,7 @@ internal static class EmojiButtonTemplate
     private struct BITMAPINFO { public BITMAPINFOHEADER bmiHeader; public int bmiColors; }
 
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(POINT pt);
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT point);
     [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] private static extern int GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr h);

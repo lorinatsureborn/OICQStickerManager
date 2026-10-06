@@ -26,6 +26,7 @@ public class GlassWindow : Window
     private bool _themeHooked;
     private BlurTile?[] _tiles = Array.Empty<BlurTile?>();
     private bool _tilesReady;
+    private bool _opaqueFallback;
 
     /// <summary>窗口级圆角（DIP）。仅 Win10 三拼片路线使用；Win11 用系统半径。</summary>
     public double WindowCornerRadiusDip { get; set; } = 16;
@@ -89,6 +90,16 @@ public class GlassWindow : Window
     private void OnThemeChangedRespray(object? sender, EventArgs e)
     {
         foreach (var tile in _tiles) tile?.ApplyAccent();
+        if (_opaqueFallback || _tiles.Any(t => t != null && !t.AccentAvailable)) ApplyOpaqueFallback();
+    }
+
+    private void ApplyOpaqueFallback()
+    {
+        _opaqueFallback = true;
+        foreach (var tile in _tiles) tile?.Dispose();
+        _tiles = Array.Empty<BlurTile?>();
+        var color = (Application.Current?.TryFindResource("GlassOverlayBrush") as SolidColorBrush)?.Color ?? SystemColors.WindowColor;
+        Resources["GlassOverlayBrush"] = GlassMaterial.CreateBrush(color, false);
     }
 
     /// <summary>内容裁剪成圆角矩形：滚动内容/贴边元素不会捅出圆角。最大化时转直角。</summary>
@@ -118,7 +129,10 @@ public class GlassWindow : Window
         for (int i = 0; i < _tiles.Length; i++)
         {
             // 先建在屏幕外，RepositionTiles 会立刻摆到位
-            _tiles[i] = BlurTile.Create(-20000, -20000, 1, 1, BlurTilesTopmost, round: RoundedTiles);
+            try { _tiles[i] = SystemParameters.IsRemoteSession ? null : BlurTile.Create(-20000, -20000, 1, 1, BlurTilesTopmost, round: RoundedTiles); }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or DllNotFoundException or EntryPointNotFoundException)
+            { QqPanelWatcher.Log("blur unavailable: " + ex.GetType().Name); }
+            if (_tiles[i] == null) { ApplyOpaqueFallback(); return; }
         }
         RepositionTiles();
         SyncTileVisibility();
@@ -172,12 +186,11 @@ public class GlassWindow : Window
         var source = PresentationSource.FromVisual(this);
         if (source?.CompositionTarget == null) return false;
         double scale = source.CompositionTarget.TransformToDevice.M11;
-        if (double.IsNaN(Left) || double.IsNaN(Top)) return false; // CenterScreen 落位前跳过
-
-        left = (int)Math.Round(Left * scale);
-        top = (int)Math.Round(Top * scale);
-        w = (int)Math.Round((ActualWidth > 0 ? ActualWidth : Width) * scale);
-        h = (int)Math.Round((ActualHeight > 0 ? ActualHeight : Height) * scale);
+        if (!GetWindowRect(_hwnd, out var rect)) return false;
+        left = rect.Left;
+        top = rect.Top;
+        w = rect.Right - rect.Left;
+        h = rect.Bottom - rect.Top;
         // 圆角半径（物理 px）：边带与圆弧相切
         r = WindowState == WindowState.Maximized ? 0 : (int)Math.Round(WindowCornerRadiusDip * scale);
         return true;
@@ -188,6 +201,7 @@ public class GlassWindow : Window
         if (IsVisible && WindowState != WindowState.Minimized)
         {
             ShowTilesPinned(); // 原子显示+钉位（含摆位），已钉好的片重复调用无害
+            if (_tiles.Any(t => t != null && !t.AccentAvailable)) ApplyOpaqueFallback();
             RepinTiles();      // 兜底：把已显示的片再钉一次，防其他窗口滑进缝隙
         }
         else

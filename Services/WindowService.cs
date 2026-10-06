@@ -1,17 +1,13 @@
 ﻿using System.Collections.Specialized;
 using System.Runtime.InteropServices;
 using System.Windows;
-using System.Windows.Automation;
 
 namespace OICQStickerManager.Services;
 
 public class WindowService
 {
+    private readonly SendCoordinator _sender = new(new NativeSendEnvironment());
     // --- Windows 底层 API (P/Invoke) ---
-
-    // 模拟键盘按键（虽然 SendKeys 更简单，但底层更稳定）
-    [DllImport("user32.dll")]
-    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, uint dwExtraInfo);
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -22,135 +18,131 @@ public class WindowService
 
     public double DoubleClickTimeMs => GetDoubleClickTime();
 
-    private const byte VK_CONTROL = 0x11;
-    private const byte VK_V = 0x56;
-    private const uint KEYEVENTF_KEYUP = 0x0002;
-
     /// <summary>
     /// 主窗口发送：最小化自身让焦点回到上一个窗口，再模拟粘贴。
     /// 历史路径，焦点恢复依赖系统行为；快捷面板上线后保留兼容。
     /// </summary>
-    public async Task SendImageToActiveWindowAsync(string imagePath, bool restoreClipboard = true)
+    public Task<SendResult> SendImageToActiveWindowAsync(string imagePath, bool restoreClipboard = true)
     {
-        ClipboardCapture.Suppress = true; // 发送+恢复全程静默剪贴板捕获（M2），防止捕获自己
-        try
+        var main = Application.Current.MainWindow;
+        var mainHwnd = new System.Windows.Interop.WindowInteropHelper(main).Handle;
+        var target = CapturePreviousTarget(mainHwnd);
+        var foreground = GetForegroundWindow();
+        return _sender.SendAsync(target, imagePath, restoreClipboard, async () =>
         {
-            IDataObject? backup = restoreClipboard ? CaptureClipboardSnapshot() : null;
-
-            if (!await TryCopyFileToClipboardAsync(imagePath)) return;
-
-            // 最小化让焦点自动回到上一个窗口（QQ/微信）
-            var currentWindow = Application.Current.MainWindow;
-            currentWindow.WindowState = WindowState.Minimized;
-
-            await Task.Delay(300); // 给系统一点切换窗口的时间
-
-            SimulateCtrlV();
-            await RestoreClipboardAfterDelayAsync(backup);
-        }
-        finally { ClipboardCapture.Suppress = false; }
+            if (GetForegroundWindow() != foreground && !FocusRootIsQq(target.Hwnd)) return false;
+            main.WindowState = WindowState.Minimized;
+            await Task.Delay(300);
+            return true;
+        });
     }
 
     /// <summary>
     /// 快捷面板发送（热键模式）：面板是非激活窗口，焦点从未离开目标应用，
     /// 直接把粘贴动作发给当前前台窗口即可，落点确定、无需等待切换。
     /// </summary>
-    public async Task QuickPasteToForegroundAsync(string imagePath, bool restoreClipboard = true)
-    {
-        ClipboardCapture.Suppress = true;
-        try
-        {
-            IDataObject? backup = restoreClipboard ? CaptureClipboardSnapshot() : null;
-
-            if (!await TryCopyFileToClipboardAsync(imagePath)) return;
-
-            SimulateCtrlV();
-            await RestoreClipboardAfterDelayAsync(backup);
-        }
-        finally { ClipboardCapture.Suppress = false; }
-    }
+    public Task<SendResult> QuickPasteToForegroundAsync(string imagePath, bool restoreClipboard = true)
+        => _sender.SendAsync(CaptureTarget(GetForegroundWindow()), imagePath, restoreClipboard, () => Task.FromResult(true));
 
     /// <summary>
     /// 快捷面板发送（QQ 共存模式）：QQ 原生表情面板打开时，聊天输入框会失焦（焦点停在表情按钮/面板搜索框上），
-    /// 直接粘贴会落空。因此先把 QQ 窗口拉回前台，再把焦点还给聊天输入框（ProseMirror 编辑器），然后粘贴。
-    /// QQ 表情面板全程保持打开。
+    /// 直接粘贴会落空。因此确认目标 QQ 仍在前台，再把焦点还给聊天输入框（ProseMirror 编辑器），然后粘贴。
+    /// 旧版 QQ 先关闭原生面板，再等待焦点编排平息；新版通过编辑区点击收起面板。
     /// IME 兼容（搜狗实测 2026-10-02 探针 D:\AsukaProbe）：焦点恢复必须以「放置插入符的点击」完成，绝不能用
     /// UIA SetFocus——UIA 焦点只设置 activeElement 不放置插入符，搜狗对编辑区做布局查询（GetTextExt）
     /// 拿不到光标矩形，候选框回退锚定屏幕边缘，且该毒化不可自愈（点击/换焦点/重启搜狗都救不回，
     /// 只能重启 QQ），用户发送一次表情后打字就全程跑屏边。
     /// 点击形态：首选向渲染子窗投递鼠标消息（用户无感、光标不动），未生效才退回 SendInput 真实点击
     /// （光标会动一下，仅此兜底）。点击顺带让 QQ 原生面板光灭（light-dismiss），无需 invoke 表情按钮
-    /// （toggle 时序有重开风险）。两级落点失败时只粘贴不抢焦点并记日志。
+    /// （toggle 时序有重开风险）。旧版必须确认到新的编辑焦点才允许粘贴。
     /// </summary>
-    public async Task<bool> CoexistPasteAsync(IntPtr qqHwnd, string imagePath, bool restoreClipboard = true)
+    public async Task<SendResult> CoexistPasteAsync(IntPtr qqHwnd, string imagePath, bool restoreClipboard = true)
     {
-        ClipboardCapture.Suppress = true;
-        try
+        var target = CaptureTarget(qqHwnd);
+        long closeGeneration = QqPanelWatcher.UserActionGen;
+        long interaction = QqCoexistLifetime.LastInteractionTicks;
+        long editorVerifiedAt = 0;
+        bool CanContinue() => FocusRootIsQq(qqHwnd)
+            && QqPanelWatcher.UserActionGen == closeGeneration
+            && QqCoexistLifetime.LastInteractionTicks == interaction;
+        var result = await _sender.SendAsync(target, imagePath, restoreClipboard, async () =>
         {
-            IDataObject? backup = restoreClipboard ? CaptureClipboardSnapshot() : null;
-
-            // 1. QQ 拉回前台（对后台窗口操作会静默失效，必须先前台化）
-            SetForegroundWindow(qqHwnd);
-            await Task.Delay(150);
+            if (!CanContinue()) return false;
 
             // 1.5 旧版先收起 QQ 原生面板再点编辑框：这代 QQ 的面板光灭回收会把焦点从编辑框
             // 抢回表情按钮（2026-10-04 实测：编辑框点击后 35ms 焦点即被抢回，Ctrl+V 落空）——
             // 先关面板就没有光灭，编辑框焦点稳。新版 QQ 光灭不抢焦点，保持原时序。
-            if (QqPanelWatcher.LegacyScanMode)
+            if (QqPanelWatcher.IsLegacyWindow(qqHwnd))
             {
-                bool invoked = QqPanelWatcher.TryCloseQqPanelNow();
+                bool invoked = await Task.Run(() => QqPanelWatcher.TryCloseQqPanelNow(qqHwnd));
                 QqPanelWatcher.Log(invoked ? "coexist: qq panel closed before editor focus" : "coexist: qq panel not open/closable, continue");
                 // 等 QQ 收面板的焦点编排平息：QQ 会在 ~0.8s 内连续回摆焦点（按钮→标签→编辑框→
                 // 按钮，实测 18:23），过早点编辑框会被随后的回摆覆盖——表情不落框的根因。
                 // 以"QQ 焦点事件静默 300ms"为准，上限 1.5s，之后留 120ms 余量。
                 var waitStart = Environment.TickCount64;
-                while (Environment.TickCount64 - waitStart < 1500 && !QqPanelWatcher.QqFocusQuiescent(300))
-                    await Task.Delay(60);
-                await Task.Delay(120);
+                await WaitForFocusSettlementAsync(() => Environment.TickCount64,
+                    () => QqPanelWatcher.LastQqFocusTicks, milliseconds => Task.Delay(milliseconds));
                 QqPanelWatcher.Log($"coexist: focus choreography settled in {Environment.TickCount64 - waitStart} ms");
             }
+            if (!CanContinue()) return false;
 
             // 2. 焦点还给聊天输入框：只允许真实鼠标点击（IME 安全）。定位串失配时退化为窗口相对启发点，
             //    仍然是真实点击——绝不退回 UIA SetFocus（会毒化搜狗候选框锚定且不可自愈）
-            bool clicked = await Task.Run(() => TryClickFocusEditor(qqHwnd));
+            long sendFocusStarted = Environment.TickCount64;
+            bool clicked = await RestoreEditorFocusAsync(() => Task.Run(() => TryClickFocusEditor(qqHwnd, sendFocusStarted, CanContinue)),
+                    CanContinue,
+                    () => WaitForFocusSettlementAsync(() => Environment.TickCount64,
+                        () => QqPanelWatcher.LastQqFocusTicks, milliseconds => Task.Delay(milliseconds)));
             QqPanelWatcher.Log(clicked ? "focus: editor clicked (IME-safe)" : "focus: click paths exhausted (gate on pre-paste focus check)");
-            if (!clicked && QqPanelWatcher.LegacyScanMode)
+            if (!clicked)
             {
                 // legacy：编辑框焦点找回失败 = 插入符没回到输入框（粘贴必落空或错位）。
                 // 宁可取消并提示，不静默粘到按钮/面板上（用户实测"焦点不回输入框，表情没上屏"）
                 QqPanelWatcher.Log("send aborted: editor focus not restored (no caret)");
                 return false;
             }
-            await Task.Delay(250);
+            editorVerifiedAt = Environment.TickCount64;
+            await Task.Delay(100);
 
             // 2.5 粘贴前最后闸门：Ctrl+V 永远落在本时刻的键盘焦点窗口上。前面校验+等待的秒级空档里
             // 用户切走窗口的话，粘贴会打进别的应用（2026-10-04 实测：发送卡顿期间切窗，表情进了其他软件）。
             // 此时剪贴板尚未写入，取消发送零副作用——错发到别的应用比不发严重得多。
-            if (!FocusRootIsQq(qqHwnd))
+            if (!CanContinue())
             {
                 QqPanelWatcher.Log("send aborted before paste: keyboard focus left QQ");
                 return false;
             }
 
-            if (!await TryCopyFileToClipboardAsync(imagePath)) return true; // 复制失败：未粘贴，无错发风险
-
-            SimulateCtrlV();
-
-            // 3. 尽力关 QQ 原生表情面板：点击编辑框通常已让它光灭，但 watcher 需 ~0.5s 确认关闭状态，
-            //    立刻 invoke 会在 _panelOpen 还是 true 时把面板 toggle 重开——延迟到确认窗之后，还开着才点。
-            //    generation 守卫：若这 800ms 内用户又按了表情按钮（新一轮操作），绝不能把人家刚打开的面板关掉
-            long closeGen = QqPanelWatcher.UserActionGen;
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(800);
-                QqPanelWatcher.TryCloseQqPanel(closeGen);
-            });
-
-            await RestoreClipboardAfterDelayAsync(backup);
             return true;
-        }
-        finally { ClipboardCapture.Suppress = false; }
+        }, () => CanContinue() && EditorFocusStillVerified(QqPanelWatcher.IsLegacyWindow(qqHwnd),
+            QqPanelWatcher.EditorFocusEchoTicks(qqHwnd), QqPanelWatcher.LastQqFocusTicks, editorVerifiedAt));
+        return result;
     }
+
+    internal static async Task WaitForFocusSettlementAsync(Func<long> now, Func<long> lastFocus, Func<int, Task> delay)
+    {
+        var start = now();
+        while (now() - start < 1500
+            && (now() - start < 600 || now() - Math.Max(start, lastFocus()) < 300))
+            await delay(60);
+        await delay(120);
+    }
+
+    internal static async Task<bool> RestoreEditorFocusAsync(Func<Task<bool>> click, Func<bool> canContinue, Func<Task> settle)
+    {
+        if (!canContinue()) return false;
+        if (await click()) return canContinue();
+        if (!canContinue()) return false;
+        QqPanelWatcher.Log("focus: cold editor recovery, settle and retry once");
+        await settle();
+        return canContinue() && await click() && canContinue();
+    }
+
+    internal static bool TryGuardedFocusClick(Func<bool> canContinue, Func<bool> click)
+        => canContinue() && click() && canContinue();
+
+    internal static bool EditorFocusStillVerified(bool legacy, long editorEcho, long lastFocus, long verifiedAt)
+        => editorEcho > 0 ? editorEcho >= lastFocus : !legacy && verifiedAt > 0 && lastFocus <= verifiedAt;
 
     /// <summary>
     /// 真实点击 QQ 聊天输入框，归还焦点并放置插入符（IME 锚定源），顺带让 QQ 原生面板光灭。
@@ -158,14 +150,15 @@ public class WindowService
     /// 中心点会点到功能条上；② UIA 不可用（树休眠/定位串失配）时按窗口几何取启发点
     /// （水平 62%、距底 6%——NTQQ 输入区恒在聊天窗口右下）。两级都是真实点击。
     /// 每次点击前经 WindowFromPoint 遮挡检查；点后轮询焦点校验（Chromium 焦点传播是异步的，
-    /// 冷启动可达数百 ms，读不到不等于没点上）——键盘焦点若已回到 QQ 窗口即信任点击；
+    /// 冷启动可达数百 ms，读不到不等于没点上）——必须确认焦点属于聊天编辑框；
     /// 校验期间绝不退回 UIA SetFocus（毒化搜狗锚定，见类注释）。
     /// </summary>
-    private static bool TryClickFocusEditor(IntPtr qqHwnd)
+    private static bool TryClickFocusEditor(IntPtr qqHwnd, long sendFocusStarted = 0, Func<bool>? canContinue = null)
     {
+        bool Click(Func<bool> action) => TryGuardedFocusClick(canContinue ?? (() => FocusRootIsQq(qqHwnd)), action);
         // ⓪ legacy：优先用焦点事件缓存的输入框矩形（免费且精确——用户点过/编辑过输入框即有缓存）。
         //    剪枝树上 UIA 定位全树扫 ~0.8s、窗口几何启发点随布局可能落偏，都是"焦点不回输入框"的祸源。
-        if (QqPanelWatcher.LegacyScanMode && QqPanelWatcher.TryGetCachedEditorRect(qqHwnd, out var cachedEditor))
+        if (QqPanelWatcher.TryGetCachedEditorRect(qqHwnd, out var cachedEditor))
         {
             try
             {
@@ -174,19 +167,20 @@ public class WindowService
                     X = (int)(cachedEditor.Left + cachedEditor.Width / 2),
                     Y = (int)(cachedEditor.Bottom - Math.Min(25, cachedEditor.Height / 4))
                 };
-                if (IsPointOnQq(editorPt, qqHwnd) && SendClickAndVerify(editorPt, qqHwnd)) return true;
+                if (IsPointOnQq(editorPt, qqHwnd) && Click(() => SendClickAndVerify(editorPt, qqHwnd, sendFocusStarted))) return true;
             }
             catch { /* 缓存矩形失效（窗口变动/元素重建），走下面的通用路径 */ }
         }
 
         // ① UIA 精确定位。旧版剪枝树跳过：全树扫描实测 ~0.8s（2026-10-04 发送卡顿主项之一），
         //    且剪枝树上元素矩形本身不可靠——直接走窗口几何启发点（输入区恒在窗口右下）。
-        var editor = QqPanelWatcher.LegacyScanMode ? null : FindEditorElement(qqHwnd);
-        if (editor != null)
+        var editorRect = QqPanelWatcher.IsLegacyWindow(qqHwnd) ? Rect.Empty
+            : QqUiaWorker.QueryAsync("editor", qqHwnd).GetAwaiter().GetResult()?.Rect?.ToRect() ?? Rect.Empty;
+        if (!editorRect.IsEmpty)
         {
             try
             {
-                var r = editor.Current.BoundingRectangle;
+                var r = editorRect;
                 if (r.Width >= 10 && r.Height >= 10)
                 {
                     var pt = new NativePoint
@@ -199,8 +193,8 @@ public class WindowService
                         // 首选隐形点击：向渲染子窗直接投递鼠标消息（光标不动，用户无感），
                         // Chromium 输入管线照常放置插入符，搜狗锚定与真实点击一致；
                         // 消息点击未生效再退回真实点击兜底（光标会动一下，落点已校验）。
-                        if (MessageClickAndVerify(pt, qqHwnd)) return true;
-                        if (SendClickAndVerify(pt, qqHwnd)) return true;
+                        if (Click(() => MessageClickAndVerify(pt, qqHwnd, sendFocusStarted))) return true;
+                        if (Click(() => SendClickAndVerify(pt, qqHwnd, sendFocusStarted))) return true;
                     }
                 }
             }
@@ -221,14 +215,14 @@ public class WindowService
             };
             if (IsPointOnQq(pt, qqHwnd))
             {
-                if (QqPanelWatcher.LegacyScanMode)
+                if (QqPanelWatcher.IsLegacyWindow(qqHwnd))
                 {
-                    if (SendClickAndVerify(pt, qqHwnd)) return true;
+                    if (Click(() => SendClickAndVerify(pt, qqHwnd, sendFocusStarted))) return true;
                 }
                 else
                 {
-                    if (MessageClickAndVerify(pt, qqHwnd)) return true;
-                    if (SendClickAndVerify(pt, qqHwnd)) return true;
+                    if (Click(() => MessageClickAndVerify(pt, qqHwnd, sendFocusStarted))) return true;
+                    if (Click(() => SendClickAndVerify(pt, qqHwnd, sendFocusStarted))) return true;
                 }
             }
         }
@@ -243,7 +237,7 @@ public class WindowService
     /// 渲染层放置插入符并通知 TSF——搜狗锚定行为与物理点击一致（2026-10-02 实测）。
     /// 仅当窗口已在前台/焦点已在 QQ 时使用（共存发送即如此）；发送后轮询焦点校验。
     /// </summary>
-    private static bool MessageClickAndVerify(NativePoint pt, IntPtr qqHwnd)
+    private static bool MessageClickAndVerify(NativePoint pt, IntPtr qqHwnd, long sendFocusStarted = 0)
     {
         try
         {
@@ -270,7 +264,7 @@ public class WindowService
             Thread.Sleep(40);
             PostMessage(target, WM_LBUTTONUP, IntPtr.Zero, lp);
 
-            bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, clickAt);
+            bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, sendFocusStarted > 0 ? sendFocusStarted : clickAt);
             GetCursorPos(out var after);
             if (verified)
             {
@@ -287,53 +281,56 @@ public class WindowService
     }
 
     /// <summary>真实点击兜底：SendInput 物理点击（光标会移动），仅当消息点击未生效时使用。</summary>
-    private static bool SendClickAndVerify(NativePoint pt, IntPtr qqHwnd)
+    private static bool SendClickAndVerify(NativePoint pt, IntPtr qqHwnd, long sendFocusStarted = 0)
     {
         GetCursorPos(out var saved);
         long clickAt = Environment.TickCount64;
-        SendClickAt(pt);
+        if (!SendClickAt(pt)) return false;
         SetCursorPos(saved.X, saved.Y);
-        bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, clickAt);
+        bool verified = PollFocusVerified(qqHwnd, out bool focusInQq, sendFocusStarted > 0 ? sendFocusStarted : clickAt);
         // legacy：焦点根==QQ 不再单独作为通过条件——焦点停在表情按钮/面板标签上时同样成立，
-        // 正是"表情没上屏"的形态。必须有"晚于本次点击"的编辑框回声（PollFocusVerified legacy 分支）。
-        return QqPanelWatcher.LegacyScanMode ? verified : (verified || focusInQq);
+        // 正是"表情没上屏"的形态。编辑框回声须晚于本轮恢复开始，重试时仍有效。
+        return verified;
     }
 
-    // 轮询焦点校验：确认到编辑器即成功；没确认到但键盘焦点已在 QQ 窗口内也信任点击
-    // （插入符在点击瞬间已由 Chromium 放置，UIA 读数只是滞后）；焦点彻底不在 QQ 才判失败
+    // 探测耗时也计入总截止时间，不能给每次跨进程查询重新分配完整超时。
     private static int waitedLog;
 
     private static bool PollFocusVerified(IntPtr qqHwnd, out bool focusInQq, long echoAfterTicks = 0)
     {
         focusInQq = false;
-        for (int waited = 0; waited < 600; waited += 100)
+        long start = Environment.TickCount64;
+        bool verified = PollEditorFocus(remaining =>
         {
-            Thread.Sleep(100);
+            if (!FocusRootIsQq(qqHwnd)) return false;
+            if (EditorEchoBelongsToSend(QqPanelWatcher.EditorFocusEchoTicks(qqHwnd), echoAfterTicks,
+                QqPanelWatcher.LastQqFocusTicks)) return true;
+            if (QqPanelWatcher.IsLegacyWindow(qqHwnd)) return false;
             try
             {
-                var f = AutomationElement.FocusedElement;
-                if (f != null && (f.Current.ClassName ?? "").Contains("ExEditor"))
-                {
-                    waitedLog = waited + 100;
-                    return true;
-                }
+                return QqUiaWorker.QueryAsync("focus", timeout: TimeSpan.FromMilliseconds(remaining))
+                    .GetAwaiter().GetResult()?.Value == true && FocusRootIsQq(qqHwnd);
             }
-            catch { }
-            // 旧版剪枝树：FocusedElement 类名不可读（实测只回窗口根）、系统 caret 恒为零值
-            // （Chromium 这代不维护），两者都做不了正向证据。有效信号是 watcher 的"编辑框焦点
-            // 回声"：必须晚于本次点击的派发时刻——QQ 收面板编排也会产生编辑框形态的焦点事件，
-            // 不加此时效会把陈旧回声错当本次点击的成果（实测 18:23 假通过→粘贴落空）。
-            if (QqPanelWatcher.LegacyScanMode && FocusRootIsQq(qqHwnd)
-                && QqPanelWatcher.EditorFocusEchoTicks() > echoAfterTicks)
-            {
-                waitedLog = waited + 100;
-                return true;
-            }
-        }
-        waitedLog = 600;
+            catch { return false; }
+        }, () => Environment.TickCount64, Thread.Sleep, 1000);
+        waitedLog = (int)Math.Min(int.MaxValue, Environment.TickCount64 - start);
         focusInQq = FocusRootIsQq(qqHwnd);
+        return verified;
+    }
+
+    internal static bool PollEditorFocus(Func<int, bool> probe, Func<long> now, Action<int> delay, int timeoutMs)
+    {
+        long start = now();
+        while (now() - start < timeoutMs)
+        {
+            delay((int)Math.Min(100, timeoutMs - (now() - start)));
+            int remaining = (int)Math.Max(0, timeoutMs - (now() - start));
+            if (remaining > 0 && probe(remaining)) return true;
+        }
         return false;
     }
+    internal static bool EditorEchoBelongsToSend(long echo, long sendStarted, long lastFocus) =>
+        echo > 0 && echo > sendStarted && echo >= lastFocus;
 
     /// <summary>键盘焦点所在的根窗口是否为 qqHwnd（GUITHREADINFO，本地调用零跨进程成本）。</summary>
     private static bool FocusRootIsQq(IntPtr qqHwnd)
@@ -357,10 +354,11 @@ public class WindowService
         GetWindowThreadProcessId(hit, out var pid);
         if (pid == (uint)Environment.ProcessId)
         {
-            foreach (System.Windows.Window w in System.Windows.Application.Current.Windows)
+            Application.Current.Dispatcher.Invoke(() =>
             {
-                if (w is Views.QuickPanelWindow qp && qp.IsVisible) { qp.Hide(); break; }
-            }
+                foreach (Window w in Application.Current.Windows)
+                    if (w is Views.QuickPanelWindow qp && qp.IsVisible) { qp.Hide(); break; }
+            });
             hit = WindowFromPoint(pt);
             if (GetAncestor(hit, GA_ROOT) == qqHwnd)
             {
@@ -372,66 +370,21 @@ public class WindowService
         return false;
     }
 
-    /// <summary>定位聊天输入框元素。类名带动态后缀（聚焦时追加 ProseMirror-focused、新旧版词序还会变），
-    /// 精确匹配命中即回（最廉价），失配再全树 contains 兜底（CacheRequest 一次带回类名，不逐元素跨进程读）。</summary>
-    private static AutomationElement? FindEditorElement(IntPtr qqHwnd)
-    {
-        var root = AutomationElement.FromHandle(qqHwnd);
-        var editor = root.FindFirst(TreeScope.Descendants,
-            new PropertyCondition(AutomationElement.ClassNameProperty, "ProseMirror ExEditor-qq-msg-editor is-empty"));
-        if (editor != null) return editor;
-        var cache = new CacheRequest();
-        cache.Add(AutomationElement.ClassNameProperty);
-        using (cache.Activate())
-        {
-            var all = root.FindAll(TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
-            foreach (AutomationElement e in all)
-            {
-                string? cls = null;
-                try { cls = e.Cached.ClassName; } catch { }
-                if (cls != null && cls.Contains("ExEditor-qq-msg-editor")) return e;
-            }
-        }
-        return null;
-    }
-
-    private static void SendClickAt(NativePoint pt)
-    {
-        int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);
-        int vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-        var move = new INPUT { type = 0 };
-        move.mi = new MOUSEINPUT { dx = (pt.X - vx) * 65536 / vw, dy = (pt.Y - vy) * 65536 / vh, dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK };
-        var down = new INPUT { type = 0 };
-        down.mi = new MOUSEINPUT { dwFlags = MOUSEEVENTF_LEFTDOWN };
-        var up = new INPUT { type = 0 };
-        up.mi = new MOUSEINPUT { dwFlags = MOUSEEVENTF_LEFTUP };
-        SendInput(1, new[] { move }, Marshal.SizeOf<INPUT>());
-        Thread.Sleep(60);
-        SendInput(1, new[] { down }, Marshal.SizeOf<INPUT>());
-        Thread.Sleep(40);
-        SendInput(1, new[] { up }, Marshal.SizeOf<INPUT>());
-    }
+    private static bool SendClickAt(NativePoint pt) => NativeInput.TryClick(pt.X, pt.Y);
 
     // 写入 FileDropList（剪贴板是争用资源，被占用时重试几次）
-    private async Task<bool> TryCopyFileToClipboardAsync(string imagePath)
+    private static bool TryCopyFileToClipboard(string imagePath)
     {
         var data = new DataObject();
         var fileList = new StringCollection { imagePath };
         data.SetFileDropList(fileList);
 
-        for (int i = 0; i < 3; i++)
+        try
         {
-            try
-            {
-                Clipboard.SetDataObject(data, true);
-                return true;
-            }
-            catch (COMException)
-            {
-                await Task.Delay(100);
-            }
+            Clipboard.SetDataObject(data, true);
+            return true;
         }
-        return false;
+        catch (COMException) { return false; }
     }
 
     // 备份当前剪贴板全部可读格式（best-effort：个别格式读不出就放弃该格式）
@@ -457,22 +410,42 @@ public class WindowService
         catch { return null; }
     }
 
-    // 等目标应用完成粘贴读取后再恢复剪贴板
-    private async Task RestoreClipboardAfterDelayAsync(IDataObject? backup)
+    private static SendTarget CaptureTarget(IntPtr hwnd)
     {
-        if (backup == null) return;
-        await Task.Delay(1000);
-        try { Clipboard.SetDataObject(backup, true); }
-        catch { /* 恢复失败保持现状，不提示 */ }
+        GetWindowThreadProcessId(hwnd, out var pid);
+        return new(hwnd, pid);
     }
 
-    private static void SimulateCtrlV()
+    private static SendTarget CapturePreviousTarget(IntPtr mainHwnd)
     {
-        keybd_event(VK_CONTROL, 0, 0, 0);
-        keybd_event(VK_V, 0, 0, 0);
-        keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+        for (var hwnd = GetWindow(mainHwnd, 2); hwnd != IntPtr.Zero; hwnd = GetWindow(hwnd, 2))
+        {
+            var target = CaptureTarget(hwnd);
+            if (target.ProcessId != (uint)Environment.ProcessId && IsWindowVisible(hwnd)
+                && (GetWindowLong(hwnd, -20) & (0x08000000 | 0x80)) == 0) return target;
+        }
+        return default;
     }
+
+    private sealed class NativeSendEnvironment : ISendEnvironment
+    {
+        public bool IsValid(SendTarget target) => target.Hwnd != IntPtr.Zero && IsWindow(target.Hwnd)
+            && CaptureTarget(target.Hwnd) == target && target.ProcessId != (uint)Environment.ProcessId;
+        public bool IsFocused(SendTarget target) => IsValid(target) && FocusRootIsQq(target.Hwnd);
+        public IDataObject? CaptureClipboard() => CaptureClipboardSnapshot();
+        public uint ClipboardSequence => GetClipboardSequenceNumber();
+        public bool TryWriteFile(string path) => TryCopyFileToClipboard(path);
+        public void RestoreClipboard(IDataObject backup) => Clipboard.SetDataObject(backup, true);
+        public bool TryPaste(SendTarget target) => IsFocused(target) && NativeInput.TryPaste();
+        public Task DelayAsync(int milliseconds) => Task.Delay(milliseconds);
+    }
+
+    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+    [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hwnd, int index);
 
     // --- 真实点击注入（共存发送的焦点恢复，见 CoexistPasteAsync 注释） ---
 
@@ -482,23 +455,6 @@ public class WindowService
         public int X;
         public int Y;
     }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
-
-    [StructLayout(LayoutKind.Explicit)]
-    private struct INPUT
-    {
-        [FieldOffset(0)] public int type;
-        [FieldOffset(8)] public MOUSEINPUT mi;
-        [FieldOffset(8)] public KEYBDINPUT ki;
-    }
-
-    private const uint MOUSEEVENTF_MOVE = 0x0001, MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
-    private const uint MOUSEEVENTF_ABSOLUTE = 0x8000, MOUSEEVENTF_VIRTUALDESK = 0x4000;
 
     [DllImport("user32.dll")]
     private static extern IntPtr WindowFromPoint(NativePoint pt);
@@ -513,12 +469,6 @@ public class WindowService
 
     [DllImport("user32.dll")]
     private static extern bool SetCursorPos(int x, int y);
-
-    [DllImport("user32.dll")]
-    private static extern uint SendInput(uint count, INPUT[] inputs, int size);
-
-    [DllImport("user32.dll")]
-    private static extern int GetSystemMetrics(int index);
 
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);

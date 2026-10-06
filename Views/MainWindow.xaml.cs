@@ -26,6 +26,10 @@ namespace OICQStickerManager.Views
     /// </summary>
     public partial class MainWindow : GlassWindow
     {
+        private readonly CancellationTokenSource _lifetime = new();
+        private Task<string?>? _keyHelperTask;
+        private Task? _watcherStateTask;
+        private bool _keyFlowRunning;
         public MainWindow()
         {
             InitializeComponent();
@@ -94,6 +98,12 @@ namespace OICQStickerManager.Views
                         // QQ 页镜像增删会刷新计数文本，顺带维护空状态
                         if (vm.IsQqTabActive) Dispatcher.Invoke(() => UpdateQqEmptyState(vm.CurrentQqService));
                     }
+                    else if (e.PropertyName is nameof(MainViewModel.AiSelectedProvider)
+                        or nameof(MainViewModel.AiDraftVerified) or nameof(MainViewModel.AiTagModel)
+                        or nameof(MainViewModel.AiTagEffort) or nameof(MainViewModel.AiKeyProfilesView))
+                    {
+                        QueueAiSettingsRefresh();
+                    }
                 }; // ← 修正：+= 事件挂接没有括号，此前误写为 "});"（另一会话遗留笔误）
 
                 vm.QqImportCompleted += (imported, duplicates, unsupported) =>
@@ -124,11 +134,8 @@ namespace OICQStickerManager.Views
                 _ = RunStartupNoticesAsync();
 
                 // 深度同步开着但密钥还没拿到 → 静默续抓（等下次 QQ 登录）
-                if (DataContext is MainViewModel vmResume) vmResume.ResumeKeyWatcherIfPending();
+                _ = ResumeAfterInitializationAsync();
 
-                // 深度同步开着且密钥在手 → 启动补跑一次对账（角标是运行时状态，
-                // 此前只有打开开关那一刻对账，重启后真实残留零角标——2026-10-02 用户实测）
-                if (DataContext is MainViewModel vmSync) _ = vmSync.RunStartupReconcileIfDueAsync();
             });
 
             // 发送表情会最小化窗口；窗口失焦时收起 GIF 预览并停止计时，避免残留
@@ -610,6 +617,7 @@ namespace OICQStickerManager.Views
             }
             else if (msg == ClipboardCapture.WM_CLIPBOARDUPDATE)
             {
+                _clipboardGuard.Invalidate();
                 // 剪贴板更新去抖：部分应用一次复制会连写两次
                 _clipboardDebounce ??= NewClipboardDebounce();
                 _clipboardDebounce.Stop();
@@ -652,8 +660,8 @@ namespace OICQStickerManager.Views
         private Thread? _clipboardWorker;
         private long _clipboardWorkerStartMs;
         private bool _clipboardPending;
-        private int _clipboardProbeSeq;  // 探测序号：UI 侧只认最新结果，防两次探测乱序回放陈旧内容
-        private int _clipboardSeenSeq;
+        private int _clipboardWorkerGeneration;
+        private readonly ClipboardProbeGuard _clipboardGuard = new();
 
         private void KickClipboardWorker()
         {
@@ -664,7 +672,8 @@ namespace OICQStickerManager.Views
                 if (w != null && w.IsAlive && Environment.TickCount64 - _clipboardWorkerStartMs < 10_000)
                     return; // 上次探测还在正常跑：合并本轮（完成时会看见 pending 再跑一遍）
                 _clipboardWorkerStartMs = Environment.TickCount64;
-                _clipboardWorker = new Thread(ClipboardWorkerLoop)
+                int generation = ++_clipboardWorkerGeneration;
+                _clipboardWorker = new Thread(() => ClipboardWorkerLoop(generation))
                 {
                     IsBackground = true,
                     Name = "AsukaClipboard",
@@ -674,24 +683,30 @@ namespace OICQStickerManager.Views
             }
         }
 
-        private void ClipboardWorkerLoop()
+        private void ClipboardWorkerLoop(int generation)
         {
             while (true)
             {
-                lock (_clipboardGate) _clipboardPending = false;
-                try { ProbeClipboard(); }
+                ClipboardProbeGuard.Ticket ticket;
+                lock (_clipboardGate)
+                {
+                    if (generation != _clipboardWorkerGeneration || _lifetime.IsCancellationRequested) return;
+                    _clipboardPending = false;
+                    ticket = _clipboardGuard.Capture(GetClipboardSequenceNumber());
+                }
+                try { ProbeClipboard(ticket); }
                 catch { /* 剪贴板被占用/无图等，吞掉本轮 */ }
                 lock (_clipboardGate)
                 {
-                    if (!_clipboardPending) return;
+                    if (generation != _clipboardWorkerGeneration || !_clipboardPending || _lifetime.IsCancellationRequested) return;
                     _clipboardWorkerStartMs = Environment.TickCount64; // 还有活，给本线程续期
                 }
             }
         }
 
-        private sealed record ClipboardProbe(int Seq, string Path, bool IsTemp, string Sig, string? Md5Hex);
+        private sealed record ClipboardProbe(ClipboardProbeGuard.Ticket Ticket, string Path, bool IsTemp, string Sig, string? Md5Hex);
 
-        private void ProbeClipboard()
+        private void ProbeClipboard(ClipboardProbeGuard.Ticket ticket)
         {
             var data = Clipboard.GetDataObject();
             if (data == null) return;
@@ -731,7 +746,7 @@ namespace OICQStickerManager.Views
                 if (sig == _lastClipboardSig) return; // 内容没变：不再落临时文件
                 var dir = Path.Combine(Path.GetTempPath(), "asuka-capture");
                 Directory.CreateDirectory(dir);
-                path = Path.Combine(dir, $"clip-{DateTime.Now:yyyyMMdd-HHmmss-fff}.png");
+                path = Path.Combine(dir, $"clip-{Guid.NewGuid():N}.png");
                 File.WriteAllBytes(path, pngBytes);
                 isTemp = true;
                 md5Hex = sig[2..];
@@ -739,40 +754,46 @@ namespace OICQStickerManager.Views
             else return;
 
             if (path == null) return;
-            var probe = new ClipboardProbe(
-                Interlocked.Increment(ref _clipboardProbeSeq), path, isTemp, sig, md5Hex);
-            Dispatcher.BeginInvoke(() => FinishClipboardProbe(probe));
+            var probe = new ClipboardProbe(ticket, path, isTemp, sig, md5Hex);
+            if (_lifetime.IsCancellationRequested || !_clipboardGuard.CanPublish(ticket, GetClipboardSequenceNumber()))
+            { DeleteProbeTemp(probe); return; }
+            try { Dispatcher.BeginInvoke(() => FinishClipboardProbe(probe)); }
+            catch { DeleteProbeTemp(probe); }
         }
 
         // UI 线程收尾：图库对账（集合只许 UI 线程碰）与去重落定、弹提示。
         // 哈希失败（文件被独占锁住等）不拦截提示，沿用原语义。
         private void FinishClipboardProbe(ClipboardProbe probe)
         {
-            if (probe.Seq <= _clipboardSeenSeq) return; // 乱序的陈旧结果
-            _clipboardSeenSeq = probe.Seq;
-            if (DataContext is not MainViewModel vm) return;
-
-            // 内容级去重（2026-10-01 用户实测：部分应用会周期性重写相同剪贴板内容，
-            // 同一张图的入库提示反复弹）：
-            // ①已入库的图（MD5 与图库对账）直接静默，复制多少遍都不再提示；
-            // ②与上一次提示过的内容相同也静默——除非期间它被删出图库（那时 MD5 对不上，会重新提示）
-            if (probe.Md5Hex != null && vm.Stickers.Any(s => s.Md5 == probe.Md5Hex))
+            bool shown = false;
+            try
             {
-                _lastClipboardSig = probe.Sig;
-                return;
-            }
-            if (probe.Sig == _lastClipboardSig) return;
-            _lastClipboardSig = probe.Sig;
+                if (_lifetime.IsCancellationRequested || !_clipboardGuard.CanPublish(probe.Ticket, GetClipboardSequenceNumber())) return;
+                if (DataContext is not MainViewModel vm || !vm.CaptureClipboardImages || _alertTcs != null) return;
 
-            ShowCaptureToast(probe.Path, probe.IsTemp);
+                if (probe.Md5Hex != null && vm.Stickers.Any(s => s.Md5 == probe.Md5Hex))
+                {
+                    _lastClipboardSig = probe.Sig;
+                    return;
+                }
+                if (probe.Sig == _lastClipboardSig) return;
+                _lastClipboardSig = probe.Sig;
+
+                shown = ShowCaptureToast(probe.Path, probe.IsTemp);
+            }
+            finally { if (!shown) DeleteProbeTemp(probe); }
         }
+
+        private static void DeleteProbeTemp(ClipboardProbe probe)
+        { if (probe.IsTemp) try { File.Delete(probe.Path); } catch { } }
+        [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
 
         // 上次提示过的内容签名：worker 线程（探测）与 UI 线程（收尾）都会读写，volatile 保证可见
         private volatile string? _lastClipboardSig;
 
         private ClipboardToastWindow? _captureToast;
 
-        private void ShowCaptureToast(string imagePath, bool isTemp)
+        private bool ShowCaptureToast(string imagePath, bool isTemp)
         {
             // 新捕获顶掉旧的（旧临时文件顺带清理）
             if (_captureToast != null)
@@ -784,7 +805,7 @@ namespace OICQStickerManager.Views
 
             ImageSource? thumb = null;
             try { thumb = LoadBitmapScaled(imagePath, 96); } catch { }
-            if (thumb == null) return;
+            if (thumb == null) return false;
 
             var durationSec = DataContext is MainViewModel vm ? vm.ToastDurationSeconds : 8;
             var toast = new ClipboardToastWindow(thumb, "复制了图片", durationSec * 1000);
@@ -800,6 +821,7 @@ namespace OICQStickerManager.Views
                 if (isTemp) TryDeleteCaptureFile(imagePath);
             };
             toast.Show();
+            return true;
         }
 
         private async Task HandleCaptureImportAsync(string imagePath, bool isTemp)
@@ -856,11 +878,12 @@ namespace OICQStickerManager.Views
             if (DataContext is not MainViewModel vm) return;
             bool enable = vm.EnableQqCoexistTrigger;
             bool polling = vm.EnableWatcherPolling;
-            Task.Run(async () =>
+            _watcherStateTask = Task.Run(async () =>
             {
                 await _watcherStateGate.WaitAsync();
                 try
                 {
+                    if (_lifetime.IsCancellationRequested) return;
                     if (enable)
                     {
                         _panelWatcher ??= CreatePanelWatcher();
@@ -889,33 +912,34 @@ namespace OICQStickerManager.Views
 
             watcher.PanelAppeared += (s, e) => Dispatcher.BeginInvoke(() =>
             {
+                if (_lifetime.IsCancellationRequested || !ReferenceEquals(_panelWatcher, watcher)) return;
+                var anchor = QqPanelWatcher.ResolveCoexistAnchor(e.PanelRect, e.EmojiButtonRect,
+                    QqPanelWatcher.WindowScale(e.HostHwnd), QqPanelWatcher.IsLegacyWindow(e.HostHwnd));
+                if (anchor.IsEmpty) return;
                 if (_quickPanel == null) _quickPanel = new QuickPanelWindow((MainViewModel)DataContext);
-                _quickPanel.OpenForCoexist(e.PanelRect, e.HostHwnd);
+                _quickPanel.OpenForCoexist(anchor, e.HostHwnd, e.EmojiButtonRect);
             });
 
-            // 按下 QQ 表情按钮的瞬间（乐观路径）：用缓存矩形立即打开，QQ 面板出现后 OpenForCoexist 会以真实矩形自校正；
-            // 矩形为 Empty 表示本会话还没见过面板位置——改用表情按钮矩形合成锚点（面板贴在按钮上方），
-            // 不能直接 return：首次点击没有锚会把面板定位到主屏左上角，用户看到的就是"第一次点不弹出"
+            // 已有真实面板矩形时立即打开；剪枝树才用旧版按钮几何回退。
+            // 新版首次打开等待 PanelAppeared 的实际边界，避免沿用旧版布局挡住 QQ 面板。
             watcher.EmojiButtonClicked += (s, e) => Dispatcher.BeginInvoke(() =>
             {
-                var anchor = e.PanelRect;
-                if (anchor == Rect.Empty)
-                {
-                if (e.EmojiButtonRect == Rect.Empty) return;
-                // QQ 原生面板标准尺寸与贴靠几何统一收口在 watcher（与旧版面板区域点击的矩形推断共用）
-                anchor = QqPanelWatcher.InferPanelRectFromAnchor(e.EmojiButtonRect);
-                }
+                if (_lifetime.IsCancellationRequested || !ReferenceEquals(_panelWatcher, watcher)) return;
+                var anchor = QqPanelWatcher.ResolveCoexistAnchor(e.PanelRect, e.EmojiButtonRect,
+                    QqPanelWatcher.WindowScale(e.HostHwnd), QqPanelWatcher.IsLegacyWindow(e.HostHwnd));
+                if (anchor.IsEmpty) return;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 if (_quickPanel == null) _quickPanel = new QuickPanelWindow((MainViewModel)DataContext);
-                _quickPanel.OpenForCoexist(anchor, e.HostHwnd);
+                _quickPanel.OpenForCoexist(anchor, e.HostHwnd, e.EmojiButtonRect);
                 QqPanelWatcher.Log($"optimistic panel shown in {sw.ElapsedMilliseconds} ms");
             });
 
             watcher.PanelDisappeared += (s, e) => Dispatcher.BeginInvoke(() =>
             {
+                if (_lifetime.IsCancellationRequested || !ReferenceEquals(_panelWatcher, watcher)) return;
                 // 仅收起共存模式打开的面板；热键打开的不受影响
                 QqPanelWatcher.Log($"disappeared handler: coexist={_quickPanel?.CoexistMode.ToString() ?? "<null>"}, visible={_quickPanel?.IsVisible.ToString() ?? "<null>"}");
-                if (_quickPanel != null && _quickPanel.CoexistMode) _quickPanel.HideSoft();
+                if (_quickPanel != null && _quickPanel.CoexistMode) _quickPanel.HideImmediately();
                 if (DataContext is MainViewModel vm) vm.SetQuickPanelCoexistTarget(IntPtr.Zero);
             });
 
@@ -945,6 +969,11 @@ namespace OICQStickerManager.Views
 
         protected override void OnClosed(EventArgs e)
         {
+            _lifetime.Cancel();
+            _clipboardGuard.Invalidate();
+            _clipboardDebounce?.Stop();
+            try { _keyHelperTask?.Wait(2000); } catch { }
+            try { _watcherStateTask?.Wait(2000); } catch { }
             _quickPanel?.Close();
             UnregisterHotKey(new WindowInteropHelper(this).Handle, HotKeyId);
             ClipboardCapture.Unregister(new WindowInteropHelper(this).Handle);
@@ -1227,6 +1256,7 @@ namespace OICQStickerManager.Views
         // 保存/关闭/重开编辑器时清空；已点选的从建议区消失
         private List<string> _aiSuggestions = new();
         private string _aiSuggestionsMeta = "";
+        private long _aiSuggestionGeneration;
 
         /// <summary>把 AI 建议接进当前打开的标签编辑器（过滤已选标签；来自缓存时附说明并亮出「重新识别」）。</summary>
         private void ApplyAiSuggestionsToEditor(AiTagResult result, bool fromCache)
@@ -1268,6 +1298,7 @@ namespace OICQStickerManager.Views
 
         private void ClearAiSuggestions()
         {
+            _aiSuggestionGeneration++;
             _aiSuggestions = new List<string>();
             _aiSuggestionsMeta = "";
             AiSuggestSection.Visibility = Visibility.Collapsed;
@@ -1353,14 +1384,17 @@ namespace OICQStickerManager.Views
             // 立即开编辑器（用户马上看到进行中状态），请求异步走
             ShowTagEditor(sticker);
             SetAiEditorBusy(true);
+            var generation = _aiSuggestionGeneration;
             try
             {
                 var (result, fromCache) = await vm.GetAiSuggestionsAsync(sticker);
+                if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return;
                 ApplyAiSuggestionsToEditor(result, fromCache);
                 vm.StatusText = "AI 标签建议已就绪，点击胶囊即可添加";
             }
             catch (AiTagException ex)
             {
+                if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return;
                 AiSuggestSection.Visibility = Visibility.Collapsed; // 空手而归时收起占位区
                 ShowAiFailureAlert(ex);
             }
@@ -1381,6 +1415,8 @@ namespace OICQStickerManager.Views
         {
             if (DataContext is not MainViewModel vm || _pendingStickers == null || _pendingStickers.Count == 0) return;
             if (_aiBusy) return; // 请求进行中：忽略重复点击（按钮已禁用，这里兜右键等旁路）
+            var generation = _aiSuggestionGeneration;
+            var stickers = _pendingStickers.ToList();
             if (!vm.AiTagConfigured)
             {
                 // 设置 sheet 在 Z 序上盖过标签编辑器（XAML 顺序），关掉设置即回到编辑继续，不丢已点标签
@@ -1389,22 +1425,22 @@ namespace OICQStickerManager.Views
                 return;
             }
 
-            if (_pendingStickers.Count > 3 && !forceRefresh && !AiTagCache.WouldAllHitCache(_pendingStickers))
+            if (stickers.Count > 3 && !forceRefresh && !AiTagCache.WouldAllHitCache(stickers))
             {
                 var ok = await ShowAlertAsync("批量 AI 识别",
-                    $"将为 {_pendingStickers.Count} 张图片分别调用 AI（约 {_pendingStickers.Count} 次请求，消耗 API 额度；已识别过的图走缓存、不重复计费），结果合并为整批候选标签。继续？",
+                    $"将为 {stickers.Count} 张图片分别调用 AI（约 {stickers.Count} 次请求，消耗 API 额度；已识别过的图走缓存、不重复计费），结果合并为整批候选标签。继续？",
                     "继续", cancel: "先不了");
-                if (!ok) return;
+                if (!ok || _aiSuggestionGeneration != generation) return;
             }
 
             SetAiEditorBusy(true);
-            var stickers = _pendingStickers.ToList();
             try
             {
                 if (stickers.Count == 1)
                 {
                     vm.StatusText = "AI 识别中…";
                     var (result, fromCache) = await vm.GetAiSuggestionsAsync(stickers[0], forceRefresh);
+                    if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return;
                     ApplyAiSuggestionsToEditor(result, fromCache);
                     vm.StatusText = "AI 标签建议已就绪，点击胶囊即可添加";
                 }
@@ -1444,7 +1480,7 @@ namespace OICQStickerManager.Views
                             var total = tasks.Count;
                             _ = Dispatcher.BeginInvoke(() =>
                             {
-                                if (TagEditorOverlay.Visibility == Visibility.Visible)
+                                if (_aiSuggestionGeneration == generation && TagEditorOverlay.Visibility == Visibility.Visible)
                                 {
                                     AiSuggestMetaText.Text = $"AI 识别中 {d}/{total}…";
                                     vm.StatusText = $"AI 识别中 {d}/{total}…";
@@ -1455,7 +1491,7 @@ namespace OICQStickerManager.Views
                     });
                     await Task.WhenAll(tasks);
 
-                    if (TagEditorOverlay.Visibility != Visibility.Visible) return; // 期间编辑器被关掉：结果已进缓存
+                    if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return; // 已换图/关编辑器，结果仍进对应图片的缓存
                     if (union.Count == 0 && firstError != null) { ShowAiFailureAlert(firstError); return; }
                     ApplyAiSuggestionsToEditor(
                         new AiTagResult(union, source?.ProviderId ?? "", source?.Model ?? "", DateTime.Now), anyCache);
@@ -1466,6 +1502,7 @@ namespace OICQStickerManager.Views
             }
             catch (AiTagException ex)
             {
+                if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return;
                 ShowAiFailureAlert(ex);
             }
             finally
@@ -1477,7 +1514,19 @@ namespace OICQStickerManager.Views
         // ———— 设置页 · AI 识别 ————
 
         // 检测结果只对发起时的服务商有效：provider 变化即清空
-        private string? _lastAiProviderForDetected;
+        private (string Provider, string Key, string Url, string Profile)? _lastAiDiscoveryIdentity;
+        private bool _aiSettingsRefreshPending;
+
+        private void QueueAiSettingsRefresh()
+        {
+            if (_aiSettingsRefreshPending) return;
+            _aiSettingsRefreshPending = true;
+            Dispatcher.BeginInvoke(() =>
+            {
+                _aiSettingsRefreshPending = false;
+                RefreshAiSettingsUi();
+            });
+        }
 
         /// <summary>渲染已保存的 Key 档案行（点选激活 / 删除），并同步档案区与草稿提示的可见性。</summary>
         private void RefreshAiProfilesUi()
@@ -1519,10 +1568,9 @@ namespace OICQStickerManager.Views
                 });
                 var who = AiTagService.FindProvider(p.ProviderId)?.Name ?? p.ProviderId;
                 var model = p.Model.Length > 0 ? p.Model : AiTagService.FindProvider(p.ProviderId)?.DefaultModel ?? "默认模型";
-                var keyTail = p.ApiKey.Length > 10 ? " · ···" + p.ApiKey[^6..] : "";
                 info.Children.Add(new TextBlock
                 {
-                    Text = $"{who} · {model}{keyTail}",
+                    Text = $"{who} · {model}",
                     FontSize = 11,
                     Foreground = (Brush)FindResource("TextSecondaryBrush"),
                     TextTrimming = TextTrimming.CharacterEllipsis,
@@ -1608,9 +1656,15 @@ namespace OICQStickerManager.Views
         private string? _aiEditorProfileId; // 正在编辑的档案 Id；null = 添加新 Key
         private List<string>? _aiDraftDetected; // 草稿态（尚无档案）时的检测结果，建档时随档案入库
         private string? _aiProfileIdBeforeEdit; // 新建草稿前的激活档案 Id，取消编辑时恢复
+        private long _aiEditorGeneration;
+        private bool _aiChooseProvider;
 
         private void OpenAiEditor(string? profileId)
         {
+            _aiEditorGeneration++;
+            _aiChooseProvider = false;
+            _aiDraftDetected = null;
+            _lastAiDiscoveryIdentity = null;
             _aiEditorOpen = true;
             _aiEditorProfileId = profileId;
             if (DataContext is not MainViewModel vm) { RefreshAiSettingsUi(); return; }
@@ -1628,6 +1682,7 @@ namespace OICQStickerManager.Views
 
         private void CloseAiEditor()
         {
+            _aiEditorGeneration++;
             var wasNewDraft = _aiEditorOpen && _aiEditorProfileId == null;
             _aiEditorOpen = false;
             _aiEditorProfileId = null;
@@ -1646,10 +1701,35 @@ namespace OICQStickerManager.Views
 
         private void AiEditorClose_Click(object sender, RoutedEventArgs e) => CloseAiEditor();
 
+        private void AiChooseProvider_Click(object sender, RoutedEventArgs e)
+        {
+            CommitAiInputs();
+            _aiChooseProvider = true;
+            RefreshAiSettingsUi();
+        }
+
+        private void CommitAiInputs()
+        {
+            AiBaseUrlBox.GetBindingExpression(TextBox.TextProperty)?.UpdateSource();
+            AiModelBox.GetBindingExpression(TextBox.TextProperty)?.UpdateSource();
+        }
+
+        private bool _syncingAiKeyInput;
+        private void AiKeyBox_PasswordChanged(object sender, RoutedEventArgs e)
+        {
+            if (!_syncingAiKeyInput && DataContext is MainViewModel vm) vm.AiTagApiKey = AiKeyBox.Password;
+        }
+
         /// <summary>按当前配置渲染服务商/模型预设胶囊（设置页打开与配置变化时调用）。</summary>
         private void RefreshAiSettingsUi()
         {
             if (DataContext is not MainViewModel vm) return;
+            if (AiKeyBox.Password != vm.AiTagApiKey)
+            {
+                _syncingAiKeyInput = true;
+                try { AiKeyBox.Password = vm.AiTagApiKey; }
+                finally { _syncingAiKeyInput = false; }
+            }
             var chip = (Style)FindResource("ChipButtonStyle");
             var chipSel = (Style)FindResource("ChipSelectedButtonStyle");
 
@@ -1676,8 +1756,8 @@ namespace OICQStickerManager.Views
             // 阶段一：Key 已输入 → 显示识别出的厂商；识别不出才列全部芯片
             var knownProvider = vm.AiSelectedProvider; // auto 时按 Key 识别；手动选过则直接用
             var providerKnown = knownProvider != null;
-            AiProviderKnownSection.Visibility = providerKnown ? Visibility.Visible : Visibility.Collapsed;
-            if (providerKnown)
+            AiProviderKnownSection.Visibility = providerKnown && !_aiChooseProvider ? Visibility.Visible : Visibility.Collapsed;
+            if (knownProvider is not null)
             {
                 var autoLocked = vm.AiTagProvider != "auto"
                     && AiTagService.DetectProviderId(vm.AiTagApiKey) == vm.AiTagProvider;
@@ -1685,7 +1765,8 @@ namespace OICQStickerManager.Views
                 var model = vm.AiTagModel.Length > 0 ? vm.AiTagModel : knownProvider.DefaultModel;
                 AiProviderKnownText.Text = $"{knownProvider.Name}（{how}）· 默认模型 {model}";
             }
-            AiProviderPickSection.Visibility = providerKnown ? Visibility.Collapsed : Visibility.Visible;
+            AiProviderPickSection.Visibility = providerKnown && !_aiChooseProvider ? Visibility.Collapsed : Visibility.Visible;
+            AiModelConfigurationSection.Visibility = providerKnown ? Visibility.Visible : Visibility.Collapsed;
 
             // 阶段二：测试通过 → 展开模型/档位/保存
             AiVerifiedSection.Visibility = vm.AiDraftVerified ? Visibility.Visible : Visibility.Collapsed;
@@ -1693,15 +1774,17 @@ namespace OICQStickerManager.Views
                 ? "更新档案" : "保存为档案";
 
             // 检测结果面板：provider 变了就清（检测结果只对当时的 Key/服务商有效）
-            if (_lastAiProviderForDetected != vm.AiTagProvider)
+            var identity = (vm.AiTagProvider, vm.AiTagApiKey, vm.AiTagBaseUrl, vm.AiActiveProfileId);
+            if (_lastAiDiscoveryIdentity != identity)
             {
-                _lastAiProviderForDetected = vm.AiTagProvider;
+                _lastAiDiscoveryIdentity = identity;
+                _aiDraftDetected = null;
                 AiDetectedModelsPanel.Children.Clear();
                 AiDetectResultText.Visibility = Visibility.Collapsed;
                 AiDetectSection.Visibility = Visibility.Visible;
             }
             // 编辑档案时先展示该档案上次检测到的模型（免重测）
-            if (editingProfile != null && editingProfile.DetectedModels.Count > 0
+            if (editingProfile != null && vm.AiActiveProfileId == editingProfile.Id && editingProfile.DetectedModels.Count > 0
                 && AiDetectedModelsPanel.Children.Count == 0)
             {
                 var chipStyle = (Style)FindResource("ChipButtonStyle");
@@ -1716,13 +1799,13 @@ namespace OICQStickerManager.Views
 
             // 服务商芯片（仅识别不出时可见）
             AiProviderChipsPanel.Children.Clear();
-            if (!providerKnown)
+            if (!providerKnown || _aiChooseProvider)
             {
                 foreach (var p in AiTagService.Providers)
                 {
                     var id = p.Id;
                     AddChip(AiProviderChipsPanel, p.Name, p.Guide, vm.AiTagProvider == id,
-                        () => vm.AiTagProvider = id);
+                        () => { _aiChooseProvider = false; vm.AiTagProvider = id; });
                 }
             }
 
@@ -1768,7 +1851,9 @@ namespace OICQStickerManager.Views
         private async void AiDetectModels_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is not MainViewModel vm) return;
-            try { _ = vm.BuildAiTagOptions(); }
+            CommitAiInputs();
+            AiTagOptions opt;
+            try { opt = vm.BuildAiTagOptions(); }
             catch (AiTagException ex)
             {
                 _ = ShowAlertAsync("还不能检测", ex.Message, "知道了", showCancel: false);
@@ -1779,9 +1864,12 @@ namespace OICQStickerManager.Views
             AiDetectModelsButton.Content = "检测中…";
             AiDetectedModelsPanel.Children.Clear();
             AiDetectResultText.Visibility = Visibility.Collapsed;
+            var revision = vm.AiConfigRevision;
+            var generation = _aiEditorGeneration;
             try
             {
-                var models = await vm.FetchAiVisionModelsAsync();
+                var models = await vm.AiTag.ListVisionModelsAsync(opt);
+                if (vm.AiConfigRevision != revision || _aiEditorGeneration != generation) return;
                 if (vm.AiActiveProfileId.Length > 0) vm.UpdateActiveProfileDetectedModels(models);
                 else _aiDraftDetected = models; // 草稿态：检测结果随建档入库
                 var chip = (Style)FindResource("ChipButtonStyle");
@@ -1800,6 +1888,7 @@ namespace OICQStickerManager.Views
             }
             catch (AiTagException ex)
             {
+                if (vm.AiConfigRevision != revision || _aiEditorGeneration != generation) return;
                 AiDetectResultText.Text = ex.Message;
                 AiDetectResultText.Visibility = Visibility.Visible;
                 ShowAiFailureAlert(ex);
@@ -1807,7 +1896,7 @@ namespace OICQStickerManager.Views
             finally
             {
                 AiDetectModelsButton.IsEnabled = true;
-                AiDetectModelsButton.Content = "检测可用视觉模型";
+                AiDetectModelsButton.Content = "检测账号可用视觉模型…";
             }
         }
 
@@ -1816,6 +1905,7 @@ namespace OICQStickerManager.Views
         private async void AiTest_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is not MainViewModel vm) return;
+            CommitAiInputs();
             AiTagOptions opt;
             try { opt = vm.BuildAiTagOptions(); }
             catch (AiTagException ex)
@@ -1826,16 +1916,20 @@ namespace OICQStickerManager.Views
 
             AiTestButton.IsEnabled = false;
             AiTestButton.Content = "测试中…";
+            var revision = vm.AiConfigRevision;
+            var generation = _aiEditorGeneration;
             try
             {
                 var testImage = await BuildAiTestImageAsync();
                 var result = await vm.AiTag.SuggestTagsAsync(testImage, opt, Array.Empty<string>());
+                if (vm.AiConfigRevision != revision || _aiEditorGeneration != generation) return;
                 AiTagService.Log($"verify: key works, tags=[{string.Join(",", result.Tags)}]");
                 vm.MarkAiDraftVerified();
                 RefreshAiSettingsUi(); // 展开「可用模型 / 思考强度 / 保存」区
             }
             catch (AiTagException ex)
             {
+                if (vm.AiConfigRevision != revision || _aiEditorGeneration != generation) return;
                 ShowAiFailureAlert(ex);
             }
             finally
@@ -1850,6 +1944,8 @@ namespace OICQStickerManager.Views
         private void AiSaveProfile_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is not MainViewModel vm) return;
+            CommitAiInputs();
+            if (!vm.AiDraftVerified) { RefreshAiSettingsUi(); return; }
             var editing = _aiEditorProfileId != null && vm.AiActiveProfileId == _aiEditorProfileId
                 ? vm.AiKeyProfilesView.FirstOrDefault(p => p.Id == _aiEditorProfileId)
                 : null;
@@ -1877,7 +1973,10 @@ namespace OICQStickerManager.Views
         private void AiProfileNameSave_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is not MainViewModel vm) { CancelAiProfileName(); return; }
-            var profile = vm.SaveCurrentAsProfile(AiProfileNameBox.Text, _aiDraftDetected ?? new List<string>());
+            if (!vm.AiDraftVerified) { CancelAiProfileName(); RefreshAiSettingsUi(); return; }
+            AiKeyProfile profile;
+            try { profile = vm.SaveCurrentAsProfile(AiProfileNameBox.Text, _aiDraftDetected ?? new List<string>()); }
+            catch (AiTagException ex) { ShowAiFailureAlert(ex); return; }
             _aiDraftDetected = null;
             _aiProfileIdBeforeEdit = null; // 新档案已激活：取消时无需恢复旧档案
             CancelAiProfileName();
@@ -1933,48 +2032,7 @@ namespace OICQStickerManager.Views
 
             try
             {
-                // 1. 先从内存集合移除，UI 停止引用该图片
-                viewModel.Stickers.Remove(sticker);
-                Diag("delete: removed from collection, saving db");
-                await viewModel.SaveDatabaseAsync();
-                Diag("delete: db saved");
-
-                // 2. （原 GC.Collect+WaitForPendingFinalizers 已删除）UI 线程等终结器会与 UIA provider
-                //    的 Dispatcher 转派互等——2026-09-30 转储实证死锁三环：UI 线程 WaitForPendingFinalizers ←→
-                //    finalizer SafeHandle.PInvoke ←→ UIA ElementProxy.get_ProviderOptions 的 Dispatcher.Invoke。
-                //    文件占用由下方 3×200ms 重试兜底，无需 GC 护航。
-
-                // 3. 尝试删除物理文件
-                if (System.IO.File.Exists(sticker.FullPath))
-                {
-                    // 增加重试机制，防止系统切换延迟导致删除失败
-                    bool deleted = false;
-                    for (int i = 0; i < 3; i++) // 尝试 3 次
-                    {
-                        try
-                        {
-                            System.IO.File.Delete(sticker.FullPath);
-                            deleted = true;
-                            break;
-                        }
-                        catch (System.IO.IOException)
-                        {
-                            Diag($"delete: file locked, retry {i + 1}");
-                            await Task.Delay(200); // 没删掉就等 200 毫秒再试
-                        }
-                    }
-
-                    if (!deleted)
-                    {
-                        // 半删除兜底：记录待删任务，30 秒后与下次启动各重试一轮；期间不会被重新收编
-                        viewModel.QueuePendingDelete(sticker.FullPath, sticker.Md5);
-                        viewModel.StatusText = "文件被占用，已从图库移除，稍后自动重试删除";
-                    }
-                    else
-                        Diag("delete: file deleted");
-                }
-                // twin 被删：QQ 页借入标签与已入库角标立即失效
-                viewModel.RefreshQqMirrorFlags();
+                await viewModel.DeleteStickersAsync(new[] { sticker });
                 Diag("delete: flow complete");
             }
             catch (Exception ex)
@@ -2213,25 +2271,10 @@ namespace OICQStickerManager.Views
                     // 💡 修正 3：在循环删除前，暂时断开 UI 的过滤逻辑，避免删除过程中的 UI 闪烁
                     viewModel.StatusText = $"正在清理标签「{tagName}」...";
 
-                    foreach (var sticker in targetStickers)
-                    {
-                        // 从内存集合移除
-                        viewModel.Stickers.Remove(sticker);
-
-                        // 尝试物理删除
-                        if (File.Exists(sticker.FullPath))
-                        {
-                            try { File.Delete(sticker.FullPath); } catch { /* 忽略锁定文件 */ }
-                        }
-                    }
-
-                    // 保存状态并刷新左侧栏
-                    await viewModel.SaveDatabaseAsync();
-                    viewModel.UpdateTabTags();
+                    int pending = await viewModel.DeleteStickersAsync(targetStickers);
                     viewModel.SelectedTab = "最近";
-                    viewModel.RefreshQqMirrorFlags(); // 被删标签从 QQ 页借入显示中移除
-
-                    viewModel.StatusText = $"标签「{tagName}」及其图片已成功清除";
+                    viewModel.StatusText = pending == 0 ? $"标签「{tagName}」及其图片已清除"
+                        : $"标签「{tagName}」已移除；{pending} 个被占用文件已排队重试删除";
                 }
                 catch (Exception ex)
                 {
@@ -2848,6 +2891,13 @@ namespace OICQStickerManager.Views
             QqBindSelectedButton.IsEnabled = false;
 
             var accounts = await QqEmojiService.ScanAccountsAsync();
+            foreach (var binding in vm.QqBindings.Where(b => !string.IsNullOrWhiteSpace(b.AccountDirectory)))
+            {
+                accounts.RemoveAll(a => a.Uin == binding.Uin);
+                accounts.Add(new QqAccountScanResult { Uin = binding.Uin, AccountDirectory = binding.AccountDirectory,
+                    OriDir = Path.Combine(binding.AccountDirectory, "nt_qq", "nt_data", "Emoji", "personal_emoji", "Ori"),
+                    StickerCount = vm.GetQqMirrorView(binding.Uin).SourceCollection.Cast<object>().Count() });
+            }
             _qqBindRows = accounts
                 .OrderByDescending(a => a.LastActive)
                 .ThenByDescending(a => a.StickerCount)
@@ -2856,6 +2906,20 @@ namespace OICQStickerManager.Views
 
             QqBindEmptyHint.Visibility = _qqBindRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             foreach (var row in _qqBindRows) QqBindList.Children.Add(BuildQqBindRow(row));
+        }
+
+        private async void ChooseQqDataDirectory_Click(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is not MainViewModel vm) return;
+            using var dialog = new System.Windows.Forms.FolderBrowserDialog
+            {
+                Description = "选择包含 nt_qq 的数字账号文件夹",
+                UseDescriptionForTitle = true,
+                ShowNewFolderButton = false,
+            };
+            if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+            try { await vm.BindCustomQqAccountAsync(dialog.SelectedPath); await RefreshQqBindRowsAsync(); }
+            catch (Exception ex) { await ShowAlertAsync("无法绑定账号目录", ex.Message); }
         }
 
         private FrameworkElement BuildQqBindRow(QqAccountRow row)
@@ -3002,22 +3066,22 @@ namespace OICQStickerManager.Views
 
         private async Task RunKeyAcquisitionFlowAsync()
         {
+            if (_keyFlowRunning || _lifetime.IsCancellationRequested) return;
+            _keyFlowRunning = true;
             MainViewModel? vm = DataContext as MainViewModel;
             try
             {
                 if (vm is null) return;
 
                 // 三选：立即读取（脚本） / 下次登录自动抓取（静默） / 取消
-                // 文案按 2026-09-30 UX 定案：明说"额外的窗口、当前 QQ 不受影响"，并把
-                // "弹窗前要分析 1-2 分钟"前置说明（实测等待黑洞被用户抓过）
                 bool? startWatcherNow = null;
                 bool proceed = await ShowAlertAsync("读取 QQ 收藏索引",
                     "方式一（立即）：接下来会弹出一个额外的 QQ 登录窗口，在里面登录一次你的账号即可，" +
-                    "登录完成后它会自动关闭。如果此时你已经登录着 QQ，可以不用管它——正在用的 QQ 不受任何影响。\n" +
+                    "登录完成后该窗口会自动关闭。读取使用固定版本的第三方调试工具，不操作你的聊天记录。\n" +
                     "注意：登录窗口弹出前需要先分析 QQ 的模块文件（约 1-2 分钟），请耐心等待。\n\n" +
                     "方式二（自动）：点「下次自动」，之后任意一次你登录 QQ 时（包括开关机后）" +
-                    "自动完成读取，QQ 完全无感；期间保持飞鸟在托盘运行即可。\n\n" +
-                    "密钥只保存在本机，仅用于读取收藏索引。",
+                    "尝试自动读取；调试附加可能使 QQ 短暂停顿，期间保持飞鸟在托盘运行即可。\n\n" +
+                    "密钥由当前 Windows 用户加密保存在本机，仅用于读取收藏索引。",
                     confirm: "立即读取",
                     neutral: "下次自动",
                     onNeutral: () => startWatcherNow = true);
@@ -3029,26 +3093,27 @@ namespace OICQStickerManager.Views
                 }
                 if (startWatcherNow == true)
                 {
-                    vm.StartKeyWatcher(); // 静默等待下次 QQ 登录，抓到后自动回填
+                    vm.StartKeyWatcher(replaceExisting: true);
+                    vm.SetKeyFlowStatus("正在等待下次 QQ 登录，以自动重新读取收藏索引密钥");
                     return;
                 }
 
-                // 等待黑洞补丁：脚本输出直落盘 + 每秒轮询，密钥一出现立即回填；
-                // onProgress 按脚本输出的阶段特征回报当前进度（检测/分析/拉起/登录/解析）
+                vm.StopKeyWatcher();
                 vm.SetKeyFlowStatus("正在启动 QQ 登录窗口：先分析 QQ 模块（约 1-2 分钟），弹出后请在其中登录…");
                 string? key;
                 try
                 {
-                    key = await Task.Run(() =>
-                        Services.QqKeyExtractor.RunScriptAndExtractAsync(msg =>
-                        {
-                            _ = Dispatcher.InvokeAsync(() => vm.SetKeyFlowStatus(msg));
-                        }).GetAwaiter().GetResult());
+                    _keyHelperTask = Services.QqKeyExtractor.RunScriptAndExtractAsync(msg =>
+                    {
+                        if (!_lifetime.IsCancellationRequested) _ = Dispatcher.InvokeAsync(() => vm.SetKeyFlowStatus(msg));
+                    }, _lifetime.Token);
+                    key = await _keyHelperTask;
                 }
                 finally
                 {
                     vm.SetKeyFlowStatus(null); // 完成或失败都撤掉瞬态提示（CompleteKeyAcquisition 也会清，双保险）
                 }
+                if (_lifetime.IsCancellationRequested) return;
                 vm.CompleteKeyAcquisition(key);
                 if (key == null)
                 {
@@ -3064,6 +3129,7 @@ namespace OICQStickerManager.Views
                     vm.StatusText = "QQ 收藏索引密钥读取成功";
                 }
             }
+            catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
             catch (Exception ex)
             {
                 if (vm is not null)
@@ -3072,14 +3138,25 @@ namespace OICQStickerManager.Views
                     _ = ShowAlertAsync("密钥读取异常", ex.Message, "知道了", showCancel: false);
                 }
             }
+            finally { _keyFlowRunning = false; }
         }
 
         // ———— 启动通知：QQ 绑定询问 → WebP 环境警告（串行，避免 Alert 叠加） ————
 
         private async Task RunStartupNoticesAsync()
         {
+            if (DataContext is MainViewModel vm) await vm.Initialization;
+            if (_lifetime.IsCancellationRequested) return;
             await TryPromptQqBindingAsync();
+            if (_lifetime.IsCancellationRequested) return;
             await TryWarnWebpSupportAsync();
+        }
+
+        private async Task ResumeAfterInitializationAsync()
+        {
+            if (DataContext is not MainViewModel vm) return;
+            await vm.Initialization;
+            if (!_lifetime.IsCancellationRequested) vm.ResumeKeyWatcherIfPending();
         }
 
         // WebP 环境警告：解不动 WebP 时一次性提醒（可直达商店安装页），处理过就永久记住。

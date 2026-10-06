@@ -9,4 +9,6 @@ public class QqBindingInfo
     public string Alias { get; set; } = "";
 
     public DateTime BoundAt { get; set; } = DateTime.Now;
+
+    public string AccountDirectory { get; set; } = "";
 }

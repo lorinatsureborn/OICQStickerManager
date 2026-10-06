@@ -69,20 +69,9 @@ public static class FeedbackService
     {
         try
         {
-            foreach (var p in Process.GetProcessesByName("QQ"))
-            {
-                try
-                {
-                    var path = p.MainModule?.FileName;
-                    if (string.IsNullOrEmpty(path)) continue;
-                    var vi = FileVersionInfo.GetVersionInfo(path);
-                    var v = vi.ProductVersion;
-                    if (string.IsNullOrEmpty(v)) v = vi.FileVersion;
-                    if (!string.IsNullOrEmpty(v)) return v;
-                }
-                catch { /* MainModule 跨位数/权限失败，试下一个进程 */ }
-                finally { p.Dispose(); }
-            }
+            var versions = QqProcessCapabilities.Collect().Select(build => build.Version)
+                .Where(version => !string.IsNullOrWhiteSpace(version)).Distinct().ToArray();
+            if (versions.Length > 0) return string.Join(" / ", versions);
         }
         catch { }
         return "未检测到运行中的 QQ";

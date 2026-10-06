@@ -28,6 +28,8 @@ namespace OICQStickerManager.Views
 
         private readonly DispatcherTimer _closeTimer;
         private readonly MainViewModel _viewModel;
+        private readonly QqCoexistLifetime _coexistLifetime;
+        private readonly Size _preferredSize;
         private bool _coexistMode; // 是否由 QQ 表情面板共存触发打开
         private bool _pinned;      // 钉住模式（设置按钮唤出）：不因鼠标离开自动关闭，靠 ✕/热键/再点按钮收起
         private bool _suppressShowAnimation; // 预热时在屏幕外显示，不播动画
@@ -42,8 +44,15 @@ namespace OICQStickerManager.Views
         public QuickPanelWindow(MainViewModel viewModel)
         {
             InitializeComponent();
+            _preferredSize = new Size(Width, Height);
             _viewModel = viewModel;
             DataContext = viewModel;
+            _coexistLifetime = new QqCoexistLifetime((host, reason) =>
+            {
+                QqPanelWatcher.DismissCoexist(host, reason);
+                _viewModel.SetQuickPanelCoexistTarget(IntPtr.Zero);
+                HideImmediately();
+            }, action => Dispatcher.BeginInvoke(DispatcherPriority.Send, action));
 
             // 面板隐藏/关闭时停掉格子内 GIF 动画（Hide 不触发 Unloaded，动画会在幕后空转耗 CPU）
             // 可见性同时镜像给 QqPanelWatcher.CoexistPanelShowing：鼠标钩子在后台线程判断
@@ -53,7 +62,7 @@ namespace OICQStickerManager.Views
             {
                 Volatile.Write(ref QqPanelWatcher.CoexistPanelShowing,
                     (bool)e.NewValue && _coexistMode ? 1 : 0);
-                if (!(bool)e.NewValue) StopPanelGifAnimation();
+                if (!(bool)e.NewValue) { StopPanelGifAnimation(); _coexistLifetime.Stop(); }
             };
 
             _closeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(CloseGraceMs) };
@@ -71,18 +80,19 @@ namespace OICQStickerManager.Views
             // 发送发起瞬间立即收起（对齐 QQ 原生面板"点完即关"；粘贴/剪贴板恢复的等待不拖面板）。
             // 关 QQ 原生表情面板不在这里做：它的 UIA Invoke 会把 QQ 焦点搬到表情按钮上，
             // 与共存发送的焦点修复并发互踩，会把搜狗输入法的上下文搞脱钩（候选框跑屏幕边缘）——
-            // 挪到 CoexistPasteAsync 粘贴落地之后执行。
+            // 由 CoexistPasteAsync 串行完成预关闭、焦点恢复和粘贴。
             viewModel.QuickPanelSendInitiated += OnSendInitiated;
         }
 
         private void OnSendInitiated(object? sender, EventArgs e)
         {
-            HideSoft();
+            HideImmediately();
         }
 
         // VM 是 App 静态单例、面板会随换肤整体重建：不退订的话旧窗体整棵对象图被静态根吊住
         protected override void OnClosed(EventArgs e)
         {
+            _coexistLifetime.Dispose();
             if (_viewModel != null) _viewModel.QuickPanelSendInitiated -= OnSendInitiated;
             base.OnClosed(e);
         }
@@ -139,6 +149,7 @@ namespace OICQStickerManager.Views
         /// <summary>带淡出的收起：动画结束后再真正隐藏窗口。</summary>
         public void HideSoft()
         {
+            _coexistLifetime.Stop();
             QqPanelWatcher.Log($"HideSoft enter: visible={IsVisible}");
             if (!IsVisible)
             {
@@ -171,6 +182,17 @@ namespace OICQStickerManager.Views
         }
 
         // --- 呼出与定位 ---
+
+        internal void HideImmediately()
+        {
+            _closeTimer.Stop(); _hideTimer?.Stop(); _hideTimer = null;
+            _coexistLifetime.Stop();
+            Hide();
+            PanelRoot.BeginAnimation(OpacityProperty, null); PanelRoot.Opacity = 1;
+            PanelScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+            PanelScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+            PanelScale.ScaleX = PanelScale.ScaleY = 1;
+        }
 
         private bool _warmed;
 
@@ -339,6 +361,7 @@ namespace OICQStickerManager.Views
 
         private void OpenNearCursorCore(bool pinned)
         {
+            _coexistLifetime.Stop();
             _coexistMode = false;
             _pinned = pinned;
             _viewModel.SetQuickPanelCoexistTarget(IntPtr.Zero);
@@ -356,7 +379,7 @@ namespace OICQStickerManager.Views
         /// 共存模式：贴靠在 QQ 原生表情面板旁打开（优先左侧，放不下贴右侧），
         /// 并记录 QQ 宿主窗口句柄——发送时需要把焦点还给它的聊天输入框。
         /// </summary>
-        public void OpenForCoexist(Rect qqPanelRect, IntPtr qqHwnd)
+        public void OpenForCoexist(Rect qqPanelRect, IntPtr qqHwnd, Rect buttonRect = default)
         {
             _coexistMode = true;
             _viewModel.SetQuickPanelCoexistTarget(qqHwnd);
@@ -389,52 +412,25 @@ namespace OICQStickerManager.Views
                 Show();
                 PlayShowAnimation();
             }
+            _coexistLifetime.Follow(qqHwnd, new WindowInteropHelper(this).Handle, qqPanelRect,
+                buttonRect.Width > 0 ? buttonRect : QqPanelWatcher.CachedButtonRect(qqHwnd));
         }
 
         // 以物理像素锚点在指定显示器上定位面板；scale 用于物理像素 ↔ DIP 换算
         private void PositionOnMonitor(IntPtr monitor, int anchorX, int anchorY, bool isCoexistAnchor = false, int anchorWidthPx = 0)
         {
             var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
-            GetMonitorInfo(monitor, ref mi);
-            GetDpiForMonitor(monitor, MONITOR_DPI_TYPE_EFFECTIVE, out uint dpiX, out _);
+            if (!GetMonitorInfo(monitor, ref mi)) return;
+            var hwnd = new WindowInteropHelper(this).EnsureHandle();
+            // Move first so GetDpiForWindow observes the destination monitor, not the previous one.
+            if (!SetWindowPos(hwnd, IntPtr.Zero, anchorX, anchorY, 0, 0, 0x0015)) return;
+            uint dpiX = GetDpiForWindow(hwnd);
             double scale = dpiX / 96.0;
 
-            double width = ActualWidth > 0 ? ActualWidth : Width;
-            double height = ActualHeight > 0 ? ActualHeight : Height;
-
-            double left;
-            double top;
-            if (isCoexistAnchor)
-            {
-                // 优先贴 QQ 面板左侧，放不下贴右侧，垂直顶对齐
-                double qLeft = anchorX / scale;
-                double qTop = anchorY / scale;
-                double workLeft = mi.rcWork.Left / scale;
-                double workRight = mi.rcWork.Right / scale;
-                double workTop = mi.rcWork.Top / scale;
-                double workBottom = mi.rcWork.Bottom / scale;
-
-                left = qLeft - width - 8;
-                if (left < workLeft + 4) left = qLeft + anchorWidthPx / scale + 8;
-                top = qTop;
-                if (left + width > workRight - 4) left = workRight - width - 8;
-                if (top + height > workBottom - 4) top = workBottom - height - 8;
-                if (top < workTop + 4) top = workTop + 4;
-                if (left < workLeft + 4) left = workLeft + 4;
-            }
-            else
-            {
-                // 热键模式：让光标落在面板内部（标题栏区域），保证“鼠标进入→离开→自动关闭”链路成立
-                left = anchorX / scale - 30;
-                top = anchorY / scale - 30;
-                if (left + width > mi.rcWork.Right / scale) left = mi.rcWork.Right / scale - width - 8;
-                if (top + height > mi.rcWork.Bottom / scale) top = mi.rcWork.Bottom / scale - height - 8;
-                if (left < mi.rcWork.Left / scale) left = mi.rcWork.Left / scale + 8;
-                if (top < mi.rcWork.Top / scale) top = mi.rcWork.Top / scale + 8;
-            }
-
-            Left = left;
-            Top = top;
+            var workArea = new Rect(mi.rcWork.Left, mi.rcWork.Top, mi.rcWork.Right - mi.rcWork.Left, mi.rcWork.Bottom - mi.rcWork.Top);
+            var placement = PanelPlacement.Place(workArea, _preferredSize, new Point(anchorX, anchorY), scale, isCoexistAnchor, anchorWidthPx);
+            if (!placement.IsEmpty)
+                SetWindowPos(hwnd, IntPtr.Zero, (int)placement.Left, (int)placement.Top, (int)placement.Width, (int)placement.Height, 0x0014);
         }
 
         // --- 关闭规则 ---
@@ -476,15 +472,14 @@ namespace OICQStickerManager.Views
         private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
         [DllImport("user32.dll")]
         private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
-        [DllImport("shcore.dll")]
-        private static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
+        [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
         [DllImport("user32.dll")]
         private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
         [DllImport("user32.dll")]
         private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
         private const uint MONITOR_DEFAULTTONEAREST = 2;
-        private const int MONITOR_DPI_TYPE_EFFECTIVE = 0;
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_NOACTIVATE = 0x08000000;
         private const int WM_MOUSEACTIVATE = 0x0021;

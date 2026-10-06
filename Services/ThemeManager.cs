@@ -59,9 +59,7 @@ public static class ThemeManager
         var target = Themes[0];
         try
         {
-            var path = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                "OICQStickerManager", "config.json");
+            var path = Path.Combine(AppDataDirectory.Root, "config.json");
             if (File.Exists(path))
             {
                 using var doc = JsonDocument.Parse(File.ReadAllText(path));
