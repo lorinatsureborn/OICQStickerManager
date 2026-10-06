@@ -373,7 +373,11 @@ namespace OICQStickerManager.Views
         }
 
         private void CloseSettings_Click(object sender, RoutedEventArgs e)
-            => HideOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+        {
+            // 草稿不跨设置页会话：收起编辑区并恢复编辑前的激活档案
+            if (_aiEditorOpen) CloseAiEditor();
+            HideOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+        }
 
         private void OpenQuickPanel_Click(object sender, RoutedEventArgs e)
         {
@@ -1500,17 +1504,18 @@ namespace OICQStickerManager.Views
                 radio.Checked += (_, _) =>
                 {
                     vm.ActivateAiProfile(captured.Id);
-                    CloseAiEditor(); // 切换是列表行为：正在展开的编辑区一并收起
-                    RefreshAiSettingsUi();
+                    if (_aiEditorOpen) CloseAiEditor(); // 切换是列表行为：正在展开的编辑区一并收起（内部已刷新）
                 };
                 Grid.SetColumn(radio, 0);
 
+                var isActive = p.Id == vm.AiActiveProfileId;
                 var info = new StackPanel { Margin = new Thickness(10, 0, 0, 0) };
                 info.Children.Add(new TextBlock
                 {
-                    Text = p.Name,
+                    Text = p.Name + (isActive ? "  ✓" : ""),
                     FontSize = 13,
-                    Foreground = (Brush)FindResource("TextPrimaryBrush"),
+                    FontWeight = isActive ? FontWeights.SemiBold : FontWeights.Normal,
+                    Foreground = (Brush)FindResource(isActive ? "AccentBrush" : "TextPrimaryBrush"),
                 });
                 var who = AiTagService.FindProvider(p.ProviderId)?.Name ?? p.ProviderId;
                 var model = p.Model.Length > 0 ? p.Model : AiTagService.FindProvider(p.ProviderId)?.DefaultModel ?? "默认模型";
@@ -1602,13 +1607,20 @@ namespace OICQStickerManager.Views
         private bool _aiEditorOpen;
         private string? _aiEditorProfileId; // 正在编辑的档案 Id；null = 添加新 Key
         private List<string>? _aiDraftDetected; // 草稿态（尚无档案）时的检测结果，建档时随档案入库
+        private string? _aiProfileIdBeforeEdit; // 新建草稿前的激活档案 Id，取消编辑时恢复
 
         private void OpenAiEditor(string? profileId)
         {
             _aiEditorOpen = true;
             _aiEditorProfileId = profileId;
             if (DataContext is not MainViewModel vm) { RefreshAiSettingsUi(); return; }
-            if (profileId == null) vm.BeginNewAiDraft();
+            if (profileId == null)
+            {
+                // 新建草稿会清空工作配置：记住当前激活档案，取消编辑时恢复（否则激活态被摘、
+                // 档案列表全无选中标识、右键 AI 建议还会报未配置）
+                _aiProfileIdBeforeEdit = vm.AiActiveProfileId.Length > 0 ? vm.AiActiveProfileId : null;
+                vm.BeginNewAiDraft();
+            }
             else vm.BeginEditAiProfile(profileId);
             RefreshAiSettingsUi();
             AiKeyBox.Focus();
@@ -1616,8 +1628,17 @@ namespace OICQStickerManager.Views
 
         private void CloseAiEditor()
         {
+            var wasNewDraft = _aiEditorOpen && _aiEditorProfileId == null;
             _aiEditorOpen = false;
             _aiEditorProfileId = null;
+            if (wasNewDraft && DataContext is MainViewModel vm)
+            {
+                // 取消新建：恢复编辑前的激活档案；保存成功路径（SaveCurrentAsProfile 已激活新档案）
+                // 会先把 _aiProfileIdBeforeEdit 清空，不会走这里
+                if (_aiProfileIdBeforeEdit != null && vm.AiKeyProfilesView.Any(p => p.Id == _aiProfileIdBeforeEdit))
+                    vm.ActivateAiProfile(_aiProfileIdBeforeEdit);
+                _aiProfileIdBeforeEdit = null;
+            }
             RefreshAiSettingsUi();
         }
 
@@ -1639,6 +1660,11 @@ namespace OICQStickerManager.Views
             AiAddKeyButton.Visibility = anyProfile && !_aiEditorOpen ? Visibility.Visible : Visibility.Collapsed;
             AiAddSeparator.Visibility = anyProfile && !_aiEditorOpen ? Visibility.Visible : Visibility.Collapsed;
             AiEditorSection.Visibility = _aiEditorOpen ? Visibility.Visible : Visibility.Collapsed;
+
+            // 档案行在列表态/编辑态都要渲染（此前列表态提前 return 导致档案区显示为空、
+            // 点「添加」进入编辑态才出现——用户实测的状态混乱即此）
+            RefreshAiProfilesUi();
+
             if (!_aiEditorOpen) return;
 
             // 编辑态标题
@@ -1713,7 +1739,6 @@ namespace OICQStickerManager.Views
             }
 
             RefreshAiEffortUi();
-            RefreshAiProfilesUi();
         }
 
         private void AddChip(WrapPanel panel, string label, string tip, bool selected, Action onClick)
@@ -1854,6 +1879,7 @@ namespace OICQStickerManager.Views
             if (DataContext is not MainViewModel vm) { CancelAiProfileName(); return; }
             var profile = vm.SaveCurrentAsProfile(AiProfileNameBox.Text, _aiDraftDetected ?? new List<string>());
             _aiDraftDetected = null;
+            _aiProfileIdBeforeEdit = null; // 新档案已激活：取消时无需恢复旧档案
             CancelAiProfileName();
             CloseAiEditor(); // 保存后收起为简化档案行
             vm.StatusText = $"已保存并启用档案「{profile.Name}」";
