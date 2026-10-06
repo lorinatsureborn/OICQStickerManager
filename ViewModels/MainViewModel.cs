@@ -762,6 +762,34 @@ public class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(AiActiveProfileId));
     }
 
+    /// <summary>清空工作配置并重置验证态（「添加 API Key」入口）。</summary>
+    public void BeginNewAiDraft()
+    {
+        _aiProfileSwitching = true;
+        try
+        {
+            _aiActiveProfileId = "";
+            _aiDraftVerified = false;
+            AiTagProvider = "auto";
+            AiTagApiKey = "";
+            AiTagBaseUrl = "";
+            AiTagModel = "";
+            AiTagEffort = "";
+        }
+        finally { _aiProfileSwitching = false; }
+        OnPropertyChanged(nameof(AiActiveProfileId));
+        NotifyAiConfigState();
+    }
+
+    /// <summary>载入档案进入编辑态：档案已验证过则直接展开模型/档位区。</summary>
+    public void BeginEditAiProfile(string id)
+    {
+        ActivateAiProfile(id);
+        var p = _activeProfile;
+        _aiDraftVerified = p?.VerifiedAt != null;
+        NotifyAiConfigState();
+    }
+
     private string _aiTagModel = "";
     /// <summary>模型名：空 = 用服务商默认视觉模型。</summary>
     public string AiTagModel
@@ -848,6 +876,7 @@ public class MainViewModel : ViewModelBase
             AiTagEffort = p.Effort;
         }
         finally { _aiProfileSwitching = false; }
+        _aiDraftVerified = p.VerifiedAt != null;
         OnPropertyChanged(nameof(AiActiveProfileId));
         NotifyAiConfigState();
         _ = SaveConfigAsync();
@@ -888,12 +917,21 @@ public class MainViewModel : ViewModelBase
         return p;
     }
 
-    /// <summary>更新激活档案的检测结果（「检测可用视觉模型」重测后）。</summary>
+    /// <summary>更新激活档案的检测结果（「检测清单外模型」重测后）。</summary>
     public void UpdateActiveProfileDetectedModels(IReadOnlyList<string> models)
     {
         var p = _activeProfile;
         if (p == null) return;
         p.DetectedModels = models.ToList();
+        p.VerifiedAt = DateTime.Now;
+        _ = SaveConfigAsync();
+    }
+
+    /// <summary>刷新激活档案的验证时间（编辑档案时点「更新档案」）。</summary>
+    public void RefreshActiveProfileVerified()
+    {
+        var p = _activeProfile;
+        if (p == null) return;
         p.VerifiedAt = DateTime.Now;
         _ = SaveConfigAsync();
     }
@@ -917,6 +955,18 @@ public class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(AiKeyProfilesView));
         OnPropertyChanged(nameof(AiEffortLevels));
         OnPropertyChanged(nameof(AiEffortVisible));
+    }
+
+    // 草稿（或编辑中的档案）是否已通过测试连接：通过后才展开模型/档位设置区
+    private bool _aiDraftVerified;
+    public bool AiDraftVerified => _aiDraftVerified;
+
+    /// <summary>测试连接通过：解锁模型/思考档位设置区。</summary>
+    public void MarkAiDraftVerified()
+    {
+        if (_aiDraftVerified) return;
+        _aiDraftVerified = true;
+        NotifyAiConfigState();
     }
 
     /// <summary>档案行的只读视图（列表绑定）。</summary>

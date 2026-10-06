@@ -363,7 +363,12 @@ namespace OICQStickerManager.Views
 
         private void OpenSettings_Click(object sender, RoutedEventArgs e)
         {
-            RefreshAiSettingsUi(); // AI 识别区的服务商/模型胶囊按当前配置渲染
+            // AI 区渐进披露：一份档案都没有 → 自动展开「添加 API Key」编辑区；
+            // 已有档案 → 收起为列表（点行上铅笔或"添加"再展开）
+            if (DataContext is MainViewModel vm && vm.AiKeyProfilesView.Count == 0 && !_aiEditorOpen)
+                OpenAiEditor(null);
+            else
+                RefreshAiSettingsUi();
             ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
         }
 
@@ -1483,6 +1488,7 @@ namespace OICQStickerManager.Views
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
                 var radio = new System.Windows.Controls.RadioButton
                 {
@@ -1491,7 +1497,12 @@ namespace OICQStickerManager.Views
                     VerticalAlignment = VerticalAlignment.Center,
                     ToolTip = "点击切换到这份 Key",
                 };
-                radio.Checked += (_, _) => { vm.ActivateAiProfile(captured.Id); RefreshAiSettingsUi(); };
+                radio.Checked += (_, _) =>
+                {
+                    vm.ActivateAiProfile(captured.Id);
+                    CloseAiEditor(); // 切换是列表行为：正在展开的编辑区一并收起
+                    RefreshAiSettingsUi();
+                };
                 Grid.SetColumn(radio, 0);
 
                 var info = new StackPanel { Margin = new Thickness(10, 0, 0, 0) };
@@ -1513,20 +1524,33 @@ namespace OICQStickerManager.Views
                 });
                 Grid.SetColumn(info, 1);
 
+                var edit = new Button
+                {
+                    Style = (Style)FindResource("IconButtonStyle"),
+                    Content = "",
+                    FontFamily = (FontFamily)FindResource("IconFontFamily"),
+                    FontSize = 11,
+                    ToolTip = "编辑这份档案（模型/思考强度/重测 Key）",
+                };
+                System.Windows.Automation.AutomationProperties.SetName(edit, $"编辑档案 {p.Name}");
+                edit.Click += (_, _) => OpenAiEditor(captured.Id);
+                Grid.SetColumn(edit, 2);
+
                 var del = new Button
                 {
                     Style = (Style)FindResource("IconButtonStyle"),
-                    Content = "",
+                    Content = "",
                     FontFamily = (FontFamily)FindResource("IconFontFamily"),
                     FontSize = 11,
                     ToolTip = "删除这份档案（不影响已打的标签）",
                 };
                 System.Windows.Automation.AutomationProperties.SetName(del, $"删除档案 {p.Name}");
                 del.Click += (_, _) => _ = DeleteAiProfileAsync(captured);
-                Grid.SetColumn(del, 2);
+                Grid.SetColumn(del, 3);
 
                 row.Children.Add(radio);
                 row.Children.Add(info);
+                row.Children.Add(edit);
                 row.Children.Add(del);
                 AiProfilesPanel.Children.Add(row);
             }
@@ -1534,7 +1558,6 @@ namespace OICQStickerManager.Views
             var any = vm.AiKeyProfilesView.Count > 0;
             AiProfilesSection.Visibility = any ? Visibility.Visible : Visibility.Collapsed;
             AiProfilesSeparator.Visibility = any ? Visibility.Visible : Visibility.Collapsed;
-            AiDraftHint.Visibility = vm.AiHasUnsavedDraft && any ? Visibility.Visible : Visibility.Collapsed;
         }
 
         private async Task DeleteAiProfileAsync(AiKeyProfile profile)
@@ -1573,6 +1596,35 @@ namespace OICQStickerManager.Views
             }
         }
 
+        // ———— AI 设置区状态机（渐进式披露）————
+        // 列表态（收起，只有档案列表+添加按钮）⇄ 编辑态（展开）：
+        // 编辑态内部再按阶段披露：输入 Key → 显示识别出的厂商 → 测试通过 → 显示模型/档位/保存
+        private bool _aiEditorOpen;
+        private string? _aiEditorProfileId; // 正在编辑的档案 Id；null = 添加新 Key
+        private List<string>? _aiDraftDetected; // 草稿态（尚无档案）时的检测结果，建档时随档案入库
+
+        private void OpenAiEditor(string? profileId)
+        {
+            _aiEditorOpen = true;
+            _aiEditorProfileId = profileId;
+            if (DataContext is not MainViewModel vm) { RefreshAiSettingsUi(); return; }
+            if (profileId == null) vm.BeginNewAiDraft();
+            else vm.BeginEditAiProfile(profileId);
+            RefreshAiSettingsUi();
+            AiKeyBox.Focus();
+        }
+
+        private void CloseAiEditor()
+        {
+            _aiEditorOpen = false;
+            _aiEditorProfileId = null;
+            RefreshAiSettingsUi();
+        }
+
+        private void AiAddKey_Click(object sender, RoutedEventArgs e) => OpenAiEditor(null);
+
+        private void AiEditorClose_Click(object sender, RoutedEventArgs e) => CloseAiEditor();
+
         /// <summary>按当前配置渲染服务商/模型预设胶囊（设置页打开与配置变化时调用）。</summary>
         private void RefreshAiSettingsUi()
         {
@@ -1580,31 +1632,73 @@ namespace OICQStickerManager.Views
             var chip = (Style)FindResource("ChipButtonStyle");
             var chipSel = (Style)FindResource("ChipSelectedButtonStyle");
 
-            // 服务商切换后旧检测结果对不上号：清空（Key/服务商变化走这里，模型点选走 vm.AiTagModel 也重渲染——检测面板保留无妨，但 provider 变了必须清）
+            // ———— 层级披露 ————
+            var anyProfile = vm.AiKeyProfilesView.Count > 0;
+            AiProfilesSection.Visibility = anyProfile ? Visibility.Visible : Visibility.Collapsed;
+            AiProfilesSeparator.Visibility = anyProfile ? Visibility.Visible : Visibility.Collapsed;
+            AiAddKeyButton.Visibility = anyProfile && !_aiEditorOpen ? Visibility.Visible : Visibility.Collapsed;
+            AiAddSeparator.Visibility = anyProfile && !_aiEditorOpen ? Visibility.Visible : Visibility.Collapsed;
+            AiEditorSection.Visibility = _aiEditorOpen ? Visibility.Visible : Visibility.Collapsed;
+            if (!_aiEditorOpen) return;
+
+            // 编辑态标题
+            var editingProfile = _aiEditorProfileId != null
+                ? vm.AiKeyProfilesView.FirstOrDefault(p => p.Id == _aiEditorProfileId)
+                : null;
+            AiEditorTitle.Text = editingProfile != null ? $"编辑「{editingProfile.Name}」" : "添加 API Key";
+
+            // 阶段一：Key 已输入 → 显示识别出的厂商；识别不出才列全部芯片
+            var knownProvider = vm.AiSelectedProvider; // auto 时按 Key 识别；手动选过则直接用
+            var providerKnown = knownProvider != null;
+            AiProviderKnownSection.Visibility = providerKnown ? Visibility.Visible : Visibility.Collapsed;
+            if (providerKnown)
+            {
+                var how = vm.AiTagProvider == "auto" ? "根据 Key 自动识别" : "手动选择";
+                var model = vm.AiTagModel.Length > 0 ? vm.AiTagModel : knownProvider.DefaultModel;
+                AiProviderKnownText.Text = $"{knownProvider.Name}（{how}）· 默认模型 {model}";
+            }
+            AiProviderPickSection.Visibility = providerKnown ? Visibility.Collapsed : Visibility.Visible;
+
+            // 阶段二：测试通过 → 展开模型/档位/保存
+            AiVerifiedSection.Visibility = vm.AiDraftVerified ? Visibility.Visible : Visibility.Collapsed;
+            AiSaveProfileButton.Content = editingProfile != null && vm.AiActiveProfileId == editingProfile.Id
+                ? "更新档案" : "保存为档案";
+
+            // 检测结果面板：provider 变了就清（检测结果只对当时的 Key/服务商有效）
             if (_lastAiProviderForDetected != vm.AiTagProvider)
             {
                 _lastAiProviderForDetected = vm.AiTagProvider;
                 AiDetectedModelsPanel.Children.Clear();
                 AiDetectResultText.Visibility = Visibility.Collapsed;
+                AiDetectSection.Visibility = Visibility.Visible;
             }
-
-            void AddChip(WrapPanel panel, string label, string tip, bool selected, Action onClick)
+            // 编辑档案时先展示该档案上次检测到的模型（免重测）
+            if (editingProfile != null && editingProfile.DetectedModels.Count > 0
+                && AiDetectedModelsPanel.Children.Count == 0)
             {
-                var b = new Button { Content = label, Style = selected ? chipSel : chip, ToolTip = tip };
-                b.Click += (_, _) => { onClick(); RefreshAiSettingsUi(); };
-                panel.Children.Add(b);
+                var chipStyle = (Style)FindResource("ChipButtonStyle");
+                foreach (var m in editingProfile.DetectedModels)
+                {
+                    var model = m;
+                    var b = new Button { Content = model, Style = chipStyle, ToolTip = "点击选用该视觉模型" };
+                    b.Click += (_, _) => { vm.AiTagModel = model; RefreshAiSettingsUi(); };
+                    AiDetectedModelsPanel.Children.Add(b);
+                }
             }
 
+            // 服务商芯片（仅识别不出时可见）
             AiProviderChipsPanel.Children.Clear();
-            AddChip(AiProviderChipsPanel, "自动识别", "根据 API Key 前缀自动判断服务商", vm.AiTagProvider == "auto",
-                () => vm.AiTagProvider = "auto");
-            foreach (var p in AiTagService.Providers)
+            if (!providerKnown)
             {
-                var id = p.Id;
-                AddChip(AiProviderChipsPanel, p.Name, p.Guide, vm.AiTagProvider == id,
-                    () => vm.AiTagProvider = id);
+                foreach (var p in AiTagService.Providers)
+                {
+                    var id = p.Id;
+                    AddChip(AiProviderChipsPanel, p.Name, p.Guide, vm.AiTagProvider == id,
+                        () => vm.AiTagProvider = id);
+                }
             }
 
+            // 模型静态清单
             AiModelPresetsPanel.Children.Clear();
             var effective = vm.AiTagModel.Length > 0 ? vm.AiTagModel : vm.AiSelectedProvider?.DefaultModel ?? "";
             foreach (var m in vm.AiModelPresets)
@@ -1618,6 +1712,13 @@ namespace OICQStickerManager.Views
 
             RefreshAiEffortUi();
             RefreshAiProfilesUi();
+        }
+
+        private void AddChip(WrapPanel panel, string label, string tip, bool selected, Action onClick)
+        {
+            var b = new Button { Content = label, Style = (Style)FindResource(selected ? "ChipSelectedButtonStyle" : "ChipButtonStyle"), ToolTip = tip };
+            b.Click += (_, _) => { onClick(); RefreshAiSettingsUi(); };
+            panel.Children.Add(b);
         }
 
         private void AiGuideLink_Click(object sender, RoutedEventArgs e)
@@ -1654,7 +1755,8 @@ namespace OICQStickerManager.Views
             try
             {
                 var models = await vm.FetchAiVisionModelsAsync();
-                vm.UpdateActiveProfileDetectedModels(models);
+                if (vm.AiActiveProfileId.Length > 0) vm.UpdateActiveProfileDetectedModels(models);
+                else _aiDraftDetected = models; // 草稿态：检测结果随建档入库
                 var chip = (Style)FindResource("ChipButtonStyle");
                 foreach (var m in models)
                 {
@@ -1682,10 +1784,8 @@ namespace OICQStickerManager.Views
             }
         }
 
-        private List<string>? _aiPendingDetectedModels; // 测试通过后暂存检测结果，命名保存时入档
-
-        // 「测试并保存」：小图验证 Key → 自动检测可用视觉模型 → 命名 → 存为档案并激活。
-        // 已有激活档案且 Key/服务商未改时，视作重测（刷新 VerifiedAt 与检测结果），不新建档案。
+        // 「测试连接」：小图真实调用一次验证 Key；通过后展开模型/档位设置区（不弹窗打断流）。
+        // 失败转译成用户可执行的动作 + 完整现场落日志。
         private async void AiTest_Click(object sender, RoutedEventArgs e)
         {
             if (DataContext is not MainViewModel vm) return;
@@ -1699,55 +1799,48 @@ namespace OICQStickerManager.Views
 
             AiTestButton.IsEnabled = false;
             AiTestButton.Content = "测试中…";
-            List<string> detected;
             try
             {
                 var testImage = await BuildAiTestImageAsync();
                 var result = await vm.AiTag.SuggestTagsAsync(testImage, opt, Array.Empty<string>());
                 AiTagService.Log($"verify: key works, tags=[{string.Join(",", result.Tags)}]");
-                AiTestButton.Content = "搜寻模型中…";
-                try
-                {
-                    detected = await vm.FetchAiVisionModelsAsync();
-                    _aiPendingDetectedModels = detected;
-                }
-                catch (AiTagException dex)
-                {
-                    // Key 已验证可用；模型清单拿不到不阻塞建档（可手填模型名）
-                    AiTagService.Log($"verify: model detection skipped :: {dex.Detail}");
-                    detected = new List<string>();
-                    _aiPendingDetectedModels = detected;
-                }
+                vm.MarkAiDraftVerified();
+                RefreshAiSettingsUi(); // 展开「可用模型 / 思考强度 / 保存」区
             }
             catch (AiTagException ex)
             {
                 ShowAiFailureAlert(ex);
-                return;
             }
             finally
             {
                 AiTestButton.IsEnabled = true;
-                AiTestButton.Content = "测试并保存";
+                AiTestButton.Content = "测试连接";
             }
+        }
 
-            var active = vm.AiActiveProfileId.Length > 0;
-            var providerName = opt.ProviderName;
-            if (active)
+        // 「保存为档案 / 更新档案」：把当前工作配置（Key+厂商+模型+档位）固定成档案并收起为列表行。
+        // 编辑已有档案且 Key/服务商未动（未脱钩）时是更新；其余一律新建（走命名）。
+        private void AiSaveProfile_Click(object sender, RoutedEventArgs e)
+        {
+            if (DataContext is not MainViewModel vm) return;
+            var editing = _aiEditorProfileId != null && vm.AiActiveProfileId == _aiEditorProfileId
+                ? vm.AiKeyProfilesView.FirstOrDefault(p => p.Id == _aiEditorProfileId)
+                : null;
+
+            if (editing != null)
             {
-                // 重测当前档案：刷新验证时间与检测结果，不重复建档
-                vm.UpdateActiveProfileDetectedModels(_aiPendingDetectedModels!);
-                var chips = _aiPendingDetectedModels!.Count > 0
-                    ? "\n检测到 " + _aiPendingDetectedModels.Count + " 个可用视觉模型（点模型区芯片切换）。"
-                    : "\n模型清单没有取到（不影响使用，可手填模型名）。";
-                _ = ShowAlertAsync("测试通过",
-                    $"{providerName} · {opt.Model} 可用，配置已更新到当前档案。{chips}", "好", showCancel: false);
-                RefreshAiSettingsUi();
+                // 更新：模型/档位改动早已即时写回档案，这里只刷新验证时间并收起
+                vm.RefreshActiveProfileVerified();
+                CloseAiEditor();
+                vm.StatusText = $"档案「{editing.Name}」已更新";
                 return;
             }
 
             // 新档案：命名（默认名 = 服务商 · 日期）
-            AiProfileNameSubtitle.Text = $"{providerName} · {opt.Model}" +
-                (_aiPendingDetectedModels.Count > 0 ? $" · {_aiPendingDetectedModels.Count} 个可用视觉模型" : "");
+            _aiDraftDetected = _aiDraftDetected ?? new List<string>();
+            var providerName = vm.AiSelectedProvider?.Name ?? "AI";
+            AiProfileNameSubtitle.Text = $"{providerName}" +
+                (vm.AiTagModel.Length > 0 ? $" · {vm.AiTagModel}" : "");
             AiProfileNameBox.Text = $"{providerName} {DateTime.Now:MM-dd}";
             ShowOverlay(AiProfileNameOverlay, AiProfileNameSheet, AiProfileNameSheetScale, 0.94);
             AiProfileNameBox.Focus();
@@ -1756,11 +1849,11 @@ namespace OICQStickerManager.Views
 
         private void AiProfileNameSave_Click(object sender, RoutedEventArgs e)
         {
-            if (DataContext is not MainViewModel vm || _aiPendingDetectedModels == null) { CancelAiProfileName(); return; }
-            var profile = vm.SaveCurrentAsProfile(AiProfileNameBox.Text, _aiPendingDetectedModels);
-            _aiPendingDetectedModels = null;
+            if (DataContext is not MainViewModel vm) { CancelAiProfileName(); return; }
+            var profile = vm.SaveCurrentAsProfile(AiProfileNameBox.Text, _aiDraftDetected ?? new List<string>());
+            _aiDraftDetected = null;
             CancelAiProfileName();
-            RefreshAiSettingsUi();
+            CloseAiEditor(); // 保存后收起为简化档案行
             vm.StatusText = $"已保存并启用档案「{profile.Name}」";
         }
 
