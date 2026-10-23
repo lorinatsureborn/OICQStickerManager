@@ -84,10 +84,33 @@ and removed in a finally block; keys and favorite identifiers are not printed.
 
 This is component regression coverage, not a substitute for QQ-version, IME,
 permission, multi-monitor DPI or long-running integration tests.
+Input-method recovery fixtures can run with `-- --accessibility-only`. They cover
+modern QQ with missing accessible controls, stale and cross-chat button caches,
+non-QQ rejection, and retaining a pixel-confirmed opening through verification.
+They use off-screen fixture windows and do not switch the user's input method.
 The Windows GitHub Actions workflow runs the same commands. Its remote runner
 result must be checked separately; adding the workflow is not a CI pass claim.
 
-QQ coexistence and sending regressions can run separately (45 cases):
+Batch management regressions can run with `-- --batch-only`. Thirteen model fixtures
+cover selection across filters/tabs/accounts, current-page select all, QQ rescan
+identity, transient metadata, click-command send suppression and mixed-source tag
+editing. QQ cleanup verifies the authoritative index once per account and tests
+refavorites, unavailable/changing indices, locked files, path ownership and account
+unbinding. The shared hidden WPF fixture exercises the actual library and QQ
+toolbars, gallery click route, 4-DIP outlines/checkmarks, tag save/cancel, deletion
+confirmation, cross-tab cache cleanup and global selection clear. Synthetic HTTP
+responses verify the AI concurrency cap of two, cache reuse, partial failure and
+cancellation of active/queued requests. No real API credits or user files are used.
+Set `ASUKA_BATCH_SCREENSHOT` or `ASUKA_BATCH_QQ_SCREENSHOT` to PNG paths to save
+minimum-size library or QQ renderings. The full suite also verifies per-account
+index-read and authentication failure handling in batch orphan confirmation.
+The WPF fixture waits past the confirmation dialog's closing animation before
+checking that cleanup results remain visible. It also verifies that completion
+unlocks the toolbar before dismissing the result, and that a zero-deletion result
+for an undecodable image allows exit. Preview fixtures retain the original
+send/delete path while falling back to QQ's thumbnail after decoding fails.
+
+QQ coexistence and sending regressions can run separately (54 cases):
 
 ```powershell
 dotnet run --project probes\CompatibilityTests\CompatibilityTests.csproj -c Release -p:OutputPath=bin\qq-core\tests\ -- --qq-core-only
@@ -97,6 +120,19 @@ These cover native host lifetime, outside clicks, injected editor-click evidence
 late worker frames after dismissal, QQ's reused panel nodes, missing panel events,
 clipboard retry focus changes, and recovery when an already-focused editor emits
 no second focus event. The test host uses the same DPI manifest as the app.
+
+Quick-panel placement regressions can run separately:
+
+```powershell
+dotnet run --project probes\CompatibilityTests\CompatibilityTests.csproj -c Release -p:OutputPath=bin\panel-placement\tests\ -- --placement-only
+```
+
+These exercise the actual quick-panel HWND with transparent content and disabled
+blur tiles/input hooks. They check duplicate notifications, direct relocation,
+placement before first display, cold handle creation, opening during warm-up and
+round trips across every attached monitor without intermediate visible bounds.
+The coexistence fixtures also verify button-relative panel cache relocation and
+invalidation after the host resizes or a different chat tries to reuse it.
 
 On a machine whose security software blocks the synthetic PowerShell key-helper
 bootstrap fixture, append `-- --skip-key-bootstrap` to run every other fixture.

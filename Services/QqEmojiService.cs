@@ -204,8 +204,13 @@ public class QqEmojiService : IDisposable
             _marshal(() =>
             {
                 if (_disposed) return;
+                var previous = Mirror.ToDictionary(m => m.FullPath, StringComparer.OrdinalIgnoreCase);
                 Mirror.Clear();
-                foreach (var m in items) Mirror.Add(m);
+                foreach (var m in items)
+                {
+                    if (previous.TryGetValue(m.FullPath, out var old)) PreserveFavoriteStatus(old, m);
+                    Mirror.Add(m);
+                }
                 MirrorChanged?.Invoke(this, EventArgs.Empty);
             });
         }
@@ -364,13 +369,22 @@ public class QqEmojiService : IDisposable
             if (_disposed) return;
             var existing = Mirror.FirstOrDefault(m => string.Equals(m.FullPath, path, StringComparison.OrdinalIgnoreCase));
             if (existing != null)
+            {
+                PreserveFavoriteStatus(existing, model);
                 Mirror[Mirror.IndexOf(existing)] = model; // 同名重写入：内容不变（名字即 MD5），仅刷新元数据
+            }
             else
             {
                 Mirror.Insert(0, model); // 新收藏置顶
                 NewFavoriteDetected?.Invoke(model); // M4：用户在 QQ 里点了「添加到表情」
             }
         });
+    }
+
+    private static void PreserveFavoriteStatus(QqStickerModel previous, QqStickerModel current)
+    {
+        if (previous.IsFavoriteStatusKnown && string.Equals(previous.Md5, current.Md5, StringComparison.OrdinalIgnoreCase))
+            current.IsOrphaned = previous.IsOrphaned;
     }
 
     public void Dispose()

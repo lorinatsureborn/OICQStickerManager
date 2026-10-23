@@ -59,7 +59,7 @@ public class ThemeOption : ViewModelBase
 }
 
 
-public class MainViewModel : ViewModelBase, IDisposable
+public partial class MainViewModel : ViewModelBase, IDisposable
 {
 
     private readonly string _dataRoot = AppDataDirectory.Root;
@@ -105,7 +105,12 @@ public class MainViewModel : ViewModelBase, IDisposable
             if (IsQqTabActive)
             {
                 var service = CurrentQqService;
-                return service == null ? "该账号尚未加载" : $"共 {service.Mirror.Count} 个QQ收藏表情";
+                if (service == null) return "该账号尚未加载";
+                int orphans = service.Mirror.Count(s => s.IsOrphaned);
+                int unknown = service.Mirror.Count(s => !s.IsFavoriteStatusKnown);
+                int favorites = service.Mirror.Count - orphans - unknown;
+                return $"{service.Mirror.Count} 张 · 收藏 {favorites} · 缓存残留 {orphans}" +
+                    (unknown > 0 ? $" · 待核验 {unknown}" : "");
             }
             return FilteredCount == Stickers.Count
                 ? $"共 {Stickers.Count} 个表情"
@@ -121,6 +126,7 @@ public class MainViewModel : ViewModelBase, IDisposable
         FilteredCount = IsQqTabActive
             ? CurrentQqService?.Mirror.Count ?? 0
             : _stickersView.OfType<object>().Count();
+        PruneBatchSelection();
         OnPropertyChanged(nameof(StickerCountText));
     }
 
@@ -411,6 +417,7 @@ public class MainViewModel : ViewModelBase, IDisposable
         var oriDir = Path.Combine(accountDirectory,
             "nt_qq", "nt_data", "Emoji", "personal_emoji", "Ori");
         var service = new QqEmojiService(binding.Uin, oriDir, action => _uiDispatcher.Invoke(action));
+        service.Mirror.CollectionChanged += (_, _) => { if (!_disposed) ScheduleUpdateCounts(); };
         service.MirrorChanged += (_, _) =>
         {
             if (_disposed) return;
@@ -659,15 +666,9 @@ public class MainViewModel : ViewModelBase, IDisposable
         if (sticker == null || !sticker.IsOrphaned) return false;
         try
         {
-            var deep = await GetOrCreateDeepSyncAsync();
-            if (deep == null || !await deep.ConfirmOrphanAsync(sticker))
-            {
-                StatusText = "未能确认这是已移除的收藏，未删除 QQ 缓存";
-                return false;
-            }
-            if (File.Exists(sticker.FullPath)) await Task.Run(() => File.Delete(sticker.FullPath));
-            if (_qqServices.TryGetValue(sticker.Uin, out var service)) service.Mirror.Remove(sticker);
-            return true;
+            var result = await DeleteQqOrphansAsync(new[] { sticker });
+            if (result.Preserved > 0) StatusText = "未能确认这是已移除的收藏，未删除 QQ 缓存";
+            return result.Deleted == 1;
         }
         catch { return false; }
     }
@@ -1317,6 +1318,7 @@ public class MainViewModel : ViewModelBase, IDisposable
             var count = await deep.ReconcileAllAsync(
                 _qqBindings.Select(b => b.Uin).ToList(),
                 (QqSyncStrategy)QqSyncStrategy);
+            UpdateCounts();
             if (count == QqDeepSyncService.Deferred)
             {
                 _deepSyncSummary = "上次对账暂缓：QQ 收藏索引仍在写入，镜像和密钥已保留";
@@ -2758,6 +2760,11 @@ public class MainViewModel : ViewModelBase, IDisposable
     // 单击发送（QQ 页的镜像表情直接从 QQ 缓存零拷贝发送，走同一条链路）
     private Task HandleStickerClickAsync(StickerModel? s)
     {
+        if (IsBatchManaging)
+        {
+            if (s != null) ToggleBatchSticker(s);
+            return Task.CompletedTask;
+        }
         if (CurrentSendMode == SendMode.SingleClick && s != null)
             return ExecuteSendAsync(s);
         return Task.CompletedTask;
@@ -2766,6 +2773,7 @@ public class MainViewModel : ViewModelBase, IDisposable
     // 双击发送
     private Task HandleStickerDoubleClickAsync(StickerModel? s)
     {
+        if (IsBatchManaging) return Task.CompletedTask;
         if (CurrentSendMode == SendMode.DoubleClick && s != null)
             return ExecuteSendAsync(s);
         return Task.CompletedTask;

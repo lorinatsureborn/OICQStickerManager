@@ -143,14 +143,21 @@ internal static class Program
         tests = tests.Concat(FocusSettlementTests.Cases).ToArray();
         tests = tests.Concat(LegacyPanelTests.Cases).ToArray();
         tests = tests.Concat(CoexistTests.Cases).ToArray();
+        tests = tests.Concat(AccessibilityRecoveryTests.Cases).ToArray();
         tests = tests.Concat(AiTagTests.Cases).ToArray();
         tests = tests.Concat(AiSecurityTests.Cases).ToArray();
         tests = tests.Concat(AiUiTests.Cases).ToArray();
+        tests = tests.Concat(BatchManagementTests.Cases).ToArray();
+        tests = tests.Concat(QuickPanelPlacementTests.Cases).ToArray();
         if (args.Contains("--ai-only")) tests = AiTagTests.Cases.Concat(AiSecurityTests.Cases).Concat(AiUiTests.Cases).ToArray();
+        if (args.Contains("--batch-only")) tests = BatchManagementTests.Cases.Concat(AiUiTests.Cases).ToArray();
         if (args.Contains("--ai-security-only")) tests = AiSecurityTests.Cases.ToArray();
+        if (args.Contains("--sync-only")) tests = SyncTests.Cases.ToArray();
         if (args.Contains("--capability-only")) tests = CapabilityTests.Cases.ToArray();
         if (args.Contains("--uia-only")) tests = UiaIsolationTests.Cases.ToArray();
-        if (args.Contains("--qq-core-only")) tests = CoexistTests.Cases.Concat(SendTests.Cases).Concat(FocusSettlementTests.Cases).Concat(LifecycleTests.Cases).Concat(LegacyPanelTests.Cases).ToArray();
+        if (args.Contains("--qq-core-only")) tests = CoexistTests.Cases.Concat(SendTests.Cases).Concat(FocusSettlementTests.Cases).Concat(LifecycleTests.Cases).Concat(LegacyPanelTests.Cases).Concat(AccessibilityRecoveryTests.Cases).ToArray();
+        if (args.Contains("--accessibility-only")) tests = AccessibilityRecoveryTests.Cases.ToArray();
+        if (args.Contains("--placement-only")) tests = PlacementTests.Cases.Concat(QuickPanelPlacementTests.Cases).ToArray();
         if (args.Contains("--skip-key-bootstrap")) tests = tests.Where(t => t.Name != "Key helper bootstrap bypasses registry detection and quotes paths safely").ToArray();
         int failed = 0;
         try
@@ -162,6 +169,7 @@ internal static class Program
                 {
                     failed++;
                     Console.WriteLine("FAIL " + test.Name + ": " + ex.GetBaseException().Message);
+                    if (args.Contains("--placement-only") || args.Contains("--batch-only")) Console.WriteLine(ex);
                 }
                 PumpPendingWork();
             }

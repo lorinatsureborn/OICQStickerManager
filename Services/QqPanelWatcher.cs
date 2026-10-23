@@ -842,7 +842,7 @@ public class QqPanelWatcher : IDisposable
                     var hostHwnd = focusHost;
                     if (hostHwnd != IntPtr.Zero && FocusPathClickIsOnButton())
                     {
-                        var cachedRect = hostHwnd == _lastPanelRectHwnd ? _lastPanelRect : Rect.Empty;
+                        var cachedRect = CachedPanelRect(hostHwnd, _emojiBtnRect);
                         _optimisticPending = true;
                         ArmTailVerify();
                         BumpUserAction();
@@ -1334,7 +1334,7 @@ public class QqPanelWatcher : IDisposable
                 {
                     _panelOpen = true;
                     _optimisticPending = false;
-                    _lastPanelRect = rect;
+                    CachePanelAnchor(hwnd, rect);
                     _lastPanelRectHwnd = hwnd;
                     _lastPanelAppearedTicks = Environment.TickCount64;
                     Log($"panel APPEARED hwnd={hwnd} rect={rect}");
@@ -1533,7 +1533,8 @@ public class QqPanelWatcher : IDisposable
     private IntPtr _cachedPanelHwnd;
     private long _lastFullScanMissTicks = long.MinValue; // 上次全扫未命中的时刻：无信号验证在 TTL 内直接复用结果
     private const int FullScanMissTtlMs = 1000;
-    private Rect _lastPanelRect = Rect.Empty;    // 上次面板矩形（物理像素）：乐观打开时的定位来源
+    private sealed record PanelAnchor(IntPtr Host, uint Pid, Rect Panel, Rect Button, Size HostSize, uint Dpi, Rect WorkArea);
+    private PanelAnchor? _lastPanelAnchor; // 原生面板相对按钮的实测位置；跨线程用不可变快照发布
     private IntPtr _lastPanelRectHwnd;
     private volatile bool _optimisticPending;    // 已按按下时点乐观打开，等待 QQ 面板真正出现
     private Rect _emojiBtnRect = Rect.Empty;     // 表情按钮绝对矩形（物理像素）：合成锚点/close-q 点按来源，每次验证命中随窗口位置刷新
@@ -1961,6 +1962,41 @@ public class QqPanelWatcher : IDisposable
     }
     internal static double WindowScale(IntPtr host) => Math.Max(96u, GetDpiForWindow(host)) / 96.0;
 
+    private static Rect ButtonWorkArea(Rect button)
+    {
+        var work = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point(
+            (int)(button.Left + button.Width / 2), (int)(button.Top + button.Height / 2))).WorkingArea;
+        return new Rect(work.X, work.Y, work.Width, work.Height);
+    }
+
+    private void CachePanelAnchor(IntPtr host, Rect panel)
+    {
+        PanelAnchor? anchor = null;
+        if (!panel.IsEmpty && _emojiBtnHwnd == host && TryResolveEmojiButtonRect(out var button)
+            && GetWindowRect(host, out var window))
+        {
+            GetWindowThreadProcessId(host, out var pid);
+            anchor = new(host, pid, panel, button, new(window.Right - window.Left, window.Bottom - window.Top),
+                GetDpiForWindow(host), ButtonWorkArea(button));
+        }
+        Volatile.Write(ref _lastPanelAnchor, anchor);
+    }
+
+    private Rect CachedPanelRect(IntPtr host, Rect button)
+    {
+        var anchor = Volatile.Read(ref _lastPanelAnchor);
+        if (anchor == null || anchor.Host != host || button.IsEmpty || button.Size != anchor.Button.Size
+            || GetDpiForWindow(host) != anchor.Dpi || !GetWindowRect(host, out var window)) return Rect.Empty;
+        GetWindowThreadProcessId(host, out var pid);
+        if (pid != anchor.Pid || new Size(window.Right - window.Left, window.Bottom - window.Top) != anchor.HostSize)
+            return Rect.Empty;
+        var panel = anchor.Panel;
+        panel.Offset(button.Left - anchor.Button.Left, button.Top - anchor.Button.Top);
+        var work = ButtonWorkArea(button);
+        // A different monitor, resized chat or edge-clamped popup needs fresh native geometry.
+        return work == anchor.WorkArea && work.Contains(panel) ? panel : Rect.Empty;
+    }
+
     /// <summary>兜底锚退化为光标近似（按钮/TAB 矩形不可用时）：32x32 光标中心块。</summary>
     private void TrySetLegacyAnchorFromCursor()
     {
@@ -2149,7 +2185,7 @@ public class QqPanelWatcher : IDisposable
                                 _legacyTabHwnd = hwnd;
                                 _legacyButtonOpenLatched = true;
                                 if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
-                                var crect = _lastPanelRectHwnd == hwnd ? _lastPanelRect : Rect.Empty;
+                                var crect = CachedPanelRect(hwnd, rectNow);
                                 _optimisticPending = true;
                                 _buttonOpenPending = true;
                                 ArmTailVerify();
@@ -2177,7 +2213,7 @@ public class QqPanelWatcher : IDisposable
                         {
                             // 按下表情按钮的物理瞬间：立即乐观打开（QQ 面板要等 mouse-up 才出现，我们更快）。
                             var hwnd = _emojiBtnHwnd;
-                            var crect = _lastPanelRectHwnd == hwnd ? _lastPanelRect : Rect.Empty;
+                            var crect = CachedPanelRect(hwnd, rectNow);
                             _optimisticPending = true;
                             _buttonOpenPending = true;
                             ArmTailVerify();
@@ -2219,7 +2255,8 @@ public class QqPanelWatcher : IDisposable
     private bool _pixelFallbackOpenedLogged;
     private long _pixelMissLogTicks; // 未命中日志节流：休眠期用户在 QQ 里每一下点击都会跑匹配，不能刷屏
 
-    /// <summary>钩子线程的廉价资格审查（零 UIA 零 GDI）：剪枝树代 + 常规几何缓存接不住 + 点击落在 QQ 窗口。
+    /// <summary>钩子线程的廉价资格审查（零 UIA 零 GDI）：常规几何缓存接不住 + 点击落在 QQ 窗口。
+    /// 无障碍信息是否可用取决于当前渲染器状态，输入法切换后新版 QQ 也可能只剩壳层，不能按版本禁用回退。
     /// 不等休眠闩（那要焦点事件+2 轮探测 ~10s，冷启动第一击会落空）——模板匹配本身就是
     /// "点了表情按钮"的充分证据（--pixel-selftest 校准：按钮 ±6px 全 0 差，相邻图标 17+ 拒绝），
     /// 与焦点兜底路径的并发由 HookCoveredLastMouseDown 现有守卫吸收。
@@ -2227,12 +2264,32 @@ public class QqPanelWatcher : IDisposable
     private bool PixelFallbackEligible(POINT pt)
     {
         if (!EmojiButtonTemplate.Available) return false;
-        if (_emojiBtnHwnd != IntPtr.Zero && TryResolveEmojiButtonRect(out _)) return false; // 树恢复或上次像素匹配已重建缓存：常规三重校验路径接住
-        if (_qqPids.Count == 0) return false;
-        var root = RootWindowFromPoint(pt);
+        return NeedsPixelFallback(RootWindowFromPoint(pt), new Point(pt.X, pt.Y));
+    }
+
+    private bool NeedsPixelFallback(IntPtr root, Point point)
+    {
         if (root == IntPtr.Zero) return false;
         GetWindowThreadProcessId(root, out var pid);
-        return _qqPids.Contains((int)pid) && _capabilities.IsLegacy((int)pid);
+        if (!_qqPids.Contains((int)pid)) return false;
+        // 只有当前窗口、当前落点仍被缓存覆盖时才交给常规路径；别的聊天或变化后的布局不能挡住识别。
+        return root != _emojiBtnHwnd || _emojiBtnPid != (int)pid
+            || !TryResolveEmojiButtonRect(out var rect) || !rect.Contains(point);
+    }
+
+    private void CachePixelButton(IntPtr root, int pid, Rect rect)
+    {
+        // 已验证的按钮点击需要沿用几何证据；否则新版 QQ 的空 UIA 扫描会立即撤销这次打开。
+        _capabilities.MarkTreeUnavailable(pid);
+        _emojiBtnRect = rect;
+        _emojiBtnHwnd = root;
+        _emojiBtnPid = pid;
+        _emojiBtnRectRel = ToWindowRelative(root, rect);
+        _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
+        _legacyTabShownTicks = Environment.TickCount64;
+        _legacyTabHwnd = root;
+        _legacyButtonOpenLatched = true;
+        if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
     }
 
     /// <summary>休眠回退的打开路径（后台线程）：点击点邻域模板匹配 → 重建按钮几何缓存（与焦点命中
@@ -2262,16 +2319,8 @@ public class QqPanelWatcher : IDisposable
                 if (_lastButtonMouseUpTicks >= gestureAt && !rect.Contains(new Point(_lastButtonMouseUpPoint.X, _lastButtonMouseUpPoint.Y)))
                     return; // Recognition finished after a cancelled click; do not publish an open.
                 _buttonOpenPending = _lastButtonMouseUpTicks < gestureAt;
-                _emojiBtnRect = rect;
-                _emojiBtnHwnd = root;
-                _emojiBtnPid = (int)pid;
-                _emojiBtnRectRel = ToWindowRelative(root, rect);
-                _legacyOpenTtlMs = LegacyOpenEvidenceTtlMs;
-                _legacyTabShownTicks = Environment.TickCount64;
-                _legacyTabHwnd = root;
-                _legacyButtonOpenLatched = true;
-                if (!TrySetLegacyAnchorFromButton()) TrySetLegacyAnchorFromCursor();
-                var crect = _lastPanelRectHwnd == root ? _lastPanelRect : Rect.Empty;
+                CachePixelButton(root, (int)pid, rect);
+                var crect = CachedPanelRect(root, rect);
                 _optimisticPending = true;
                 ArmTailVerify();
                 BumpUserAction();

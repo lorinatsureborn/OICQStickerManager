@@ -55,6 +55,8 @@ public class QqStickerModel : StickerModel
     [JsonIgnore]
     public string? ThumbPath { get; set; }
 
+    protected override string? FallbackThumbnailPath => ThumbPath;
+
     private bool _isGifReal;
 
     /// <summary>按魔数嗅探的真实动图判定（Ori 后缀不可信，不能用基类的扩展名判定）。</summary>
@@ -80,16 +82,35 @@ public class QqStickerModel : StickerModel
     }
 
     private bool _isOrphaned;
+    private bool _isFavoriteStatusKnown;
+
+    [JsonIgnore]
+    public bool IsFavoriteStatusKnown => _isFavoriteStatusKnown;
+
+    [JsonIgnore]
+    public string FavoriteStatusText => !_isFavoriteStatusKnown ? "待核验" : _isOrphaned ? "缓存残留" : "QQ 收藏";
     /// <summary>深度同步判定：QQ 已取消收藏、此处为缓存残留（淡色角标 + 悬浮解释）。</summary>
     [JsonIgnore]
     public bool IsOrphaned
     {
         get => _isOrphaned;
-        set { if (_isOrphaned != value) { _isOrphaned = value; OnPropertyChanged(); OnPropertyChanged(nameof(OrphanToolTip)); } }
+        set
+        {
+            if (_isOrphaned == value && _isFavoriteStatusKnown) return;
+            _isOrphaned = value;
+            _isFavoriteStatusKnown = true;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(IsFavoriteStatusKnown));
+            OnPropertyChanged(nameof(FavoriteStatusText));
+            OnPropertyChanged(nameof(DisplayName));
+            OnPropertyChanged(nameof(OrphanToolTip));
+        }
     }
 
     [JsonIgnore]
-    public string OrphanToolTip => "QQ 中已取消收藏，这里是缓存残留；可在图库中继续管理或忽略";
+    public string OrphanToolTip => !_isFavoriteStatusKnown
+        ? "尚未核验 QQ 收藏状态，暂不能判断是否为缓存残留"
+        : _isOrphaned ? "QQ 中已取消收藏，这里是缓存残留；可在批量管理中清理" : "已核验，仍在 QQ 收藏中";
 
     // Md5 基类可空（旧数据惰性补算），镜像条目取文件名时总是有值，这里兜底防解引用
     [JsonIgnore]
@@ -98,7 +119,8 @@ public class QqStickerModel : StickerModel
         get
         {
             var md5 = Md5 ?? string.Empty;
-            return md5.Length == 0 ? "QQ收藏表情（未知）" : $"QQ收藏表情 {md5[..Math.Min(6, md5.Length)]}";
+            var label = !_isFavoriteStatusKnown ? "QQ表情（待核验）" : _isOrphaned ? "QQ缓存残留" : "QQ收藏表情";
+            return md5.Length == 0 ? label : $"{label} {md5[..Math.Min(6, md5.Length)]}";
         }
     }
 

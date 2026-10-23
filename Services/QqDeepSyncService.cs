@@ -112,13 +112,29 @@ public class QqDeepSyncService
     private static bool IsMd5(string? value) => value is { Length: 32 } && value.All(char.IsAsciiHexDigit);
 
     public async Task<bool> ConfirmOrphanAsync(QqStickerModel sticker)
+        => (await ConfirmOrphansAsync(new[] { sticker })).Contains(sticker);
+
+    /// <summary>每个账号只读一次权威索引；旧角标不能作为删除依据，失败的账号全部保留。</summary>
+    public async Task<List<QqStickerModel>> ConfirmOrphansAsync(IEnumerable<QqStickerModel> stickers)
     {
-        if (!IsMd5(sticker.Md5) || _serviceOf(sticker.Uin) == null) return false;
-        var (index, deferred) = await (_readIndex?.Invoke(sticker.Uin) ?? ReadAuthoritativeMd5sAsync(sticker.Uin));
-        if (deferred || index == null) return false;
-        bool orphan = !index.Contains(sticker.Md5!, StringComparer.OrdinalIgnoreCase);
-        sticker.IsOrphaned = orphan;
-        return orphan;
+        var confirmed = new List<QqStickerModel>();
+        foreach (var group in stickers.Distinct().Where(s => IsMd5(s.Md5)).GroupBy(s => s.Uin))
+        {
+            if (_serviceOf(group.Key) == null) continue;
+            try
+            {
+                var (index, deferred) = await (_readIndex?.Invoke(group.Key) ?? ReadAuthoritativeMd5sAsync(group.Key));
+                if (deferred || index == null) continue;
+                var active = new HashSet<string>(index, StringComparer.OrdinalIgnoreCase);
+                foreach (var sticker in group)
+                {
+                    sticker.IsOrphaned = !active.Contains(sticker.Md5!);
+                    if (sticker.IsOrphaned) confirmed.Add(sticker);
+                }
+            }
+            catch (Exception ex) { QqPanelWatcher.Log("QQ cache verification failed: " + ex.GetType().Name); }
+        }
+        return confirmed;
     }
 
     /// <summary>读取账号索引；区分读取失败与数据库仍在写入的暂缓状态。</summary>

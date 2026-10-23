@@ -19,6 +19,8 @@
             <Border x:Name="Tile" Width="120" Height="120" Margin="5" Cursor="Hand"
                     Background="Transparent" CornerRadius="16" RenderTransformOrigin="0.5,0.5"
                     AutomationProperties.Name="{Binding DisplayName}"
+                    AutomationProperties.HelpText="{Binding IsBatchSelected, StringFormat=批量选中：{0}}"
+                    ContextMenuOpening="GalleryTile_ContextMenuOpening"
                     MouseEnter="StickerBorder_MouseEnter" MouseLeave="StickerBorder_MouseLeave"
                     Loaded="StickerTile_Loaded"
                     DataContextChanged="StickerTile_DataContextChanged">
@@ -52,14 +54,31 @@
                     <Image Source="{Binding ImageSource}" Width="104" Height="104"
                            Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     <!-- GIF 角标：提示该表情悬浮可预览动画 -->
-                    <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0"
+                    <Border x:Name="GifBadge" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0"
                             Background="#99000000" CornerRadius="7" Padding="5,2"
                             Visibility="{Binding IsGif, Converter={StaticResource BoolToVis}}">
                         <TextBlock Text="GIF" FontSize="8.5" FontWeight="Bold" Foreground="#F2FFFFFF"/>
                     </Border>
+                    <!-- 覆盖在图片上方，不挤压缩略图；回收控件时跟随数据状态。 -->
+                    <Border x:Name="BatchOutline" BorderThickness="4" CornerRadius="16"
+                            BorderBrush="{DynamicResource AccentBrush}" IsHitTestVisible="False"
+                            Visibility="{Binding IsBatchSelected, Converter={StaticResource BoolToVis}}"/>
+                    <Border x:Name="BatchCheck" Width="26" Height="26" CornerRadius="13"
+                            HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,7,7,0"
+                            Background="{DynamicResource AccentBrush}" BorderBrush="White" BorderThickness="1.5"
+                            IsHitTestVisible="False"
+                            Visibility="{Binding IsBatchSelected, Converter={StaticResource BoolToVis}}">
+                        <TextBlock Text="&#xE73E;" FontFamily="{StaticResource IconFontFamily}"
+                                   FontSize="14" FontWeight="Bold" Foreground="White"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
                 </Grid>
             </Border>
             <DataTemplate.Triggers>
+                <DataTrigger Binding="{Binding IsBatchSelected}" Value="True">
+                    <Setter TargetName="GifBadge" Property="VerticalAlignment" Value="Bottom"/>
+                    <Setter TargetName="GifBadge" Property="Margin" Value="0,0,10,10"/>
+                </DataTrigger>
                 <Trigger SourceName="Tile" Property="IsMouseOver" Value="True">
                     <Setter TargetName="FillLayer" Property="Opacity" Value="1"/>
                     <Trigger.EnterActions>
@@ -111,6 +130,8 @@
             <Border x:Name="Tile" Width="120" Height="120" Margin="5" Cursor="Hand"
                     Background="Transparent" CornerRadius="16" RenderTransformOrigin="0.5,0.5"
                     AutomationProperties.Name="{Binding DisplayName}"
+                    AutomationProperties.HelpText="{Binding IsBatchSelected, StringFormat=批量选中：{0}}"
+                    ContextMenuOpening="GalleryTile_ContextMenuOpening"
                     MouseEnter="StickerBorder_MouseEnter" MouseLeave="StickerBorder_MouseLeave"
                     Loaded="StickerTile_Loaded"
                     DataContextChanged="StickerTile_DataContextChanged">
@@ -147,7 +168,7 @@
                             CornerRadius="16" Opacity="0"/>
                     <Image Source="{Binding ImageSource}" Width="104" Height="104"
                            Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                    <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0"
+                    <Border x:Name="GifBadge" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0"
                             Background="#99000000" CornerRadius="7" Padding="5,2"
                             Visibility="{Binding IsGif, Converter={StaticResource BoolToVis}}"
                             ToolTipService.ShowOnDisabled="True">
@@ -158,17 +179,40 @@
                             Visibility="{Binding IsImported, Converter={StaticResource BoolToVis}}">
                         <TextBlock Text="已入库" FontSize="8.5" Foreground="#F2FFFFFF"/>
                     </Border>
-                    <!-- 孤儿角标：淡色小图标（低不透明度，不抢视觉），悬浮显示解释 -->
+                    <!-- 明确区分缓存残留与待核验；已确认收藏不额外占用角标。 -->
                     <Border x:Name="OrphanBadge" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10,10,0,0"
-                            Background="#66FFFFFF" CornerRadius="7" Padding="4,2" Opacity="0.55"
-                            ToolTip="{Binding OrphanToolTip}"
-                            Visibility="{Binding IsOrphaned, Converter={StaticResource BoolToVis}}">
-                        <TextBlock FontFamily="{StaticResource IconFontFamily}" Text="&#xE74D;" FontSize="9"
-                                   Foreground="#CC333333"/>
+                            Background="{DynamicResource MaterialBrush}" CornerRadius="7" Padding="5,3"
+                            ToolTip="{Binding OrphanToolTip}">
+                        <TextBlock x:Name="FavoriteStatusLabel" Text="{Binding FavoriteStatusText}" FontSize="10"
+                                   FontWeight="SemiBold" Foreground="{DynamicResource TextSecondaryBrush}"/>
+                    </Border>
+                    <Border x:Name="BatchOutline" BorderThickness="4" CornerRadius="16"
+                            BorderBrush="{DynamicResource AccentBrush}" IsHitTestVisible="False"
+                            Visibility="{Binding IsBatchSelected, Converter={StaticResource BoolToVis}}"/>
+                    <Border x:Name="BatchCheck" Width="26" Height="26" CornerRadius="13"
+                            HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,7,7,0"
+                            Background="{DynamicResource AccentBrush}" BorderBrush="White" BorderThickness="1.5"
+                            IsHitTestVisible="False"
+                            Visibility="{Binding IsBatchSelected, Converter={StaticResource BoolToVis}}">
+                        <TextBlock Text="&#xE73E;" FontFamily="{StaticResource IconFontFamily}"
+                                   FontSize="14" FontWeight="Bold" Foreground="White"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     </Border>
                 </Grid>
             </Border>
             <DataTemplate.Triggers>
+                <DataTrigger Binding="{Binding IsFavoriteStatusKnown}" Value="True">
+                    <Setter TargetName="OrphanBadge" Property="Visibility" Value="Collapsed"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsOrphaned}" Value="True">
+                    <Setter TargetName="OrphanBadge" Property="Visibility" Value="Visible"/>
+                    <Setter TargetName="OrphanBadge" Property="Background" Value="{DynamicResource DangerBrush}"/>
+                    <Setter TargetName="FavoriteStatusLabel" Property="Foreground" Value="White"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsBatchSelected}" Value="True">
+                    <Setter TargetName="GifBadge" Property="VerticalAlignment" Value="Bottom"/>
+                    <Setter TargetName="GifBadge" Property="Margin" Value="0,0,10,10"/>
+                </DataTrigger>
                 <Trigger SourceName="Tile" Property="IsMouseOver" Value="True">
                     <Setter TargetName="FillLayer" Property="Opacity" Value="1"/>
                     <Trigger.EnterActions>
@@ -363,7 +407,40 @@
 
             <!-- 表情网格 -->
             <Grid Grid.Column="2">
-                <ListBox x:Name="StickersList"
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Grid Margin="16,4,16,6">
+                    <Button x:Name="EnterBatchButton" Content="批量管理" HorizontalAlignment="Right"
+                            Style="{StaticResource TextButtonStyle}" Click="EnterBatch_Click"
+                            Visibility="{Binding IsBatchManaging, Converter={StaticResource InverseBoolToVis}}"/>
+                    <StackPanel x:Name="BatchToolbar"
+                                Visibility="{Binding IsBatchManaging, Converter={StaticResource BoolToVis}}">
+                        <Grid>
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding BatchSelectionText}" Style="{StaticResource HeadlineTextStyle}"
+                                           VerticalAlignment="Center"/>
+                                <Button x:Name="BatchSelectAllButton" Content="{Binding BatchSelectAllText}"
+                                        Style="{StaticResource TextButtonStyle}" Margin="12,0,0,0"
+                                        Click="BatchSelectAll_Click" ToolTip="全选当前列表中的图片（Ctrl+A），保留其他标签页的选择"/>
+                                <Button x:Name="BatchClearButton" Content="清空选择" Style="{StaticResource TextButtonStyle}"
+                                        Click="BatchClear_Click" IsEnabled="{Binding HasBatchSelection}"/>
+                            </StackPanel>
+                            <Button x:Name="BatchDoneButton" Content="完成" HorizontalAlignment="Right" Style="{StaticResource TextButtonStyle}"
+                                    Click="ExitBatch_Click" ToolTip="退出批量管理（Esc）"/>
+                        </Grid>
+                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0" IsEnabled="{Binding HasBatchSelection}">
+                            <Button x:Name="BatchEditTagsButton" Content="{Binding BatchEditTagsText}" Style="{StaticResource AccentButtonStyle}"
+                                    Click="BatchEditTags_Click" ToolTip="QQ 镜像图片会先复制到图库，再编辑标签；原缓存保留"/>
+                            <Button x:Name="BatchAiButton" Content="{Binding BatchAiText}" Style="{StaticResource TextButtonStyle}"
+                                    Margin="8,0,0,0" Click="BatchAi_Click"/>
+                            <Button x:Name="BatchDeleteButton" Content="{Binding BatchDeleteText}" Style="{StaticResource TextButtonStyle}"
+                                    Foreground="{DynamicResource DangerBrush}" Margin="8,0,0,0" Click="BatchDelete_Click"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Grid>
+                <ListBox x:Name="StickersList" Grid.Row="1"
                          Style="{StaticResource GhostListBoxStyle}"
                          ItemsSource="{Binding Stickers}"
                          AllowDrop="True"
@@ -377,6 +454,7 @@
                          ScrollViewer.VerticalScrollBarVisibility="Auto"
                          VirtualizingPanel.IsVirtualizing="True"
                          VirtualizingPanel.VirtualizationMode="Recycling"
+                         PreviewMouseDown="Gallery_PreviewMouseDown"
                          PreviewMouseWheel="Gallery_PreviewMouseWheel">
                     <ListBox.ItemsPanel>
                         <ItemsPanelTemplate>
@@ -390,7 +468,7 @@
                 </ListBox>
 
                 <!-- 空状态 -->
-                <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center"
+                <StackPanel x:Name="EmptyState" Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center"
                             IsHitTestVisible="False" Visibility="Collapsed">
                     <StackPanel.Style>
                         <Style TargetType="StackPanel">
@@ -455,7 +533,7 @@
                 </StackPanel>
 
                 <!-- 拖放反馈 -->
-                <Border x:Name="DropOverlay" Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
+                <Border x:Name="DropOverlay" Grid.Row="1" Background="{DynamicResource ScrimBrush}" Visibility="Collapsed"
                         IsHitTestVisible="False">
                     <Border HorizontalAlignment="Center" VerticalAlignment="Center"
                             Background="{DynamicResource MaterialBrush}" CornerRadius="24" Padding="22,13"
@@ -501,7 +579,7 @@
                         </TextBlock.RenderTransform>
                     </TextBlock>
                 </Border>
-                <TextBlock Grid.Column="2" Text="{Binding StickerCountText}" FontSize="11"
+                <TextBlock x:Name="StickerCountLabel" Grid.Column="2" Text="{Binding StickerCountText}" FontSize="11"
                            Foreground="{DynamicResource TextPrimaryBrush}"
                            HorizontalAlignment="Right" VerticalAlignment="Center"/>
             </Grid>
@@ -526,6 +604,7 @@
                     <StackPanel Grid.Row="0" Margin="0,0,0,20">
                         <TextBlock x:Name="TagEditorTitle" Text="编辑标签" Style="{StaticResource TitleTextStyle}"/>
                         <TextBlock x:Name="TagEditorSubtitle" Style="{StaticResource FootnoteTextStyle}"
+                                   TextWrapping="Wrap"
                                    Margin="0,4,0,0" Text="为表情添加标签，方便搜索与整理"/>
                     </StackPanel>
 
@@ -565,7 +644,10 @@
                                                MaxWidth="300" TextAlignment="Right"
                                                Foreground="{DynamicResource TextSecondaryBrush}"/>
                                 </Grid>
-                                <WrapPanel x:Name="AiSuggestPanel" Margin="-2,6,-2,0"/>
+                                <ScrollViewer MaxHeight="128" VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollBarVisibility="Disabled" Margin="0,6,0,0">
+                                    <WrapPanel x:Name="AiSuggestPanel" Margin="0"/>
+                                </ScrollViewer>
                             </StackPanel>
 
                             <TextBlock Text="新增标签（回车或点击添加）" Style="{StaticResource CaptionTextStyle}"

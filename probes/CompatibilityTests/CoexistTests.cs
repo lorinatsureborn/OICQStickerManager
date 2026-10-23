@@ -25,6 +25,9 @@ internal static class CoexistTests
         ("Releasing an opening button gesture elsewhere cancels optimistic coexist", AbortedOpenCloses),
         ("Clicks inside the native QQ panel verify closure without dismissing tabs", NativePanelClickVerifies),
         ("A queued native panel verification cannot affect a replaced session", StalePanelClickIgnored),
+        ("Cached native panel bounds follow the current toolbar button after a host move", CachedPanelFollowsButton),
+        ("Resizing the QQ host invalidates optimistic panel geometry", ResizedHostInvalidatesPanel),
+        ("Cached panel geometry cannot be borrowed by another QQ host", CachedPanelRejectsAnotherHost),
     ];
 
     private static void OwnClickEvidence()
@@ -225,4 +228,50 @@ internal static class CoexistTests
     }
     private static void Set(object target, string field, object value)
         => typeof(QqPanelWatcher).GetField(field, Instance)!.SetValue(target, value);
+
+    private static void CachedPanelFollowsButton()
+    {
+        using var fixture = new AnchorFixture();
+        fixture.Capture();
+        Program.Require(SetWindowPos(fixture.Host.Handle, IntPtr.Zero, 300, 200, 0, 0, 0x0015), "fixture host could not move");
+        Program.Require(fixture.Resolve(fixture.Host.Handle, new Rect(347, 580, 32, 32)) == new Rect(320, 240, 450, 336),
+            "optimistic opening retained the old absolute panel coordinates");
+    }
+    private static void ResizedHostInvalidatesPanel()
+    {
+        using var fixture = new AnchorFixture();
+        fixture.Capture();
+        Program.Require(SetWindowPos(fixture.Host.Handle, IntPtr.Zero, 0, 0, 900, 600, 0x0016), "fixture host could not resize");
+        Program.Require(fixture.Resolve(fixture.Host.Handle, new Rect(147, 480, 32, 32)).IsEmpty,
+            "changed QQ layout reused stale panel geometry");
+    }
+    private static void CachedPanelRejectsAnotherHost()
+    {
+        using var fixture = new AnchorFixture();
+        fixture.Capture();
+        Program.Require(fixture.Resolve(new IntPtr(42), new Rect(147, 480, 32, 32)).IsEmpty,
+            "another chat borrowed the last native panel's geometry");
+    }
+    private sealed class AnchorFixture : IDisposable
+    {
+        internal HwndSource Host { get; } = new(new HwndSourceParameters("cached-panel-anchor")
+        { Width = 800, Height = 600, PositionX = 100, PositionY = 100, WindowStyle = unchecked((int)0x80000000) });
+        private readonly QqPanelWatcher _watcher = new(_ => { });
+        internal void Capture()
+        {
+            Set(_watcher, "_emojiBtnHwnd", Host.Handle);
+            Set(_watcher, "_emojiBtnRectRel", new Rect(47, 380, 32, 32));
+            var method = typeof(QqPanelWatcher).GetMethod("CachePanelAnchor", Instance);
+            Program.Require(method != null, "confirmed panel geometry is not cached relative to its toolbar button");
+            method!.Invoke(_watcher, [Host.Handle, new Rect(120, 140, 450, 336)]);
+        }
+        internal Rect Resolve(IntPtr host, Rect button)
+        {
+            var method = typeof(QqPanelWatcher).GetMethod("CachedPanelRect", Instance);
+            Program.Require(method != null, "optimistic opening has no current-button geometry validation");
+            return (Rect)method!.Invoke(_watcher, [host, button])!;
+        }
+        public void Dispose() { _watcher.Dispose(); Host.Dispose(); }
+    }
+    [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
 }

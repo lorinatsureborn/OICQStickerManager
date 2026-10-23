@@ -196,9 +196,18 @@ namespace OICQStickerManager.Views
         // ———— 浮层动效（scrim 淡入淡出 + sheet 缩放弹出） ————
 
         private static readonly IEasingFunction SheetEase = new CubicEase { EasingMode = EasingMode.EaseOut };
+        private readonly Dictionary<Grid, int> _overlayGenerations = new();
+
+        private int NextOverlayGeneration(Grid scrim)
+        {
+            var generation = _overlayGenerations.GetValueOrDefault(scrim) + 1;
+            _overlayGenerations[scrim] = generation;
+            return generation;
+        }
 
         private void ShowOverlay(Grid scrim, FrameworkElement sheet, ScaleTransform scale, double fromScale)
         {
+            NextOverlayGeneration(scrim); // 先使旧的淡出回调失效，再替换动画时钟。
             sheet.BeginAnimation(OpacityProperty, null);
             scale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
             scale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
@@ -217,8 +226,13 @@ namespace OICQStickerManager.Views
 
         private void HideOverlay(Grid scrim, FrameworkElement sheet, ScaleTransform scale, double toScale)
         {
+            var generation = NextOverlayGeneration(scrim);
             var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(160)) { EasingFunction = SheetEase };
-            fade.Completed += (s, e) => scrim.Visibility = Visibility.Collapsed;
+            fade.Completed += (s, e) =>
+            {
+                if (_overlayGenerations.GetValueOrDefault(scrim) == generation)
+                    scrim.Visibility = Visibility.Collapsed;
+            };
             scrim.BeginAnimation(OpacityProperty, fade);
 
             sheet.BeginAnimation(OpacityProperty, fade);
@@ -420,12 +434,33 @@ namespace OICQStickerManager.Views
         // Esc 逐层退出：Alert → 设置 → QQ 绑定 → QQ 重命名 → 标签编辑器
         private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
         {
+            if (DataContext is MainViewModel { IsBatchManaging: true } vm
+                && AlertOverlay.Visibility != Visibility.Visible && SettingsOverlay.Visibility != Visibility.Visible
+                && TagEditorOverlay.Visibility != Visibility.Visible && QqBindOverlay.Visibility != Visibility.Visible
+                && QqRenameOverlay.Visibility != Visibility.Visible && Keyboard.FocusedElement is not TextBoxBase)
+            {
+                if (e.Key == Key.A && Keyboard.Modifiers == ModifierKeys.Control)
+                {
+                    vm.SelectAllBatchStickers();
+                    e.Handled = true;
+                    return;
+                }
+                if (e.Key == Key.Space && Keyboard.FocusedElement is DependencyObject source
+                    && ItemsControl.ContainerFromElement(StickersList, source) is ListBoxItem { DataContext: StickerModel sticker })
+                {
+                    vm.ToggleBatchSticker(sticker);
+                    e.Handled = true;
+                    return;
+                }
+            }
             if (e.Key != Key.Escape) return;
             if (AlertOverlay.Visibility == Visibility.Visible) { CancelAlert(); e.Handled = true; }
             else if (SettingsOverlay.Visibility == Visibility.Visible) { CloseSettings_Click(sender, e); e.Handled = true; }
             else if (QqBindOverlay.Visibility == Visibility.Visible) { CloseQqBindDialog_Click(sender, e); e.Handled = true; }
             else if (QqRenameOverlay.Visibility == Visibility.Visible) { CloseQqRename_Click(sender, e); e.Handled = true; }
             else if (TagEditorOverlay.Visibility == Visibility.Visible) { CloseTagEditor_Click(sender, e); e.Handled = true; }
+            else if (DataContext is MainViewModel { IsBatchManaging: true } batchVm)
+            { batchVm.ExitBatchManagement(); e.Handled = true; }
         }
 
         // ———— iOS 风格 Alert ————
@@ -1101,6 +1136,7 @@ namespace OICQStickerManager.Views
                 // 2. 核心持久化与视图刷新
                 await viewModel.SaveDatabaseAsync(); // 存入 JSON
                 viewModel.UpdateTabTags();           // 刷新左侧选项卡列表
+                viewModel.RefreshGalleryTags();      // 标签改动后重新匹配当前筛选，跨页选择继续保留
                 viewModel.RefreshTagPool();          // 刷新编辑器里的标签池
                 viewModel.RefreshQqMirrorFlags();    // QQ 页借入标签与已入库角标同步
             }
@@ -1151,6 +1187,9 @@ namespace OICQStickerManager.Views
 
         private void ShowTagEditor(StickerModel sticker)
         {
+            _batchAdjustMode = false;
+            TagEditorTitle.Text = "编辑标签";
+            TagInputBox.Text = "";
             // 💡 统一入口：即使是编辑单个，也放入列表中
             _pendingStickers = new List<StickerModel> { sticker };
             _suggestedTag = null; // 编辑已有表情不提供来源建议
@@ -1299,6 +1338,7 @@ namespace OICQStickerManager.Views
         private void ClearAiSuggestions()
         {
             _aiSuggestionGeneration++;
+            _editorAiCts?.Cancel();
             _aiSuggestions = new List<string>();
             _aiSuggestionsMeta = "";
             AiSuggestSection.Visibility = Visibility.Collapsed;
@@ -1318,6 +1358,8 @@ namespace OICQStickerManager.Views
 
         // 防多击：AI 请求进行中再点（右键菜单/编辑器按钮）一律忽略，结果照样会回来
         private bool _aiBusy;
+        private CancellationTokenSource? _editorAiCts;
+        private const int BatchAiConcurrency = 2;
 
         /// <summary>识别中反馈：AI 建议区亮出旋转图标（请求已发出，正在等回复），完成/失败即收。</summary>
         private void AiSuggestRefreshSpin(bool busy)
@@ -1434,12 +1476,15 @@ namespace OICQStickerManager.Views
             }
 
             SetAiEditorBusy(true);
+            using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            _editorAiCts = requestCts;
+            var ct = requestCts.Token;
             try
             {
                 if (stickers.Count == 1)
                 {
                     vm.StatusText = "AI 识别中…";
-                    var (result, fromCache) = await vm.GetAiSuggestionsAsync(stickers[0], forceRefresh);
+                    var (result, fromCache) = await vm.GetAiSuggestionsAsync(stickers[0], forceRefresh, ct);
                     if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return;
                     ApplyAiSuggestionsToEditor(result, fromCache);
                     vm.StatusText = "AI 标签建议已就绪，点击胶囊即可添加";
@@ -1452,13 +1497,14 @@ namespace OICQStickerManager.Views
                     var anyCache = false;
                     AiTagResult? source = null;
                     var done = 0;
-                    using var gate = new SemaphoreSlim(2);
+                    AiSuggestMetaText.Text = $"AI 识别中 0/{stickers.Count}（最多同时 {BatchAiConcurrency} 张）…";
+                    using var gate = new SemaphoreSlim(BatchAiConcurrency);
                     var tasks = stickers.Select(async st =>
                     {
-                        await gate.WaitAsync();
+                        await gate.WaitAsync(ct);
                         try
                         {
-                            var (result, fromCache) = await vm.GetAiSuggestionsAsync(st, forceRefresh);
+                            var (result, fromCache) = await vm.GetAiSuggestionsAsync(st, forceRefresh, ct);
                             lock (union)
                             {
                                 foreach (var t in result.Tags) if (!union.Contains(t)) union.Add(t);
@@ -1470,36 +1516,31 @@ namespace OICQStickerManager.Views
                         {
                             lock (union) { firstError ??= ex; failed++; }
                         }
-                        finally { gate.Release(); Interlocked.Increment(ref done); }
-                    }).ToList();
-                    _ = Task.Run(async () =>
-                    {
-                        while (done < tasks.Count)
+                        finally
                         {
-                            var d = Math.Min(done, tasks.Count);
-                            var total = tasks.Count;
-                            _ = Dispatcher.BeginInvoke(() =>
+                            gate.Release();
+                            Interlocked.Increment(ref done);
+                            if (_aiSuggestionGeneration == generation && TagEditorOverlay.Visibility == Visibility.Visible)
                             {
-                                if (_aiSuggestionGeneration == generation && TagEditorOverlay.Visibility == Visibility.Visible)
-                                {
-                                    AiSuggestMetaText.Text = $"AI 识别中 {d}/{total}…";
-                                    vm.StatusText = $"AI 识别中 {d}/{total}…";
-                                }
-                            });
-                            await Task.Delay(150);
+                                AiSuggestMetaText.Text = $"AI 识别中 {done}/{stickers.Count}（最多同时 {BatchAiConcurrency} 张）…";
+                                vm.StatusText = $"AI 识别中 {done}/{stickers.Count}…";
+                            }
                         }
-                    });
+                    }).ToList();
                     await Task.WhenAll(tasks);
 
                     if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return; // 已换图/关编辑器，结果仍进对应图片的缓存
                     if (union.Count == 0 && firstError != null) { ShowAiFailureAlert(firstError); return; }
                     ApplyAiSuggestionsToEditor(
                         new AiTagResult(union, source?.ProviderId ?? "", source?.Model ?? "", DateTime.Now), anyCache);
+                    if (failed > 0)
+                        AiSuggestMetaText.Text = $"{stickers.Count - failed}/{stickers.Count} 张成功；{failed} 张失败，可重新识别";
                     vm.StatusText = failed > 0
                         ? $"AI 建议已就绪（{stickers.Count - failed}/{stickers.Count} 张成功，失败详情见 %TEMP%\\asuka-aitag.log）"
                         : "AI 标签建议已就绪，点击胶囊即可添加";
                 }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
             catch (AiTagException ex)
             {
                 if (_aiSuggestionGeneration != generation || TagEditorOverlay.Visibility != Visibility.Visible) return;
@@ -1507,6 +1548,7 @@ namespace OICQStickerManager.Views
             }
             finally
             {
+                if (ReferenceEquals(_editorAiCts, requestCts)) _editorAiCts = null;
                 SetAiEditorBusy(false);
             }
         }
@@ -2194,23 +2236,9 @@ namespace OICQStickerManager.Views
             var stickers = vm.Stickers.Where(s => s.Tags.Contains(tagName)).ToList();
             if (stickers.Count == 0) return;
 
-            IEnumerable<string> common = stickers[0].Tags;
-            foreach (var s in stickers.Skip(1)) common = common.Intersect(s.Tags);
-            _batchOriginalTags = common.Distinct().ToList();
-            _editingTags = new List<string>(_batchOriginalTags);
-            _pendingStickers = stickers;
-            _batchAdjustMode = true;
-            _suggestedTag = null;
-            TagInputBox.Text = "";
-
-            TagEditorTitle.Text = "编辑标签下所有图片";
-            TagEditorSubtitle.Text = $"「{tagName}」下共 {stickers.Count} 张图片；已预填全部图片共有的标签，" +
-                                     "保存时只应用你的增删改动，各图片独有的标签会保留";
-            SetTagEditorPreview(stickers[0]);
-            ClearAiSuggestions();
-            RefreshEditorUI();
-            ShowOverlay(TagEditorOverlay, TagEditorSheet, TagEditorSheetScale, 0.94);
-            TagInputBox.Focus();
+            ShowBatchTagEditor(stickers, "编辑标签下所有图片",
+                $"「{tagName}」下共 {stickers.Count} 张图片；已预填全部图片共有的标签，" +
+                "保存时只应用你的增删改动，各图片独有的标签会保留");
         }
 
         // 删除该标签：从所有表情上移除标签本身，图片保留

@@ -69,7 +69,7 @@ public class GlassWindow : Window
     {
         base.OnSourceInitialized(e);
         _hwnd = new WindowInteropHelper(this).Handle;
-        ((HwndSource)PresentationSource.FromVisual(this)!).AddHook(WndProc);
+        HwndSource.FromHwnd(_hwnd)!.AddHook(WndProc);
         TryRoundSystemCorners();
         ApplyCornerClip(new Size(ActualWidth, ActualHeight));
     }

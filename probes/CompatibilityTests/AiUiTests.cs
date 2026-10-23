@@ -84,6 +84,7 @@ internal static class AiUiTests
             handler.Reply(); Program.RunAsync(pending);
             var suggestions = (IList)typeof(MainWindow).GetField("_aiSuggestions", Private)!.GetValue(window)!;
             Program.Require(suggestions.Count == 0, "a late result for the first sticker appeared in the second sticker's editor");
+            BatchManagementTests.VerifyWindow(window, vm, root);
             vm.Dispose(); vm.FlushPendingConfigSave();
         }
         finally

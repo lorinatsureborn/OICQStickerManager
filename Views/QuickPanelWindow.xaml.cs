@@ -33,6 +33,7 @@ namespace OICQStickerManager.Views
         private bool _coexistMode; // 是否由 QQ 表情面板共存触发打开
         private bool _pinned;      // 钉住模式（设置按钮唤出）：不因鼠标离开自动关闭，靠 ✕/热键/再点按钮收起
         private bool _suppressShowAnimation; // 预热时在屏幕外显示，不播动画
+        private Rect _placementDuringMove = Rect.Empty;
         private DispatcherTimer? _hideTimer; // HideSoft 的淡出收尾定时器：淡出途中重新打开时必须取消，否则窗口会在收尾时被 Hide
 
         public bool CoexistMode => _coexistMode;
@@ -105,11 +106,22 @@ namespace OICQStickerManager.Views
             var hwnd = new WindowInteropHelper(this).Handle;
             int style = GetWindowLong(hwnd, GWL_EXSTYLE);
             SetWindowLong(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE);
-            ((HwndSource)PresentationSource.FromVisual(this)!).AddHook(WndProc);
+            HwndSource.FromHwnd(hwnd)!.AddHook(WndProc);
         }
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
+            if (msg == WM_DPICHANGED && !_placementDuringMove.IsEmpty)
+            {
+                // WPF must update its render DPI, but its automatic size suggestion must not
+                // scale our already-computed destination pixels a second time.
+                var placement = _placementDuringMove;
+                Marshal.StructureToPtr(new RECT
+                {
+                    Left = (int)placement.Left, Top = (int)placement.Top,
+                    Right = (int)placement.Right, Bottom = (int)placement.Bottom
+                }, lParam, false);
+            }
             // 核心：鼠标点击永不把面板带到前台，键盘焦点始终留在聊天窗口
             if (msg == WM_MOUSEACTIVATE)
             {
@@ -219,6 +231,14 @@ namespace OICQStickerManager.Views
             PanelScale.ScaleX = PanelScale.ScaleY = 1;
             Hide();
             QqPanelWatcher.Log("quick panel pre-warmed (built + first frame rendered)");
+        }
+
+        private void CancelPendingWarmUp()
+        {
+            if (!_suppressShowAnimation) return;
+            ContentRendered -= WarmUp_ContentRendered;
+            _suppressShowAnimation = false;
+            HideImmediately();
         }
 
         /// <summary>
@@ -361,6 +381,7 @@ namespace OICQStickerManager.Views
 
         private void OpenNearCursorCore(bool pinned)
         {
+            CancelPendingWarmUp();
             _coexistLifetime.Stop();
             _coexistMode = false;
             _pinned = pinned;
@@ -381,6 +402,7 @@ namespace OICQStickerManager.Views
         /// </summary>
         public void OpenForCoexist(Rect qqPanelRect, IntPtr qqHwnd, Rect buttonRect = default)
         {
+            CancelPendingWarmUp();
             _coexistMode = true;
             _viewModel.SetQuickPanelCoexistTarget(qqHwnd);
             // 已可见路径不触发 IsVisibleChanged（如热键面板转共存），镜像在此补记
@@ -422,15 +444,28 @@ namespace OICQStickerManager.Views
             var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
             if (!GetMonitorInfo(monitor, ref mi)) return;
             var hwnd = new WindowInteropHelper(this).EnsureHandle();
-            // Move first so GetDpiForWindow observes the destination monitor, not the previous one.
-            if (!SetWindowPos(hwnd, IntPtr.Zero, anchorX, anchorY, 0, 0, 0x0015)) return;
             uint dpiX = GetDpiForWindow(hwnd);
-            double scale = dpiX / 96.0;
+            // Read the destination DPI without moving a visible panel onto the native QQ popup.
+            if (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != monitor
+                && GetDpiForMonitor(monitor, 0, out var monitorDpi, out _) == 0)
+                dpiX = monitorDpi;
+            double scale = Math.Max(96u, dpiX) / 96.0;
 
             var workArea = new Rect(mi.rcWork.Left, mi.rcWork.Top, mi.rcWork.Right - mi.rcWork.Left, mi.rcWork.Bottom - mi.rcWork.Top);
             var placement = PanelPlacement.Place(workArea, _preferredSize, new Point(anchorX, anchorY), scale, isCoexistAnchor, anchorWidthPx);
-            if (!placement.IsEmpty)
+            if (placement.IsEmpty) return;
+            // Mouse-down, focus and confirmed UIA bounds can describe the same opening.
+            // Leave both the panel and its blur tiles alone when the final bounds already match.
+            if (GetWindowRect(hwnd, out var current)
+                && current.Left == (int)placement.Left && current.Top == (int)placement.Top
+                && current.Right - current.Left == (int)placement.Width
+                && current.Bottom - current.Top == (int)placement.Height) return;
+            _placementDuringMove = placement;
+            try
+            {
                 SetWindowPos(hwnd, IntPtr.Zero, (int)placement.Left, (int)placement.Top, (int)placement.Width, (int)placement.Height, 0x0014);
+            }
+            finally { _placementDuringMove = Rect.Empty; }
         }
 
         // --- 关闭规则 ---
@@ -472,6 +507,9 @@ namespace OICQStickerManager.Views
         private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
         [DllImport("user32.dll")]
         private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+        [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("shcore.dll")] private static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
         [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
         [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
         [DllImport("user32.dll")]
@@ -483,6 +521,7 @@ namespace OICQStickerManager.Views
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_NOACTIVATE = 0x08000000;
         private const int WM_MOUSEACTIVATE = 0x0021;
+        private const int WM_DPICHANGED = 0x02E0;
         private const int MA_NOACTIVATE = 3;
 
         [StructLayout(LayoutKind.Sequential)]

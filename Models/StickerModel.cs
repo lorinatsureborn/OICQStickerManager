@@ -6,6 +6,20 @@ namespace OICQStickerManager.Models;
 
 public class StickerModel : ViewModelBase // 💡 继承基类
 {
+    private bool _isBatchSelected;
+    /// <summary>仅供主窗口批量管理使用，不写入图库或同步元数据。</summary>
+    [JsonIgnore]
+    public bool IsBatchSelected
+    {
+        get => _isBatchSelected;
+        internal set
+        {
+            if (_isBatchSelected == value) return;
+            _isBatchSelected = value;
+            OnPropertyChanged();
+        }
+    }
+
     public Guid Id { get; set; } = Guid.NewGuid();
 
     /// <summary>文件内容 MD5（大写 hex）：去重与"QQ 页已导入"对账键；新入库文件同时以其命名。旧数据惰性补算。</summary>
@@ -86,6 +100,8 @@ public class StickerModel : ViewModelBase // 💡 继承基类
 
     private BitmapImage? _imageSource;
 
+    protected virtual string? FallbackThumbnailPath => null;
+
     [JsonIgnore]
     public BitmapImage? ImageSource
     {
@@ -93,27 +109,26 @@ public class StickerModel : ViewModelBase // 💡 继承基类
         {
             // 缓存解码结果：绑定会反复求值，不能每次都重新解码
             if (_imageSource != null) return _imageSource;
-            if (string.IsNullOrEmpty(FullPath) || !System.IO.File.Exists(FullPath))
-                return null;
-
-            try
-            {
-                var bitmap = new BitmapImage();
-                bitmap.BeginInit();
-                bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                // 按缩略图尺寸解码，内存从每张数 MB 降到 ~260KB
-                bitmap.DecodePixelWidth = ThumbnailWidth;
-                bitmap.UriSource = new Uri(FullPath);
-                bitmap.EndInit();
-                bitmap.Freeze();
-                _imageSource = bitmap;
-                return bitmap;
-            }
-            catch
-            {
-                return null; // 防止损坏的图片导致闪退
-            }
+            _imageSource = LoadThumbnail(FullPath) ?? LoadThumbnail(FallbackThumbnailPath);
+            return _imageSource;
         }
+    }
+
+    private static BitmapImage? LoadThumbnail(string? path)
+    {
+        if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) return null;
+        try
+        {
+            var bitmap = new BitmapImage();
+            bitmap.BeginInit();
+            bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            bitmap.DecodePixelWidth = ThumbnailWidth;
+            bitmap.UriSource = new Uri(path);
+            bitmap.EndInit();
+            bitmap.Freeze();
+            return bitmap;
+        }
+        catch { return null; }
     }
 
     /// <summary>QQ 收藏镜像条目标记：快捷面板混排时给来源角标用（图库条目恒为 false）。</summary>
