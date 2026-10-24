@@ -12,7 +12,7 @@ internal static class AiUiTests
 {
     internal static (string Name, Action Run)[] Cases =>
     [
-        ("AI masked key input, settings refresh, stale verification and sticker result isolation", Run),
+        ("AI setup navigation, masked key input, settings refresh, stale verification and sticker result isolation", Run),
     ];
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
 
@@ -34,6 +34,7 @@ internal static class AiUiTests
             var window = new MainWindow();
             var vm = OICQStickerManager.App.SharedViewModel;
             Program.RunAsync(vm.Initialization);
+            VerifySetupNavigation(window, vm);
             Invoke(window, "OpenAiEditor", new object?[] { null });
             vm.AiTagApiKey = "sk-proj-ui-synthetic-key";
             Program.RunAsync(Task.Delay(20));
@@ -95,6 +96,52 @@ internal static class AiUiTests
             Environment.SetEnvironmentVariable("ASUKA_DATA_DIR", previous);
             SynchronizationContext.SetSynchronizationContext(previousContext);
         }
+    }
+
+    private static void VerifySetupNavigation(MainWindow window, OICQStickerManager.ViewModels.MainViewModel vm)
+    {
+        var sticker = new StickerModel { Md5 = "synthetic-setup-navigation", Tags = ["保留标签"] };
+        foreach (var route in new[] { "gallery", "editor", "batch" })
+        {
+            Program.Require(!vm.AiTagConfigured && vm.AiKeyProfilesView.Count == 0,
+                "setup navigation fixture requires an unconfigured AI profile");
+            Task? pending = null;
+            if (route == "gallery")
+                Invoke(window, "AiSuggest_Click", [new System.Windows.Controls.MenuItem { DataContext = sticker }, new RoutedEventArgs()]);
+            else
+            {
+                if (route == "editor") Invoke(window, "ShowTagEditor", [sticker]);
+                else Invoke(window, "ShowBatchTagEditor", [new List<StickerModel> { sticker, new() { Md5 = "synthetic-setup-second" } }, "批量编辑标签", "测试"]);
+                pending = (Task)Invoke(window, "RunEditorAiAsync", [false])!;
+            }
+            Program.Require(Element(window, "AlertOverlay").Visibility == Visibility.Visible,
+                $"{route}: missing-key guide did not appear");
+            Invoke(window, "AlertConfirm_Click", [window, new RoutedEventArgs()]);
+            if (pending != null) Program.RunAsync(pending);
+            WaitUntil(() => Element(window, "SettingsOverlay").Visibility == Visibility.Visible);
+            Program.Require(Element(window, "AiEditorSection").Visibility == Visibility.Visible,
+                $"{route}: guided settings left the API key editor collapsed");
+            var password = (System.Windows.Controls.PasswordBox)Element(window, "AiKeyBox");
+            Program.Require(password.IsEnabled && password.Focusable,
+                $"{route}: guided API key input cannot accept focus");
+            password.Password = "sk-proj-setup-synthetic-key";
+            Program.Require(vm.AiTagApiKey == password.Password && vm.AiSelectedProvider?.Id == "openai",
+                $"{route}: guided API key input did not update the draft and provider");
+            Invoke(window, "CloseSettings_Click", [window, new RoutedEventArgs()]);
+            if (route != "gallery")
+            {
+                Program.Require(Element(window, "TagEditorOverlay").Visibility == Visibility.Visible,
+                    $"{route}: returning from settings lost the tag editor");
+                Invoke(window, "CloseTagEditor_Click", [window, new RoutedEventArgs()]);
+            }
+            vm.BeginNewAiDraft();
+            Program.RunAsync(Task.Delay(200));
+        }
+        Invoke(window, "OpenSettings_Click", [window, new RoutedEventArgs()]);
+        Program.Require(Element(window, "AiEditorSection").Visibility == Visibility.Visible,
+            "manual settings no longer expands the first API key editor");
+        Invoke(window, "CloseSettings_Click", [window, new RoutedEventArgs()]);
+        Program.RunAsync(Task.Delay(200));
     }
 
     private static FrameworkElement Element(MainWindow window, string name) => (FrameworkElement)window.FindName(name);

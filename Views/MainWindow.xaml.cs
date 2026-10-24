@@ -382,7 +382,9 @@ namespace OICQStickerManager.Views
             Close(); // OnClosed 清理热键/watcher/托盘图标，ShutdownMode=OnMainWindowClose 结束进程
         }
 
-        private void OpenSettings_Click(object sender, RoutedEventArgs e)
+        private void OpenSettings_Click(object sender, RoutedEventArgs e) => OpenSettings();
+
+        private void OpenSettings()
         {
             // AI 区渐进披露：一份档案都没有 → 自动展开「添加 API Key」编辑区；
             // 已有档案 → 收起为列表（点行上铅笔或"添加"再展开）
@@ -1419,7 +1421,7 @@ namespace OICQStickerManager.Views
             if (!vm.AiTagConfigured)
             {
                 if (await GuideAiSetupAsync())
-                    ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+                    OpenSettings();
                 return;
             }
 
@@ -1463,7 +1465,7 @@ namespace OICQStickerManager.Views
             {
                 // 设置 sheet 在 Z 序上盖过标签编辑器（XAML 顺序），关掉设置即回到编辑继续，不丢已点标签
                 if (await GuideAiSetupAsync())
-                    ShowOverlay(SettingsOverlay, SettingsSheet, SettingsSheetScale, 0.94);
+                    OpenSettings();
                 return;
             }
 

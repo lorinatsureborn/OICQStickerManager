@@ -40,7 +40,10 @@ AI API fixtures use synthetic keys and an injected HTTP handler, covering OpenAI
 project/service-account key detection, completion budgets, Claude model cursors
 and capability metadata, HTTP errors, cancellation, format retries, diagnostic
 redaction, active model persistence, draft invalidation and isolated cache flushes.
-A hidden WPF window verifies masked key input, password automation protection,
+A hidden WPF window verifies that the missing-key guide opens an editable API key
+section from the gallery, single-sticker editor and batch editor on the first try,
+and that manual settings entry still works. It also verifies masked key input,
+password automation protection,
 profile-to-input synchronization, settings refresh, model input before verification,
 late verification replies and suggestions arriving after a different sticker is
 opened. It does not show the app or run the app's startup hooks. Run only these
